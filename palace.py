@@ -5,6 +5,10 @@ Recursive Hierarchical Self Improvement (RHSI) for Claude
 
 Palace is NOT a replacement for Claude - it's an orchestration layer.
 Every command invokes Claude with context, letting Claude use its full power.
+
+This file serves dual purposes:
+1. CLI tool for invoking Claude (python3 palace.py next)
+2. MCP server providing tools to Claude (uv run mcp install palace.py)
 """
 
 import sys
@@ -134,8 +138,6 @@ class Palace:
 
         Returns the exit code from Claude
         """
-        palace_path = Path(__file__).resolve()
-
         cmd = [
             "claude",
             "-p", prompt,
@@ -144,7 +146,7 @@ class Palace:
             "--include-partial-messages",
             "--input-format", "stream-json",
             "--output-format", "stream-json",
-            "--permission-prompt-tool", f"python3 {palace_path} permissions"
+            "--permission-prompt-tool", "handle_permission"
         ]
 
         print("🏛️  Palace - Invoking Claude Code CLI...")
@@ -524,3 +526,73 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ============================================================================
+# MCP Server Integration
+# ============================================================================
+# When Palace is installed as an MCP server (uv run mcp install palace.py),
+# this code provides tools that Claude can call directly.
+
+try:
+    from mcp.server.fastmcp import FastMCP
+
+    # Create MCP server instance
+    mcp = FastMCP("Palace")
+
+    @mcp.tool()
+    def handle_permission(request: dict) -> dict:
+        """
+        Handle permission requests from Claude during RHSI loops.
+
+        Args:
+            request: Permission request containing action details
+
+        Returns:
+            dict with 'approved' (bool) and optional 'reason' (str)
+        """
+        # Initialize Palace instance to access logging
+        palace = Palace()
+
+        # Log the permission request
+        palace.log_action("permission_request", {"request": request})
+
+        # For now, approve all requests
+        # TODO: Add smart permission logic based on learning from history
+        return {"approved": True}
+
+    @mcp.tool()
+    def get_project_context() -> dict:
+        """
+        Get lightweight context about the current project.
+
+        Returns project state including files, git status, and recent history.
+        Optimized for minimal token usage (~700-1300 tokens).
+        """
+        palace = Palace()
+        context = palace.gather_context()
+
+        # Log that context was requested
+        palace.log_action("context_requested", {"size": len(json.dumps(context))})
+
+        return context
+
+    @mcp.tool()
+    def log_palace_action(action: str, details: dict = None) -> str:
+        """
+        Log an action to Palace history for RHSI learning.
+
+        Args:
+            action: Name of the action being logged
+            details: Optional dictionary with additional details
+
+        Returns:
+            Confirmation message
+        """
+        palace = Palace()
+        palace.log_action(action, details or {})
+        return f"Logged action: {action}"
+
+except ImportError:
+    # MCP not installed - server functionality unavailable
+    # This is fine for CLI-only usage
+    pass
