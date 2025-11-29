@@ -1,7 +1,8 @@
 # Palace dependencies
 
+# MCP Integration (REQUIRED for permission handling)
+mcp>=0.1.0
+
 # Testing (Golden Rule #1: TDD)
 pytest>=7.4.0
 pytest-cov>=4.1.0
-
-# Future dependencies will be added here as needed

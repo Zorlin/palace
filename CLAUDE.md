@@ -21,6 +21,58 @@ This principle is encoded into Palace's DNA and applies to:
 
 **Test coverage is not optional - it's mandatory.**
 
+## MCP Integration Required
+
+Palace uses the Model Context Protocol (MCP) for permission handling. You need:
+
+1. **Python MCP Module**: `pip install mcp` or `uv pip install mcp`
+2. **MCP Server Setup**: Palace's permission handler must be registered as an MCP tool
+
+### Setting Up Palace MCP Server
+
+The `palace.py permissions` command is designed to be called as an MCP tool by Claude Code CLI.
+
+**Error you'll see without MCP:**
+```
+Error: MCP tool python3 /path/to/palace.py permissions (passed via --permission-prompt-tool) not found.
+```
+
+**What you need:**
+- Install the Python MCP module
+- Register Palace as an MCP server in your Claude Code config
+- Palace will then handle permission prompts during RHSI loops
+
+**This is NOT optional** - the permission system is core to Palace's ability to autonomously improve itself while maintaining safety.
+
+### MCP Server Configuration
+
+Add Palace to your Claude Code MCP config (typically `~/.config/claude-code/mcp.json` or `~/.claude-code/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "palace-permissions": {
+      "command": "python3",
+      "args": ["/absolute/path/to/palace.py", "permissions"],
+      "env": {}
+    }
+  }
+}
+```
+
+Then Palace can be invoked with:
+```bash
+claude -p "prompt" --permission-prompt-tool palace-permissions
+```
+
+The permission handler will:
+1. Receive permission requests from Claude via stdin (stream-json format)
+2. Log the request to `.palace/history.jsonl`
+3. Approve/deny based on Palace's permission logic
+4. Return response via stdout (stream-json format)
+
+This enables Palace to learn from permission patterns and eventually predict what should be allowed in the RHSI loop.
+
 ## Overview
 
 Palace is **not** a replacement for Claude - it's a thin orchestration layer that:
