@@ -1,0 +1,2 @@
+# palace
+structure determines action
