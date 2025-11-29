@@ -21,69 +21,68 @@ This principle is encoded into Palace's DNA and applies to:
 
 **Test coverage is not optional - it's mandatory.**
 
-## MCP Integration Required
+## Permission Handling via MCP-Compliant Tool
 
-Palace uses the Model Context Protocol (MCP) for permission handling. You need:
+Palace implements an MCP-compliant permission handler that Claude Code CLI invokes directly.
 
-1. **Python MCP Module**: `pip install mcp` or `uv pip install mcp`
-2. **MCP Server Setup**: Palace's permission handler must be registered as an MCP tool
+### Current Status: MCP Tool Registration Required
 
-### Setting Up Palace MCP Server
-
-The `palace.py permissions` command is designed to be called as an MCP tool by Claude Code CLI.
-
-**Error you'll see without MCP:**
+**Error you're seeing:**
 ```
-Error: MCP tool python3 /path/to/palace.py permissions (passed via --permission-prompt-tool) not found.
+Error: MCP tool python3 /home/wings/projects/palace/palace.py permissions (passed via --permission-prompt-tool) not found. Available MCP tools: none
 ```
 
-**What you need:**
-- Install the Python MCP module
-- Register Palace as an MCP server in your Claude Code config
-- Palace will then handle permission prompts during RHSI loops
+**What this means:**
+- Palace is passing `--permission-prompt-tool "python3 /path/to/palace.py permissions"` to Claude CLI
+- Claude Code expects this to be a registered MCP tool NAME, not a command
+- We need to register Palace as an MCP tool with Claude Code first
+
+**What needs to happen:**
+1. Figure out how to register MCP tools with Claude Code CLI
+2. Register `palace-permissions` as an MCP tool that runs `python3 palace.py permissions`
+3. Update Palace to use the registered tool name
+
+**DO NOT remove the `--permission-prompt-tool` flag - this is a REQUIRED feature for RHSI safety.**
+
+### How It Will Work (Once MCP Registration is Solved)
+
+When you run `python3 palace.py next` in interactive mode, Palace invokes Claude with:
+
+```bash
+claude -p "prompt" \
+  --permission-prompt-tool "palace-permissions"
+```
+
+The `--permission-prompt-tool` flag tells Claude Code to use Palace's permission handler for all permission requests during that session.
+
+### The Permission Handler
+
+`palace.py permissions` acts as an MCP-compliant tool:
+
+1. **Receives requests** via stdin (stream-json format)
+2. **Logs the request** to `.palace/history.jsonl`
+3. **Approves/denies** based on Palace's permission logic
+4. **Returns response** via stdout (stream-json format)
 
 **This is NOT optional** - the permission system is core to Palace's ability to autonomously improve itself while maintaining safety.
 
-### MCP Server Configuration
+### Learning from Permissions
 
-**Quick setup:**
-```bash
-# Copy the provided MCP config to Claude Code
-mkdir -p ~/.claude-code
-cp mcp-config.json ~/.claude-code/mcp.json
+Over time, Palace will:
+- Track which permissions are frequently requested
+- Identify patterns in RHSI loops
+- Learn what should be auto-approved for efficiency
+- Flag unusual requests for review
 
-# Or merge with existing config if you have one
-```
+This creates a feedback loop where Palace becomes smarter about what changes are safe during self-improvement.
 
-The `mcp-config.json` file in this repo contains the Palace MCP server definition:
+### Next Steps to Fix MCP Registration
 
-```json
-{
-  "mcpServers": {
-    "palace-permissions": {
-      "command": "python3",
-      "args": ["/absolute/path/to/palace.py", "permissions"],
-      "env": {},
-      "description": "Palace permission handler for RHSI loops"
-    }
-  }
-}
-```
-
-**Important**: Update the path in `args` to match your Palace installation location.
-
-Then Palace can be invoked with:
-```bash
-claude -p "prompt" --permission-prompt-tool palace-permissions
-```
-
-The permission handler will:
-1. Receive permission requests from Claude via stdin (stream-json format)
-2. Log the request to `.palace/history.jsonl`
-3. Approve/deny based on Palace's permission logic
-4. Return response via stdout (stream-json format)
-
-This enables Palace to learn from permission patterns and eventually predict what should be allowed in the RHSI loop.
+1. Research Claude Code CLI MCP tool registration
+2. Find where MCP tools are configured (likely `~/.claude-code/` somewhere)
+3. Add Palace to that configuration
+4. Test that `--permission-prompt-tool` works
+5. Document the setup process here
 
 ## Overview
 

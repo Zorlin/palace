@@ -134,6 +134,8 @@ class Palace:
 
         Returns the exit code from Claude
         """
+        palace_path = Path(__file__).resolve()
+
         cmd = [
             "claude",
             "-p", prompt,
@@ -142,7 +144,7 @@ class Palace:
             "--include-partial-messages",
             "--input-format", "stream-json",
             "--output-format", "stream-json",
-            "--permission-prompt-tool", "palace-permissions"
+            "--permission-prompt-tool", f"python3 {palace_path} permissions"
         ]
 
         print("🏛️  Palace - Invoking Claude Code CLI...")
