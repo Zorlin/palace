@@ -139,6 +139,7 @@ class Palace:
         cmd = [
             "claude",
             "-p", prompt,
+            "--verbose",
             "--system-prompt",
             "--include-partial-messages",
             "--input-format", "stream-json",
