@@ -46,7 +46,16 @@ Error: MCP tool python3 /path/to/palace.py permissions (passed via --permission-
 
 ### MCP Server Configuration
 
-Add Palace to your Claude Code MCP config (typically `~/.config/claude-code/mcp.json` or `~/.claude-code/mcp.json`):
+**Quick setup:**
+```bash
+# Copy the provided MCP config to Claude Code
+mkdir -p ~/.claude-code
+cp mcp-config.json ~/.claude-code/mcp.json
+
+# Or merge with existing config if you have one
+```
+
+The `mcp-config.json` file in this repo contains the Palace MCP server definition:
 
 ```json
 {
@@ -54,11 +63,14 @@ Add Palace to your Claude Code MCP config (typically `~/.config/claude-code/mcp.
     "palace-permissions": {
       "command": "python3",
       "args": ["/absolute/path/to/palace.py", "permissions"],
-      "env": {}
+      "env": {},
+      "description": "Palace permission handler for RHSI loops"
     }
   }
 }
 ```
+
+**Important**: Update the path in `args` to match your Palace installation location.
 
 Then Palace can be invoked with:
 ```bash

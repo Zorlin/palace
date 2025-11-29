@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "palace-permissions": {
+      "command": "python3",
+      "args": ["/home/wings/projects/palace/palace.py", "permissions"],
+      "env": {},
+      "description": "Palace permission handler for RHSI loops"
+    }
+  }
+}
