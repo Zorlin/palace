@@ -1246,6 +1246,61 @@ try:
     # Create MCP server instance
     mcp = FastMCP("Palace")
 
+    def _assess_permission_safety(tool_name: str, tool_input: dict) -> dict:
+        """
+        Use Haiku to assess whether a permission request is safe.
+
+        Loads the command-safety skill from .palace/skills/command-safety.md
+        which users can customize to train the safety assessment.
+        """
+        try:
+            import anthropic
+
+            # Load the command-safety skill
+            palace = Palace()
+            skill_path = palace.palace_dir / "skills" / "command-safety.md"
+
+            if skill_path.exists():
+                skill_content = skill_path.read_text()
+            else:
+                # Default: approve everything if no skill file
+                return {"approved": True, "reason": "No command-safety skill configured"}
+
+            # Build the prompt for Haiku
+            prompt = f"""Tool: {tool_name}
+Input: {json.dumps(tool_input, indent=2)}
+
+Based on the safety guidelines, should this operation be approved?"""
+
+            # Call Haiku for fast safety assessment
+            client = anthropic.Anthropic()
+            response = client.messages.create(
+                model="claude-haiku-4-20250514",
+                max_tokens=256,
+                system=skill_content,
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+            # Parse the response
+            response_text = response.content[0].text.strip()
+
+            # Try to extract JSON from the response
+            if "{" in response_text and "}" in response_text:
+                json_start = response_text.find("{")
+                json_end = response_text.rfind("}") + 1
+                result = json.loads(response_text[json_start:json_end])
+                return {
+                    "approved": result.get("approved", True),
+                    "reason": result.get("reason", "Assessed by Haiku")
+                }
+
+            # Fallback: approve if we can't parse
+            return {"approved": True, "reason": "Could not parse safety response"}
+
+        except Exception as e:
+            # On any error, approve but log the issue
+            return {"approved": True, "reason": f"Safety check error: {str(e)[:100]}"}
+
     @mcp.tool()
     def handle_permission(
         tool_name: str = "",
@@ -1257,7 +1312,7 @@ try:
         Handle permission requests from Claude during RHSI loops.
 
         Claude Code sends permission requests with tool_name, input, and tool_use_id.
-        We auto-approve all requests for RHSI autonomous operation.
+        Uses Haiku to assess safety based on the trainable command-safety skill.
 
         Returns:
             dict with 'approved' (bool) and optional 'reason' (str)
@@ -1274,9 +1329,17 @@ try:
         }
         palace.log_action("permission_request", {"request": request_data})
 
-        # Auto-approve all requests for RHSI loops
-        # TODO: Add smart permission logic based on learning from history
-        return {"approved": True}
+        # Assess safety using Haiku and the command-safety skill
+        result = _assess_permission_safety(tool_name, input or {})
+
+        # Log the decision
+        palace.log_action("permission_decision", {
+            "tool_name": tool_name,
+            "approved": result.get("approved"),
+            "reason": result.get("reason")
+        })
+
+        return result
 
     MCP_AVAILABLE = True
 except ImportError:

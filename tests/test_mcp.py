@@ -201,3 +201,105 @@ class TestPermissionRequestStructure:
         assert "Bash" in logged_tools
         assert "Glob" in logged_tools
         assert "Grep" in logged_tools
+
+
+@pytest.mark.skipif(not MCP_AVAILABLE, reason="MCP not installed")
+class TestSafetyAssessment:
+    """Test Haiku-based safety assessment"""
+
+    @pytest.fixture
+    def temp_palace_with_skill(self, tmp_path):
+        """Create Palace with command-safety skill"""
+        os.chdir(tmp_path)
+        palace = Palace()
+        palace.ensure_palace_dir()
+
+        # Create skills directory and command-safety skill
+        skills_dir = palace.palace_dir / "skills"
+        skills_dir.mkdir(exist_ok=True)
+        skill_file = skills_dir / "command-safety.md"
+        skill_file.write_text("""# Test Safety Skill
+Respond with JSON: {"approved": true, "reason": "test"}""")
+
+        yield palace
+
+    def test_safety_assessment_without_skill(self, tmp_path):
+        """Without skill file, should approve with explanation"""
+        os.chdir(tmp_path)
+        palace = Palace()
+        palace.ensure_palace_dir()
+
+        from palace import _assess_permission_safety
+
+        result = _assess_permission_safety("Read", {"file_path": "/test.py"})
+        assert result["approved"] is True
+        assert "No command-safety skill" in result["reason"]
+
+    def test_safety_assessment_with_skill(self, temp_palace_with_skill):
+        """With skill file, should call Haiku (mocked)"""
+        from palace import _assess_permission_safety
+
+        # Mock anthropic client
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text='{"approved": true, "reason": "Safe read operation"}')]
+
+        with patch('anthropic.Anthropic') as mock_client:
+            mock_client.return_value.messages.create.return_value = mock_response
+
+            result = _assess_permission_safety("Read", {"file_path": "/test.py"})
+
+            assert result["approved"] is True
+            assert "Safe read operation" in result["reason"]
+
+    def test_safety_assessment_deny(self, temp_palace_with_skill):
+        """Should handle denial responses"""
+        from palace import _assess_permission_safety
+
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text='{"approved": false, "reason": "Dangerous operation"}')]
+
+        with patch('anthropic.Anthropic') as mock_client:
+            mock_client.return_value.messages.create.return_value = mock_response
+
+            result = _assess_permission_safety("Bash", {"command": "rm -rf /"})
+
+            assert result["approved"] is False
+            assert "Dangerous" in result["reason"]
+
+    def test_safety_assessment_error_fallback(self, temp_palace_with_skill):
+        """On API error, should approve with error explanation"""
+        from palace import _assess_permission_safety
+
+        with patch('anthropic.Anthropic') as mock_client:
+            mock_client.return_value.messages.create.side_effect = Exception("API error")
+
+            result = _assess_permission_safety("Read", {"file_path": "/test.py"})
+
+            assert result["approved"] is True
+            assert "error" in result["reason"].lower()
+
+    def test_permission_decision_logged(self, tmp_path):
+        """Permission decisions should be logged"""
+        os.chdir(tmp_path)
+        palace = Palace()
+        palace.ensure_palace_dir()
+
+        from palace import handle_permission
+
+        # Mock the safety assessment
+        with patch('palace._assess_permission_safety') as mock_assess:
+            mock_assess.return_value = {"approved": True, "reason": "Test approval"}
+
+            handle_permission(
+                tool_name="Read",
+                input={"file_path": "/test.py"},
+                tool_use_id="test-123"
+            )
+
+        # Check both logs exist
+        history_file = palace.palace_dir / "history.jsonl"
+        lines = history_file.read_text().strip().split('\n')
+
+        actions = [json.loads(l)["action"] for l in lines]
+        assert "permission_request" in actions
+        assert "permission_decision" in actions
