@@ -43,13 +43,15 @@ class TestEscapeDetection:
 
     def test_escape_sequence_not_triggered_by_single_esc(self, temp_palace):
         """Single ESC should not trigger interrupt"""
-        # Simulate single ESC keypress
-        temp_palace._last_esc_time = None
+        # Initialize escape handler
+        temp_palace._setup_escape_handler()
         result = temp_palace._check_escape_sequence(chr(27))  # ESC char
         assert result == "first_esc"  # Waiting for second
 
     def test_escape_sequence_triggered_by_double_esc(self, temp_palace):
         """ESC-ESC within timeout triggers interrupt"""
+        # Initialize escape handler
+        temp_palace._setup_escape_handler()
         # Simulate first ESC
         temp_palace._last_esc_time = time.time()
         # Simulate second ESC immediately
@@ -58,6 +60,8 @@ class TestEscapeDetection:
 
     def test_escape_sequence_timeout(self, temp_palace):
         """ESC-ESC with too much delay does not trigger"""
+        # Initialize escape handler
+        temp_palace._setup_escape_handler()
         # Simulate first ESC from 2 seconds ago
         temp_palace._last_esc_time = time.time() - 2.0
         # Simulate second ESC now (beyond 0.5s timeout)
@@ -67,7 +71,7 @@ class TestEscapeDetection:
 
     def test_non_esc_key_ignored(self, temp_palace):
         """Non-ESC keys don't trigger anything"""
-        temp_palace._last_esc_time = None
+        temp_palace._setup_escape_handler()
         result = temp_palace._check_escape_sequence('a')
         assert result is None
 
@@ -120,7 +124,7 @@ class TestSessionResume:
 
     def test_checkpoint_before_interrupt(self, temp_palace):
         """Session is checkpointed before handling interrupt"""
-        session_id = temp_palace.generate_session_id()
+        session_id = temp_palace._generate_session_id()
         session_state = {
             "iteration": 3,
             "pending_actions": [{"num": "1", "label": "Test task"}],
@@ -191,7 +195,7 @@ class TestInterruptIntegration:
 
     def test_full_interrupt_flow(self, temp_palace):
         """Full flow: detect ESC-ESC -> pause -> steer -> resume"""
-        session_id = temp_palace.generate_session_id()
+        session_id = temp_palace._generate_session_id()
 
         # Save initial session state
         temp_palace.save_session(session_id, {

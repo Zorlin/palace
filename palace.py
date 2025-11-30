@@ -710,6 +710,166 @@ Parse this and return JSON."""
         return f"{composed_content}\n\n{base_prompt}"
 
     # ========================================================================
+    # User Steering (ESC-ESC Interrupt)
+    # ========================================================================
+
+    def _setup_escape_handler(self):
+        """
+        Initialize escape sequence detection state.
+
+        Call this before starting stream processing to enable ESC-ESC detection.
+        """
+        self._last_esc_time = None
+        self._escape_timeout = 0.5  # 500ms window for double-tap
+
+    def _check_escape_sequence(self, char: str) -> Optional[str]:
+        """
+        Check if character is part of ESC-ESC sequence.
+
+        Returns:
+        - "first_esc": First ESC detected, waiting for second
+        - "interrupt": ESC-ESC sequence completed, trigger interrupt
+        - None: Not an ESC key
+        """
+        if char != chr(27):  # ESC character
+            return None
+
+        current_time = time.time()
+
+        if self._last_esc_time is None:
+            # First ESC
+            self._last_esc_time = current_time
+            return "first_esc"
+
+        # Check if within timeout window
+        elapsed = current_time - self._last_esc_time
+        if elapsed <= self._escape_timeout:
+            # Double-tap detected!
+            self._last_esc_time = None
+            return "interrupt"
+        else:
+            # Too slow, reset and treat as new first ESC
+            self._last_esc_time = current_time
+            return "first_esc"
+
+    def _check_for_escape(self) -> bool:
+        """
+        Non-blocking check for ESC keypress.
+
+        Returns True if ESC-ESC was detected.
+        Uses select() to check stdin without blocking.
+        """
+        import select
+        import sys
+        import tty
+        import termios
+
+        # Only works in TTY
+        if not sys.stdin.isatty():
+            return False
+
+        try:
+            # Save terminal settings
+            old_settings = termios.tcgetattr(sys.stdin)
+
+            try:
+                # Set terminal to raw mode (no echo, immediate input)
+                tty.setraw(sys.stdin.fileno())
+
+                # Check if input is available (non-blocking)
+                readable, _, _ = select.select([sys.stdin], [], [], 0)
+
+                if readable:
+                    char = sys.stdin.read(1)
+                    result = self._check_escape_sequence(char)
+                    return result == "interrupt"
+
+            finally:
+                # Restore terminal settings
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+        except Exception:
+            # Terminal manipulation failed, skip escape detection
+            pass
+
+        return False
+
+    def _handle_user_interrupt(self) -> Optional[Dict[str, Any]]:
+        """
+        Handle user interrupt (ESC-ESC).
+
+        Shows steering prompt and returns user input.
+
+        Returns dict with:
+        - action: "steer", "resume", or "abort"
+        - steering: User's steering text (if action is "steer")
+
+        Returns None if user cancels (empty input).
+        """
+        print("\n")
+        print("⏸️  " + "─" * 50)
+        print("   PALACE PAUSED - Enter steering command")
+        print("   (Press Enter to resume, /abort to stop)")
+        print("   " + "─" * 50)
+        print()
+
+        try:
+            steering = input("🎯 Steer: ").strip()
+
+            if not steering:
+                # Empty input = resume normally
+                print("▶️  Resuming...")
+                return {"action": "resume"}
+
+            if steering.lower() == "/abort":
+                print("🛑 Aborting session...")
+                return {"action": "abort"}
+
+            # Log the steering
+            self.log_steering(steering)
+
+            print(f"✅ Steering applied: {steering[:50]}...")
+            return {"action": "steer", "steering": steering}
+
+        except (EOFError, KeyboardInterrupt):
+            print("\n▶️  Resuming...")
+            return {"action": "resume"}
+
+    def log_steering(self, steering: str):
+        """Log user steering to history for learning"""
+        self.log_action("user_steering", {"steering": steering})
+
+    def build_prompt_with_steering(self, task_prompt: str, steering: str = None,
+                                    context: Dict[str, Any] = None) -> str:
+        """
+        Build prompt with optional user steering context.
+
+        If steering is provided, adds a prominent section for user direction.
+        """
+        base_prompt = self.build_prompt(task_prompt, context)
+
+        if not steering:
+            return base_prompt
+
+        steering_section = f"""
+## 🎯 USER STEERING
+
+The user has provided this direction - prioritize it:
+
+> {steering}
+
+Take this into account as you continue the task.
+
+"""
+        # Insert steering after the task description
+        parts = base_prompt.split("## Project Context", 1)
+        if len(parts) == 2:
+            return parts[0] + steering_section + "## Project Context" + parts[1]
+
+        # Fallback: prepend steering
+        return steering_section + base_prompt
+
+    # ========================================================================
     # Error Recovery
     # ========================================================================
 
@@ -1710,10 +1870,58 @@ After running this, read the generated prompt and run the tests.
             print(f"   • /{cmd}")
 
         print()
+
+        # Install 'pal' CLI alias
+        self._install_pal_alias(palace_path)
+
+        print()
         print("🎉 Palace is now integrated with Claude Code!")
         print()
         print("Output style 'palace-menu' enables action menus.")
-        print("Try: /pal-next")
+        print("Try: /pal-next or just: pal next")
+
+    def _install_pal_alias(self, palace_path: Path):
+        """Install 'pal' command alias to ~/.local/bin"""
+        bin_dir = Path.home() / ".local" / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+
+        pal_script = bin_dir / "pal"
+
+        # Determine the Python interpreter to use
+        palace_venv = palace_path.parent / ".venv" / "bin" / "python"
+        if palace_venv.exists():
+            python_path = str(palace_venv)
+        else:
+            python_path = sys.executable
+
+        script_content = f'''#!/bin/bash
+# Palace CLI - installed by 'palace.py install'
+# Usage: pal <command> [args]
+#   pal next      - Suggest next step
+#   pal new       - Create new project
+#   pal scaffold  - Scaffold project
+#   pal test      - Run tests
+#   pal install   - Install/update Palace
+#   pal sessions  - List sessions
+
+exec "{python_path}" "{palace_path}" "$@"
+'''
+
+        with open(pal_script, 'w') as f:
+            f.write(script_content)
+
+        # Make executable
+        pal_script.chmod(0o755)
+
+        print(f"✅ Installed 'pal' command: {pal_script}")
+
+        # Check if ~/.local/bin is in PATH
+        path_dirs = os.environ.get("PATH", "").split(":")
+        if str(bin_dir) not in path_dirs:
+            print()
+            print("⚠️  Add ~/.local/bin to your PATH:")
+            print('   export PATH="$HOME/.local/bin:$PATH"')
+            print("   (Add to ~/.bashrc or ~/.zshrc for persistence)")
 
     def cmd_init(self, args):
         """Initialize Palace in current directory"""
