@@ -275,6 +275,53 @@ class TestSessionManagement:
         assert sessions[0]["pending_actions"] == 1
         assert sessions[1]["session_id"] == "pal-first1"
 
+    def test_session_resumption_with_actions(self, temp_palace):
+        """Session can be resumed with pending actions"""
+        session_id = "pal-resume1"
+        pending = [
+            {"num": "1", "label": "Write tests", "description": "Add unit tests"},
+            {"num": "2", "label": "Run build", "description": "Execute build"}
+        ]
+
+        temp_palace.save_session(session_id, {
+            "iteration": 2,
+            "pending_actions": pending,
+            "context": {"project_root": str(temp_palace.project_root)}
+        })
+
+        loaded = temp_palace.load_session(session_id)
+        assert loaded is not None
+        assert loaded["iteration"] == 2
+        assert len(loaded["pending_actions"]) == 2
+        assert loaded["pending_actions"][0]["label"] == "Write tests"
+
+    def test_session_action_selection_parsing(self, temp_palace):
+        """Session actions can be filtered with parse_action_selection"""
+        actions = [
+            {"num": "1", "label": "Task 1"},
+            {"num": "2", "label": "Task 2"},
+            {"num": "3", "label": "Task 3"}
+        ]
+
+        # Simulate user selecting subset
+        selected = temp_palace.parse_action_selection("1 3", actions)
+        assert len(selected) == 2
+        assert selected[0]["label"] == "Task 1"
+        assert selected[1]["label"] == "Task 3"
+
+    def test_session_with_modifiers(self, temp_palace):
+        """Session actions can have modifiers applied during selection"""
+        actions = [
+            {"num": "1", "label": "Deploy app"},
+            {"num": "2", "label": "Run tests"}
+        ]
+
+        selected = temp_palace.parse_action_selection("1 2 (follow TDD)", actions)
+        assert len(selected) == 2
+        for action in selected:
+            assert "_modifiers" in action
+            assert "follow TDD" in action["_modifiers"]
+
 
 class TestActionSelectionParsing:
     """Test action selection parsing for RHSI loops"""
