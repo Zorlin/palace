@@ -140,13 +140,24 @@ class Palace:
 
         Returns the exit code from Claude
         """
+        # Menu format instructions for action selection
+        menu_prompt = """When presenting choices or suggesting next actions, format as:
+
+ACTIONS:
+1. First option with description
+   Additional context if needed.
+
+2. Second option
+   More details here.
+
+Use numbered items, with optional indented descriptions."""
+
         cmd = [
             "claude",
             "-p", prompt,
             "--model", "claude-sonnet-4-5",
-            "--output-style", "palace-menu",
+            "--append-system-prompt", menu_prompt,
             "--verbose",
-            "--system-prompt",
             "--include-partial-messages",
             "--input-format", "stream-json",
             "--output-format", "stream-json",
