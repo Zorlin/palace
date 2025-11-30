@@ -142,6 +142,8 @@ class Palace:
         cmd = [
             "claude",
             "-p", prompt,
+            "--model", "claude-sonnet-4-5",
+            "--output-style", "palace-menu",
             "--verbose",
             "--system-prompt",
             "--include-partial-messages",
