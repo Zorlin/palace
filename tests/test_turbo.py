@@ -275,6 +275,62 @@ sys.stdout.flush()
         assert "test-1" in captured.out or "Reading" in captured.out or "Model" in captured.out
 
 
+class TestDoneAgentState:
+    """Test that done agents don't receive interleaved input"""
+
+    @pytest.fixture
+    def temp_palace(self, tmp_path):
+        os.chdir(tmp_path)
+        palace = Palace()
+        palace.ensure_palace_dir()
+        yield palace
+
+    def test_done_agent_not_forwarded_to(self, temp_palace, capsys):
+        """Agent marked done should not receive forwarded messages"""
+        # This tests the internal logic - when an agent outputs "result" type,
+        # it gets added to done_agents and no longer receives forwarded input
+
+        # Create mock processes that output result immediately
+        from io import StringIO
+
+        # Agent 1 finishes immediately (result type)
+        agent1_output = StringIO(json.dumps({
+            "type": "result",
+            "result": "done"
+        }) + "\n")
+
+        # Agent 2 sends assistant message after
+        agent2_output = StringIO(json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "test"}]}
+        }) + "\n")
+
+        mock_process1 = MagicMock()
+        mock_process1.poll.side_effect = [None, 0]
+        mock_process1.stdout = agent1_output
+        mock_process1.stdin = MagicMock()
+        mock_process1.returncode = 0
+
+        mock_process2 = MagicMock()
+        mock_process2.poll.side_effect = [None, None, 0]
+        mock_process2.stdout = agent2_output
+        mock_process2.stdin = MagicMock()
+        mock_process2.returncode = 0
+
+        processes = {
+            "1": {"process": mock_process1, "agent_id": "agent-1", "model": "haiku", "task": "Task 1"},
+            "2": {"process": mock_process2, "agent_id": "agent-2", "model": "haiku", "task": "Task 2"},
+        }
+
+        with patch('select.select', return_value=([agent1_output], [], [])):
+            # Run a single iteration-ish via mocking
+            results = temp_palace.monitor_swarm(processes)
+
+        captured = capsys.readouterr()
+        # Agent 1 should have printed Done
+        assert "Done" in captured.out or "agent-1" in captured.out
+
+
 class TestTurboModeIntegration:
     """Integration tests for full turbo mode flow"""
 

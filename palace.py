@@ -1392,6 +1392,86 @@ Return JSON only:
             for t in tasks
         }
 
+    def evaluate_turbo_completion(self) -> Dict[str, Any]:
+        """
+        Evaluate if turbo mode goals are complete using Opus.
+
+        Reads README.md and specs, evaluates codebase state, decides if done.
+        Returns: {complete: bool, reason: str, next_tasks: list}
+        """
+        import anthropic
+
+        # Gather context
+        readme_content = ""
+        spec_content = ""
+
+        readme_path = self.project_root / "README.md"
+        if readme_path.exists():
+            readme_content = readme_path.read_text()[:4000]  # Limit size
+
+        spec_path = self.project_root / "SPEC.md"
+        if spec_path.exists():
+            spec_content = spec_path.read_text()[:2000]
+
+        # Get file listing
+        try:
+            import subprocess
+            files = subprocess.run(
+                ["find", ".", "-type", "f", "-name", "*.py", "-o", "-name", "*.md", "-o", "-name", "*.toml"],
+                cwd=self.project_root,
+                capture_output=True,
+                text=True,
+                timeout=5
+            ).stdout[:2000]
+        except:
+            files = ""
+
+        prompt = f"""Evaluate if the project goals are complete.
+
+README.md:
+{readme_content}
+
+{f"SPEC.md:{chr(10)}{spec_content}" if spec_content else ""}
+
+Current files:
+{files}
+
+Based on the README requirements, is the project complete?
+
+Reply with JSON only:
+{{"complete": true/false, "reason": "brief explanation", "next_tasks": ["task1", "task2"] if not complete else []}}"""
+
+        try:
+            # Use Z.ai for evaluation (same as turbo mode agents)
+            zai_key = os.environ.get("ZAI_API_KEY", "")
+            if zai_key:
+                client = anthropic.Anthropic(
+                    api_key=zai_key,
+                    base_url="https://api.z.ai/api/anthropic"
+                )
+            else:
+                client = anthropic.Anthropic()
+
+            response = client.messages.create(
+                model="glm-4.6",  # Use GLM for cheap evaluation
+                max_tokens=500,
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+            response_text = response.content[0].text.strip()
+
+            # Parse JSON from response
+            if "{" in response_text:
+                json_start = response_text.find("{")
+                json_end = response_text.rfind("}") + 1
+                return json.loads(response_text[json_start:json_end])
+
+            return {"complete": True, "reason": "Evaluation complete", "next_tasks": []}
+
+        except Exception as e:
+            # On error, assume complete to avoid infinite loops
+            return {"complete": True, "reason": f"Evaluation error: {str(e)[:50]}", "next_tasks": []}
+
     def build_swarm_prompt(self, task: str, agent_id: str, base_context: str = "") -> str:
         """Build simple task prompt for swarm agent"""
         prompt_parts = [
@@ -1416,12 +1496,15 @@ Return JSON only:
         config = self.get_provider_config()
 
         for task_num, assignment in assignments.items():
-            model_alias = assignment.get("model", "sonnet")
+            model_alias = assignment.get("model", "sonnet")  # Keep for effort labeling
             task = assignment.get("task", {})
             task_label = task.get("label", f"Task {task_num}")
 
-            # Resolve model to provider
-            provider, model = self.resolve_model(model_alias)
+            # TURBO MODE: Always use GLM-4.6 via Z.ai for cheap parallel execution
+            # The model_alias (haiku/sonnet/opus) indicates ranked effort level
+            # but actual execution always uses GLM for cost efficiency
+            provider = "z.ai"
+            model = "glm-4.6"
             provider_config = config["providers"].get(provider, {})
 
             agent_id = f"{model_alias}-{task_num}"
@@ -1438,14 +1521,35 @@ Return JSON only:
             api_key_env = provider_config.get("api_key_env", "ANTHROPIC_API_KEY")
             base_url = provider_config.get("base_url", "")
 
-            if base_url and "anthropic.com" not in base_url:
+            # Route to correct provider API
+            if provider == "anthropic":
+                # Use default Anthropic - unset any overrides
+                env.pop("ANTHROPIC_AUTH_TOKEN", None)
+                env.pop("ANTHROPIC_BASE_URL", None)
+            elif provider == "z.ai":
+                # Z.ai uses Anthropic format with different endpoint
+                zai_key = os.environ.get("ZAI_API_KEY", "")
+                if zai_key:
+                    env["ANTHROPIC_AUTH_TOKEN"] = zai_key
+                    env["ANTHROPIC_BASE_URL"] = "https://api.z.ai/api/anthropic"
+            elif provider == "openrouter":
+                # OpenRouter needs translation - TODO: set up translator proxy
+                openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+                if openrouter_key:
+                    env["ANTHROPIC_AUTH_TOKEN"] = openrouter_key
+                    # TODO: Need translator proxy URL for OpenRouter
+                    # env["ANTHROPIC_BASE_URL"] = "http://localhost:8080/openrouter"
+            elif base_url and "anthropic.com" not in base_url:
                 env["ANTHROPIC_BASE_URL"] = base_url
 
             # System prompt for swarm agent
             swarm_system = f"""You are agent {agent_id} in a parallel swarm.
-Other agents are working on related tasks simultaneously.
-Execute your assigned task fully - use tools to read, write, and modify files.
-Do NOT just plan or discuss - actually DO the work."""
+
+When your task is complete: output a summary, then stop.
+
+If you verify another agent's task is complete (tests pass), output:
+[VERIFIED: agent-id]
+This tells Palace to stop that agent."""
 
             # Build CLI command - bidirectional streaming JSON
             cmd = [
@@ -1458,8 +1562,13 @@ Do NOT just plan or discuss - actually DO the work."""
                 "--permission-prompt-tool", "mcp__palace__handle_permission",
             ]
 
-            # Debug: show what we're running
-            print(f"   🚀 {agent_id}: claude --model {model}")
+            # Debug: show what we're running and which API
+            api_target = "Anthropic"
+            if provider == "z.ai":
+                api_target = "Z.ai"
+            elif provider == "openrouter":
+                api_target = "OpenRouter"
+            print(f"   🚀 {agent_id}: {model} via {api_target}")
 
             try:
                 process = subprocess.Popen(
@@ -1514,6 +1623,11 @@ Do NOT just plan or discuss - actually DO the work."""
         buffers = {num: "" for num in active}
         seen_tools = set()
 
+        # Track which agents have marked themselves as "Done"
+        # Done agents don't receive interleaved input until USER gives new input
+        # This prevents the "long tail" problem of agents triggering each other
+        done_agents = set()
+
         # Track agent confidence (based on activity patterns)
         # confidence: 1.0 = highly confident, 0.0 = stuck
         agent_confidence = {num: 1.0 for num in active}
@@ -1565,6 +1679,9 @@ Do NOT just plan or discuss - actually DO the work."""
                     remaining = process.stdout.read()
                     buffers[task_num] += remaining
 
+                    # Calculate duration
+                    duration = time.time() - agent_last_action.get(task_num, time.time())
+
                     results[task_num] = {
                         "agent": agent_id,
                         "exit_code": process.returncode,
@@ -1579,9 +1696,17 @@ Do NOT just plan or discuss - actually DO the work."""
                         if output_preview:
                             print(f"   Output: {output_preview}")
                     else:
-                        print(f"✅ {agent_id} finished")
+                        was_done = task_num in done_agents
+                        status = "✅" if was_done else "⏱️"
+                        print(f"{status} {agent_id} finished (exit 0, {'completed task' if was_done else 'no result msg'})")
 
                     del active[task_num]
+                    continue
+
+                # Skip processing if agent already marked done
+                # (still in active dict waiting for process to exit, but no more output processing)
+                if task_num in done_agents:
+                    time.sleep(0.01)
                     continue
 
                 # Read available output (non-blocking)
@@ -1644,14 +1769,60 @@ Do NOT just plan or discuss - actually DO the work."""
                                                 ts = confidence_timestamp(task_num)
                                                 print(f"{ts}[{agent_id}] {text}", end="", flush=True)
 
+                                                # Check for peer verification
+                                                import re
+                                                verify_match = re.search(r'\[VERIFIED:\s*(\S+)\]', text)
+                                                if verify_match:
+                                                    target_agent = verify_match.group(1)
+                                                    # Find and stop the verified agent
+                                                    for other_num, other_info in list(active.items()):
+                                                        if other_info["agent_id"] == target_agent and other_num not in done_agents:
+                                                            print(f"\n🔒 {target_agent} verified complete by {agent_id}")
+                                                            done_agents.add(other_num)
+                                                            # Tell agent to stop
+                                                            try:
+                                                                stop_msg = {"type": "user", "message": {"role": "user", "content": "Your task has been verified complete. Stop now."}}
+                                                                other_info["process"].stdin.write(json.dumps(stop_msg) + "\n")
+                                                                other_info["process"].stdin.flush()
+                                                                other_info["process"].stdin.close()
+                                                                other_info["process"].terminate()
+                                                            except:
+                                                                pass
+                                                            results[other_num] = {
+                                                                "agent": target_agent,
+                                                                "exit_code": 0,
+                                                                "output": buffers.get(other_num, ""),
+                                                                "completed": True,
+                                                                "verified_by": agent_id
+                                                            }
+                                                            del active[other_num]
+
                                 elif msg_type == "result":
                                     ts = confidence_timestamp(task_num)
                                     print(f"{ts}[{agent_id}] ✅ Done")
+                                    # Mark agent as done - fully stop it NOW
+                                    done_agents.add(task_num)
+                                    # Kill the process immediately - don't wait for cleanup
+                                    try:
+                                        process.stdin.close()
+                                        process.terminate()
+                                    except:
+                                        pass
+                                    # Record result and remove from active
+                                    results[task_num] = {
+                                        "agent": agent_id,
+                                        "exit_code": 0,
+                                        "output": buffers[task_num],
+                                        "completed": True
+                                    }
+                                    del active[task_num]
+                                    break  # Stop processing this agent
 
-                                # Forward to ALL agents - convert output format to input format
+                                # Forward to active (non-done) agents - convert output format to input format
                                 # Output: {"type": "assistant", "message": {"content": [...]}}
                                 # Input:  {"type": "user", "message": {"role": "user", "content": "..."}}
-                                if msg_type == "assistant":
+                                # Skip forwarding if sender is done (prevents long-tail triggering)
+                                if msg_type == "assistant" and task_num not in done_agents:
                                     # Convert Anthropic content array to text for forwarding
                                     content = msg.get("message", {}).get("content", [])
                                     converted = self._convert_output_to_input(agent_id, content)
@@ -1662,7 +1833,8 @@ Do NOT just plan or discuss - actually DO the work."""
                                         }
                                         context_line = json.dumps(context_msg) + "\n"
                                         for other_num, other_info in active.items():
-                                            if other_num != task_num:
+                                            # Skip: self, done agents
+                                            if other_num != task_num and other_num not in done_agents:
                                                 try:
                                                     other_info["process"].stdin.write(context_line)
                                                     other_info["process"].stdin.flush()
@@ -2427,6 +2599,7 @@ The "ACTIONS:" header is required (exact spelling with colon) - it triggers the 
         resume_id = getattr(args, 'resume', None)
         selection = getattr(args, 'select', None)
         turbo_mode = getattr(args, 'turbo', False)
+        guidance = ' '.join(getattr(args, 'guidance', []))
 
         session_id = None
         iteration = 0
@@ -2466,7 +2639,18 @@ The "ACTIONS:" header is required (exact spelling with colon) - it triggers the 
             session_id = self._generate_session_id()
 
         # Initial prompt for first iteration
-        initial_prompt = """Analyze this project and suggest possible next actions.
+        if guidance:
+            initial_prompt = f"""Analyze this project and suggest possible next actions.
+
+USER GUIDANCE: {guidance}
+
+Focus your suggestions on what the user has asked for above.
+Check SPEC.md and ROADMAP.md if they exist for context.
+
+Provide as many options as you see fit - there may be many valid paths forward.
+Be concrete and actionable. The user will select which action(s) to execute."""
+        else:
+            initial_prompt = """Analyze this project and suggest possible next actions.
 
 Consider what exists, what's in progress, and what could come next.
 Check SPEC.md and ROADMAP.md if they exist.
@@ -2540,8 +2724,27 @@ Be concrete and actionable. The user will select which action(s) to execute."""
                     "results": {k: v.get("exit_code", -1) for k, v in result.get("results", {}).items()}
                 })
 
-                print("\n✅ Turbo mode complete!")
-                break
+                print("\n✅ Swarm round complete!")
+
+                # Evaluate if we should continue or stop
+                evaluation = self.evaluate_turbo_completion()
+
+                if evaluation.get("complete"):
+                    print(f"\n🏆 {evaluation.get('reason', 'Goals achieved!')}")
+                    break
+                else:
+                    # Continue with next RHSI loop
+                    print(f"\n🔄 {evaluation.get('reason', 'More work needed...')}")
+                    next_tasks = evaluation.get("next_tasks", [])
+                    if next_tasks:
+                        # Convert to action format for next iteration
+                        selected_actions = [{"label": t, "description": ""} for t in next_tasks]
+                        current_prompt = self._build_action_prompt(selected_actions)
+                        continue
+                    else:
+                        # No specific tasks, let Claude decide
+                        current_prompt = "Evaluate the current state and suggest next actions. Include an ACTIONS: section."
+                        continue
 
             # Build prompt for next iteration based on selected actions
             current_prompt = self._build_action_prompt(selected_actions)
@@ -2712,32 +2915,67 @@ for this project type."""
         print("🏛️  Palace - Installing to Claude Code")
         print()
 
-        # Install Python dependencies using uv (preferred) or pip
-        print("📦 Installing dependencies...")
-        deps = ["questionary", "rich", "anthropic", "mcp"]
-
-        # Check for palace venv or use uv
-        palace_venv = Path(__file__).resolve().parent / ".venv" / "bin" / "python"
+        palace_dir = Path(__file__).resolve().parent
+        palace_venv = palace_dir / ".venv"
         uv_path = Path.home() / ".local" / "bin" / "uv"
 
-        try:
-            if uv_path.exists():
-                # Use uv pip install
-                cmd = [str(uv_path), "pip", "install", "--quiet"] + deps
-                result = subprocess.run(cmd, capture_output=True, text=True)
-            elif palace_venv.exists():
-                # Use palace venv pip
-                cmd = [str(palace_venv), "-m", "pip", "install", "--quiet"] + deps
-                result = subprocess.run(cmd, capture_output=True, text=True)
+        # Step 1: Ensure uv is installed
+        if not uv_path.exists():
+            # Check if uv is in PATH
+            uv_in_path = shutil.which("uv")
+            if uv_in_path:
+                uv_path = Path(uv_in_path)
             else:
-                # Fallback to system pip (may fail on managed environments)
-                cmd = [sys.executable, "-m", "pip", "install", "--quiet"] + deps
-                result = subprocess.run(cmd, capture_output=True, text=True)
+                print("📦 Installing uv (Python package manager)...")
+                try:
+                    result = subprocess.run(
+                        ["curl", "-LsSf", "https://astral.sh/uv/install.sh"],
+                        capture_output=True, text=True
+                    )
+                    if result.returncode == 0:
+                        # Pipe to sh
+                        install_result = subprocess.run(
+                            ["sh"], input=result.stdout,
+                            capture_output=True, text=True
+                        )
+                        if install_result.returncode == 0:
+                            print("✅ uv installed")
+                            uv_path = Path.home() / ".local" / "bin" / "uv"
+                        else:
+                            print(f"⚠️  uv install failed: {install_result.stderr}")
+                            print("   Install manually: curl -LsSf https://astral.sh/uv/install.sh | sh")
+                            return
+                    else:
+                        print("⚠️  Could not download uv installer")
+                        print("   Install manually: curl -LsSf https://astral.sh/uv/install.sh | sh")
+                        return
+                except FileNotFoundError:
+                    print("⚠️  curl not found. Install uv manually:")
+                    print("   curl -LsSf https://astral.sh/uv/install.sh | sh")
+                    return
 
+        # Step 2: Create venv and sync dependencies
+        print("📦 Setting up Python environment...")
+        try:
+            # uv sync creates venv and installs from pyproject.toml
+            result = subprocess.run(
+                [str(uv_path), "sync"],
+                cwd=palace_dir,
+                capture_output=True, text=True
+            )
             if result.returncode == 0:
-                print(f"✅ Installed: {', '.join(deps)}")
+                print("✅ Dependencies installed")
             else:
-                print(f"⚠️  Install failed. Try: uv pip install {' '.join(deps)}")
+                print(f"⚠️  uv sync failed: {result.stderr}")
+                # Fallback: try creating venv and pip install
+                if not palace_venv.exists():
+                    subprocess.run([str(uv_path), "venv"], cwd=palace_dir, capture_output=True)
+                deps = ["questionary", "rich", "anthropic", "mcp", "json-stream", "pytest"]
+                subprocess.run(
+                    [str(uv_path), "pip", "install"] + deps,
+                    cwd=palace_dir, capture_output=True
+                )
+                print("✅ Dependencies installed (fallback)")
         except Exception as e:
             print(f"⚠️  Could not install dependencies: {e}")
         print()
@@ -2838,24 +3076,21 @@ After running this, read the generated prompt and run the tests.
 
         pal_script = bin_dir / "pal"
 
-        # Determine the Python interpreter to use
-        palace_venv = palace_path.parent / ".venv" / "bin" / "python"
-        if palace_venv.exists():
-            python_path = str(palace_venv)
-        else:
-            python_path = sys.executable
+        # Always use the venv python (created by install)
+        palace_venv_python = palace_path.parent / ".venv" / "bin" / "python"
 
         script_content = f'''#!/bin/bash
 # Palace CLI - installed by 'palace.py install'
 # Usage: pal <command> [args]
 #   pal next      - Suggest next step
+#   pal next <guidance> - Suggest with focus (e.g., "pal next focus on testing")
 #   pal new       - Create new project
 #   pal scaffold  - Scaffold project
 #   pal test      - Run tests
 #   pal install   - Install/update Palace
 #   pal sessions  - List sessions
 
-exec "{python_path}" "{palace_path}" "$@"
+exec "{palace_venv_python}" "{palace_path}" "$@"
 '''
 
         with open(pal_script, 'w') as f:
@@ -3164,6 +3399,8 @@ def main():
 
     # Commands that invoke Claude
     parser_next = subparsers.add_parser('next', help='Ask Claude what to do next (RHSI core)')
+    parser_next.add_argument('guidance', nargs='*', default=[],
+                             help='Optional guidance to focus suggestions (e.g., "focus on testing")')
     parser_next.add_argument('--resume', '-r', metavar='SESSION_ID',
                              help='Resume a paused session')
     parser_next.add_argument('--select', '-s', metavar='SELECTION',

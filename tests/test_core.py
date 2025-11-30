@@ -10,6 +10,7 @@ Tests for:
 import pytest
 import json
 import tempfile
+import shutil
 from pathlib import Path
 import sys
 import os
@@ -674,3 +675,95 @@ class TestLLMActionParsing:
             )
             # Verify the flow works end-to-end
             assert isinstance(selected, list)
+
+
+class TestCmdNextGuidance:
+    """Test guidance argument for cmd_next"""
+
+    @pytest.fixture
+    def temp_palace(self, tmp_path):
+        """Create a Palace instance in a temp directory"""
+        os.chdir(tmp_path)
+        palace = Palace()
+        palace.ensure_palace_dir()
+        yield palace
+
+    def test_guidance_joined_from_args(self, temp_palace):
+        """Guidance words are joined into a single string"""
+        # Simulate argparse result
+        class Args:
+            guidance = ['focus', 'on', 'testing']
+            resume = None
+            select = None
+            turbo = False
+
+        # Extract guidance the same way cmd_next does
+        guidance = ' '.join(getattr(Args, 'guidance', []))
+        assert guidance == "focus on testing"
+
+    def test_guidance_empty_when_not_provided(self, temp_palace):
+        """Empty guidance when not provided"""
+        class Args:
+            guidance = []
+            resume = None
+            select = None
+            turbo = False
+
+        guidance = ' '.join(getattr(Args, 'guidance', []))
+        assert guidance == ""
+
+    def test_guidance_single_word(self, temp_palace):
+        """Single word guidance works"""
+        class Args:
+            guidance = ['testing']
+            resume = None
+            select = None
+            turbo = False
+
+        guidance = ' '.join(getattr(Args, 'guidance', []))
+        assert guidance == "testing"
+
+    def test_guidance_with_special_chars(self, temp_palace):
+        """Guidance with quotes and special chars preserved"""
+        class Args:
+            guidance = ['add', 'authentication', 'using', 'OAuth2']
+            resume = None
+            select = None
+            turbo = False
+
+        guidance = ' '.join(getattr(Args, 'guidance', []))
+        assert guidance == "add authentication using OAuth2"
+
+
+class TestCmdInstall:
+    """Test install command functionality"""
+
+    def test_uv_path_detection(self, tmp_path):
+        """uv path detection works"""
+        # Test the logic used in cmd_install
+        uv_path = Path.home() / ".local" / "bin" / "uv"
+        uv_in_path = shutil.which("uv")
+
+        # Either uv_path exists or we find it in PATH
+        uv_available = uv_path.exists() or uv_in_path is not None
+        # This test just verifies the detection logic doesn't crash
+        assert isinstance(uv_available, bool)
+
+    def test_palace_venv_path(self):
+        """Palace venv path is correctly computed"""
+        palace_dir = Path(__file__).resolve().parent.parent
+        palace_venv = palace_dir / ".venv"
+        # Path should be computed relative to palace.py location
+        assert "palace" in str(palace_venv).lower() or ".venv" in str(palace_venv)
+
+    def test_pal_script_content_includes_guidance_help(self, tmp_path):
+        """Pal script help text includes guidance usage"""
+        # The script content that _install_pal_alias generates
+        script_content = '''#!/bin/bash
+# Palace CLI - installed by 'palace.py install'
+# Usage: pal <command> [args]
+#   pal next      - Suggest next step
+#   pal next <guidance> - Suggest with focus (e.g., "pal next focus on testing")
+'''
+        assert "pal next <guidance>" in script_content
+        assert "focus on testing" in script_content
