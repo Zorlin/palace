@@ -524,9 +524,6 @@ def main():
     else:
         parser.print_help()
 
-if __name__ == "__main__":
-    main()
-
 # ============================================================================
 # MCP Server Integration
 # ============================================================================
@@ -564,7 +561,17 @@ try:
         # TODO: Add smart permission logic based on learning from history
         return {"approved": True}
 
+    MCP_AVAILABLE = True
 except ImportError:
     # MCP not installed - server functionality unavailable
     # This is fine for CLI-only usage
-    pass
+    MCP_AVAILABLE = False
+
+if __name__ == "__main__":
+    # If no arguments, run as MCP server (for Claude Code integration)
+    # If arguments provided, run as CLI
+    if len(sys.argv) == 1 and MCP_AVAILABLE:
+        # No arguments - start MCP server
+        mcp.run()
+    else:
+        main()
