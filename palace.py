@@ -778,21 +778,22 @@ The "ACTIONS:" header is required (exact spelling with colon) - it triggers the 
             session_id = self._generate_session_id()
 
         # Initial prompt for first iteration
-        initial_prompt = """Analyze this project and suggest what to do next.
+        initial_prompt = """Analyze this project and suggest possible next actions.
 
 Consider:
 1. What exists already (check the files context)
 2. What's in progress (check git status and recent history)
-3. What should come next in a logical development flow
+3. What could come next in a logical development flow
 4. The project's SPEC.md and ROADMAP.md if they exist
 
-Provide:
-- A clear next action to take
-- Why this is the logical next step
-- How to execute it (specific commands or steps)
+Provide MULTIPLE options - there may be many valid paths forward. Include:
+- Quick wins and small improvements
+- Larger features or refactors
+- Testing, documentation, cleanup tasks
+- Any blockers or issues to address
 
-Be concrete and actionable. This is part of a Recursive Hierarchical Self Improvement loop,
-so your suggestion will be used to actually advance the project."""
+Be concrete and actionable. This is part of a Recursive Hierarchical Self Improvement loop.
+The user will select which action(s) to execute from your suggestions."""
 
         current_prompt = initial_prompt
 
@@ -852,7 +853,7 @@ so your suggestion will be used to actually advance the project."""
                 task_desc = action.get("label", "")
                 return f"""Execute this task: {task_desc}
 
-After completing, suggest what to do next. Include an ACTIONS: section with your recommendations."""
+After completing, suggest possible next actions. Include an ACTIONS: section with multiple options."""
             else:
                 task_desc = action.get("label", "")
                 task_detail = action.get("description", "")
@@ -861,7 +862,7 @@ After completing, suggest what to do next. Include an ACTIONS: section with your
                 return f"""Execute this action: {task_desc}
 {f"Details: {task_detail}" if task_detail else ""}{mod_text}
 
-After completing, suggest what to do next. Include an ACTIONS: section with your recommendations."""
+After completing, suggest possible next actions. Include an ACTIONS: section with multiple options."""
         else:
             tasks = []
             for a in actions:
@@ -873,7 +874,7 @@ After completing, suggest what to do next. Include an ACTIONS: section with your
             return f"""Execute these actions in order:
 {chr(10).join(tasks)}
 
-After completing all, suggest what to do next. Include an ACTIONS: section with your recommendations."""
+After completing all, suggest possible next actions. Include an ACTIONS: section with multiple options."""
 
     def _show_non_interactive_output(self, result, context: Dict[str, Any], session_id: str = None, iteration: int = 1):
         """Show output for non-interactive mode and save session state"""
