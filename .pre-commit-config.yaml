@@ -1,0 +1,47 @@
+# Pre-commit hooks for Palace
+# Install with: pre-commit install
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: mixed-line-ending
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: [--fix, --select, "E,F,W", --ignore, "E501"]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: bash -c 'source .venv/bin/activate && pytest tests/ -x'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [commit]
+
+      - id: no-debug-statements
+        name: Check for debug statements
+        entry: bash -c 'if git diff --cached | grep -E "(print\(|pdb\.set_trace|breakpoint\(\))"; then echo "Found debug statements"; exit 1; fi'
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: test-coverage
+        name: Check test coverage
+        entry: bash -c 'source .venv/bin/activate && pytest tests/ --cov=palace --cov-fail-under=80 --cov-report=term-missing'
+        language: system
+        pass_filenames: false
+        stages: [push]
