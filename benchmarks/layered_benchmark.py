@@ -83,8 +83,8 @@ class BenchmarkResult:
     error: Optional[str] = None
 
 
-class SelfReplicationBenchmark:
-    """Benchmark Palace's self-replication capability"""
+class LayeredBenchmark:
+    """Two-layer benchmark: Palace→Palace→Asteroids"""
 
     def __init__(self, provider: str = "anthropic", model: Optional[str] = None):
         self.provider = provider
@@ -386,9 +386,9 @@ pytest tests/ -v --cov=. --cov-report=term-missing
         finally:
             os.chdir(self.original_dir)
 
-    def validate_replication(self, work_dir: Path) -> Dict[str, Any]:
-        """Validate the replicated Palace"""
-        print(f"\n🔍 Validating replication...")
+    def validate_palace(self, work_dir: Path) -> Dict[str, Any]:
+        """Validate Palace implementation (Layer 1)"""
+        print(f"\n🔍 Validating Palace implementation...")
 
         validation = {
             "files_exist": {},
@@ -453,7 +453,102 @@ pytest tests/ -v --cov=. --cov-report=term-missing
 
         validation["faithfulness_score"] = (score / total_checks) * 100.0
 
-        print(f"\n   Faithfulness Score: {validation['faithfulness_score']:.1f}%")
+        print(f"\n   Layer 1 Score: {validation['faithfulness_score']:.1f}%")
+
+        return validation
+
+    def validate_asteroids(self, work_dir: Path) -> Dict[str, Any]:
+        """Validate Asteroids game implementation (Layer 2)"""
+        print(f"\n🔍 Validating Asteroids game...")
+
+        validation = {
+            "files_exist": {},
+            "tests_pass": False,
+            "test_results": {},
+            "game_runs": False,
+            "functionality_score": 0.0
+        }
+
+        # Check required game files
+        required_files = [
+            "main.py",
+            "game.py",
+            "entities.py",
+            "README.md",
+            "requirements.txt",
+            "tests/test_game.py",
+            "tests/test_entities.py"
+        ]
+
+        files_found = 0
+        for filename in required_files:
+            exists = (work_dir / filename).exists()
+            validation["files_exist"][filename] = exists
+            if exists:
+                files_found += 1
+            print(f"   {'✓' if exists else '✗'} {filename}")
+
+        # Run tests
+        if (work_dir / "tests").exists():
+            try:
+                result = subprocess.run(
+                    ["python3", "-m", "pytest", "tests/", "-v", "--cov=.", "--cov-report=term-missing"],
+                    cwd=work_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+                validation["tests_pass"] = result.returncode == 0
+                validation["test_results"]["output"] = result.stdout
+                validation["test_results"]["errors"] = result.stderr
+
+                # Parse test results and coverage
+                import re
+                if "passed" in result.stdout:
+                    match = re.search(r'(\d+) passed', result.stdout)
+                    if match:
+                        validation["test_results"]["passed"] = int(match.group(1))
+
+                # Extract coverage percentage
+                coverage_match = re.search(r'TOTAL\s+\d+\s+\d+\s+(\d+)%', result.stdout)
+                if coverage_match:
+                    validation["test_results"]["coverage"] = int(coverage_match.group(1))
+
+                print(f"   {'✓' if validation['tests_pass'] else '✗'} Tests: {validation.get('test_results', {}).get('passed', 0)} passed")
+                if "coverage" in validation["test_results"]:
+                    print(f"   📊 Coverage: {validation['test_results']['coverage']}%")
+            except Exception as e:
+                validation["test_results"]["error"] = str(e)
+                print(f"   ✗ Test execution failed: {e}")
+
+        # Try to run the game (check for import errors)
+        if (work_dir / "main.py").exists():
+            try:
+                result = subprocess.run(
+                    ["python3", "-c", "import main; print('OK')"],
+                    cwd=work_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                validation["game_runs"] = result.returncode == 0
+                print(f"   {'✓' if validation['game_runs'] else '✗'} Game imports successfully")
+            except Exception as e:
+                print(f"   ✗ Game import failed: {e}")
+
+        # Calculate functionality score
+        score = 0.0
+        total_checks = len(required_files) + 2  # files + tests + game_runs
+
+        score += (files_found / len(required_files)) * 100
+        if validation["tests_pass"]:
+            score += 50
+        if validation["game_runs"]:
+            score += 50
+
+        validation["functionality_score"] = score / (100 + 100)  # Normalize to 100%
+
+        print(f"\n   Layer 2 Score: {validation['functionality_score']*100:.1f}%")
 
         return validation
 
@@ -471,7 +566,27 @@ def main():
     """Main benchmark execution"""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Palace Self-Replication Benchmark")
+    parser = argparse.ArgumentParser(
+        description="Palace Layered Benchmark (Palace→Palace→Asteroids)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Setup Layer 1 (Palace builds Palace)
+  python benchmarks/layered_benchmark.py --layer 1 --provider anthropic
+
+  # Setup Layer 2 (Palace builds Asteroids)
+  python benchmarks/layered_benchmark.py --layer 2 --provider zai
+
+  # Validate Palace directory
+  python benchmarks/layered_benchmark.py --validate-palace /tmp/palace-bench-abc123
+
+  # Validate Asteroids directory
+  python benchmarks/layered_benchmark.py --validate-asteroids /tmp/asteroids-abc123
+
+  # Compare both providers
+  python benchmarks/layered_benchmark.py --compare --layer 1
+        """
+    )
     parser.add_argument(
         "--provider",
         choices=["anthropic", "zai"],
@@ -483,9 +598,25 @@ def main():
         help="Model to use (defaults to provider default)"
     )
     parser.add_argument(
+        "--layer",
+        type=int,
+        choices=[1, 2],
+        help="Which layer to run (1=Palace builds Palace, 2=Palace builds Asteroids)"
+    )
+    parser.add_argument(
         "--compare",
         action="store_true",
         help="Run benchmarks for all providers and compare"
+    )
+    parser.add_argument(
+        "--validate-palace",
+        metavar="DIR",
+        help="Validate Palace implementation in directory"
+    )
+    parser.add_argument(
+        "--validate-asteroids",
+        metavar="DIR",
+        help="Validate Asteroids game in directory"
     )
     parser.add_argument(
         "--no-cleanup",
@@ -496,18 +627,56 @@ def main():
     args = parser.parse_args()
 
     print("=" * 70)
-    print("🏛️  Palace Self-Replication Benchmark")
+    print("🏛️  Palace Layered Benchmark")
     print("=" * 70)
 
+    # Validation mode
+    if args.validate_palace:
+        bench = LayeredBenchmark()
+        work_dir = Path(args.validate_palace)
+        if not work_dir.exists():
+            print(f"❌ Directory not found: {work_dir}")
+            return 1
+
+        validation = bench.validate_palace(work_dir)
+        print("\n" + "=" * 70)
+        print("📊 Validation Results")
+        print("=" * 70)
+        print(json.dumps(validation, indent=2, default=str))
+        return 0
+
+    if args.validate_asteroids:
+        bench = LayeredBenchmark()
+        work_dir = Path(args.validate_asteroids)
+        if not work_dir.exists():
+            print(f"❌ Directory not found: {work_dir}")
+            return 1
+
+        validation = bench.validate_asteroids(work_dir)
+        print("\n" + "=" * 70)
+        print("📊 Validation Results")
+        print("=" * 70)
+        print(json.dumps(validation, indent=2, default=str))
+        return 0
+
+    # Benchmark mode
+    layer = args.layer or 2  # Default to Layer 2 (Asteroids)
+
     if args.compare:
-        print("\n📊 Running comparison benchmark...")
+        print(f"\n📊 Running comparison benchmark (Layer {layer})...")
         providers = ["anthropic", "zai"]
         results = []
 
         for provider in providers:
-            bench = SelfReplicationBenchmark(provider=provider)
-            result = bench.run_replication()
-            results.append(result)
+            bench = LayeredBenchmark(provider=provider)
+
+            if layer == 1:
+                print(f"\n🔄 Setting up Layer 1 for {provider}...")
+                # In future: result = bench.run_palace_benchmark()
+                print(f"   Layer 1 setup not yet automated")
+            else:
+                result = bench.run_asteroids_benchmark()
+                results.append(result)
 
             if not args.no_cleanup:
                 bench.cleanup()
@@ -523,8 +692,16 @@ def main():
             if result.error:
                 print(f"   Error: {result.error}")
     else:
-        bench = SelfReplicationBenchmark(provider=args.provider, model=args.model)
-        result = bench.run_replication()
+        bench = LayeredBenchmark(provider=args.provider, model=args.model)
+
+        if layer == 1:
+            print(f"\n🔄 Setting up Layer 1 (Palace builds Palace)...")
+            # In future: result = bench.run_palace_benchmark()
+            print("   Layer 1 setup not yet automated")
+            print("   Use: python3 palace.py init && python3 palace.py next")
+            return 0
+        else:
+            result = bench.run_asteroids_benchmark()
 
         print("\n" + "=" * 70)
         print("📊 Benchmark Results")
@@ -535,6 +712,7 @@ def main():
             bench.cleanup()
 
     print("\n✨ Benchmark complete!")
+    return 0
 
 
 if __name__ == "__main__":
