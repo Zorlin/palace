@@ -33,45 +33,49 @@ class TestProviderConfig:
         config = temp_palace.get_provider_config()
         assert config["default_provider"] == "anthropic"
 
-    def test_load_provider_config(self, temp_palace):
-        """Load provider config from .palace/providers.json"""
+    def test_zai_in_default_providers(self, temp_palace):
+        """Z.ai should be in default providers (for turbo mode ranking)"""
+        config = temp_palace.get_provider_config()
+        assert "z.ai" in config["providers"]
+        assert config["providers"]["z.ai"]["api_key_env"] == "ZAI_API_KEY"
+
+    def test_openrouter_in_default_providers(self, temp_palace):
+        """OpenRouter should be in default providers"""
+        config = temp_palace.get_provider_config()
+        assert "openrouter" in config["providers"]
+        assert config["providers"]["openrouter"]["format"] == "openai"
+
+    def test_glm_alias_in_defaults(self, temp_palace):
+        """GLM alias should be in defaults"""
+        config = temp_palace.get_provider_config()
+        assert "glm" in config["model_aliases"]
+        assert config["model_aliases"]["glm"]["provider"] == "z.ai"
+
+    def test_load_global_provider_config(self, temp_palace, tmp_path):
+        """Load provider config from ~/.palace/providers.json"""
+        # Create a fake global config
+        global_palace = tmp_path / "fake_home" / ".palace"
+        global_palace.mkdir(parents=True)
+        config_path = global_palace / "providers.json"
+
         providers_config = {
-            "providers": {
-                "z.ai": {
-                    "base_url": "https://api.z.ai/api/anthropic",
-                    "format": "anthropic",
-                    "api_key_env": "ZAI_API_KEY"
-                }
-            },
             "model_aliases": {
-                "sonnet": {"provider": "z.ai", "model": "glm-4.6"}
+                "custom-model": {"provider": "z.ai", "model": "custom-glm"}
             }
         }
-
-        temp_palace.ensure_palace_dir()
-        config_path = temp_palace.palace_dir / "providers.json"
         with open(config_path, 'w') as f:
             json.dump(providers_config, f)
 
-        config = temp_palace.get_provider_config()
-        assert "z.ai" in config["providers"]
-        assert config["model_aliases"]["sonnet"]["model"] == "glm-4.6"
+        # Patch Path.home() to return our fake home
+        with patch.object(Path, 'home', return_value=tmp_path / "fake_home"):
+            config = temp_palace.get_provider_config()
+            assert "custom-model" in config["model_aliases"]
+            assert config["model_aliases"]["custom-model"]["model"] == "custom-glm"
 
     def test_resolve_model_alias(self, temp_palace):
-        """Resolve model alias to provider and model"""
-        temp_palace.ensure_palace_dir()
-        config_path = temp_palace.palace_dir / "providers.json"
-        with open(config_path, 'w') as f:
-            json.dump({
-                "providers": {
-                    "z.ai": {"base_url": "https://api.z.ai/api/anthropic", "format": "anthropic"}
-                },
-                "model_aliases": {
-                    "fast": {"provider": "z.ai", "model": "glm-4.6"}
-                }
-            }, f)
-
-        provider, model = temp_palace.resolve_model("fast")
+        """Resolve model alias to provider and model (using defaults)"""
+        # GLM is in defaults now
+        provider, model = temp_palace.resolve_model("glm")
         assert provider == "z.ai"
         assert model == "glm-4.6"
 
@@ -105,21 +109,10 @@ class TestAnthropicFormat:
         assert request["system"] == "You are helpful"
 
     def test_zai_uses_anthropic_format(self, temp_palace):
-        """Z.ai uses Anthropic format with different base URL"""
-        temp_palace.ensure_palace_dir()
-        config_path = temp_palace.palace_dir / "providers.json"
-        with open(config_path, 'w') as f:
-            json.dump({
-                "providers": {
-                    "z.ai": {
-                        "base_url": "https://api.z.ai/api/anthropic",
-                        "format": "anthropic"
-                    }
-                }
-            }, f)
-
+        """Z.ai uses Anthropic format with different base URL (from defaults)"""
         config = temp_palace.get_provider_config()
         assert config["providers"]["z.ai"]["format"] == "anthropic"
+        assert "z.ai" in config["providers"]["z.ai"]["base_url"]
 
 
 class TestOpenAIFormatTranslation:
@@ -216,26 +209,14 @@ class TestProviderInvocation:
             mock_client.return_value.messages.create.assert_called_once()
 
     def test_invoke_openrouter_provider(self, temp_palace):
-        """Invoke OpenRouter with format translation"""
+        """Invoke OpenRouter with format translation (using defaults)"""
         with patch('requests.post') as mock_post:
             mock_post.return_value.status_code = 200
             mock_post.return_value.json.return_value = {
                 "choices": [{"message": {"role": "assistant", "content": "Hi!"}}]
             }
 
-            temp_palace.ensure_palace_dir()
-            config_path = temp_palace.palace_dir / "providers.json"
-            with open(config_path, 'w') as f:
-                json.dump({
-                    "providers": {
-                        "openrouter": {
-                            "base_url": "https://openrouter.ai/api/v1",
-                            "format": "openai",
-                            "api_key_env": "OPENROUTER_API_KEY"
-                        }
-                    }
-                }, f)
-
+            # OpenRouter is in defaults now
             with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
                 response = temp_palace.invoke_provider(
                     provider="openrouter",

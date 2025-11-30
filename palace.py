@@ -904,9 +904,14 @@ Take this into account as you continue the task.
 
     def get_provider_config(self) -> Dict[str, Any]:
         """
-        Load provider configuration from .palace/providers.json
+        Load provider configuration.
 
-        Returns merged config with defaults.
+        Checks (in order, later overrides earlier):
+        1. Built-in defaults
+        2. Global ~/.palace/providers.json
+        3. Project .palace/providers.json
+
+        Returns merged config.
         """
         defaults = {
             "default_provider": "anthropic",
@@ -915,16 +920,29 @@ Take this into account as you continue the task.
                     "base_url": "https://api.anthropic.com",
                     "format": "anthropic",
                     "api_key_env": "ANTHROPIC_API_KEY"
+                },
+                "z.ai": {
+                    "base_url": "https://api.z.ai/api/anthropic",
+                    "format": "anthropic",
+                    "api_key_env": "ZAI_API_KEY"
+                },
+                "openrouter": {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "format": "openai",
+                    "api_key_env": "OPENROUTER_API_KEY"
                 }
             },
             "model_aliases": {
                 "opus": {"provider": "anthropic", "model": "claude-opus-4-5-20250514"},
                 "sonnet": {"provider": "anthropic", "model": "claude-sonnet-4-5-20250929"},
-                "haiku": {"provider": "anthropic", "model": "claude-haiku-4-20250514"}
+                "haiku": {"provider": "anthropic", "model": "claude-haiku-4-20250514"},
+                "glm": {"provider": "z.ai", "model": "glm-4.6"},
+                "glm-fast": {"provider": "z.ai", "model": "glm-4-flash"}
             }
         }
 
-        config_path = self.palace_dir / "providers.json"
+        # Load from ~/.palace/providers.json
+        config_path = Path.home() / ".palace" / "providers.json"
         if config_path.exists():
             try:
                 with open(config_path) as f:
@@ -935,8 +953,8 @@ Take this into account as you continue the task.
                         defaults[key].update(user_config[key])
                 if "default_provider" in user_config:
                     defaults["default_provider"] = user_config["default_provider"]
-            except (json.JSONDecodeError, IOError):
-                pass
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"⚠️  Failed to load {config_path}: {e}")
 
         return defaults
 
