@@ -35,12 +35,12 @@ def is_interactive() -> bool:
 class Palace:
     """Palace orchestration layer - coordinates Claude invocations"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.project_root = Path.cwd()
         self.palace_dir = self.project_root / ".palace"
         self.config_file = self.palace_dir / "config.json"
 
-    def ensure_palace_dir(self):
+    def ensure_palace_dir(self) -> None:
         """Ensure .palace directory exists"""
         self.palace_dir.mkdir(exist_ok=True)
 
@@ -51,7 +51,7 @@ class Palace:
                 return json.load(f)
         return {}
 
-    def save_config(self, config: Dict[str, Any]):
+    def save_config(self, config: Dict[str, Any]) -> None:
         """Save Palace configuration"""
         self.ensure_palace_dir()
         with open(self.config_file, 'w') as f:
@@ -104,7 +104,7 @@ class Palace:
 
         return context
 
-    def log_action(self, action: str, details: Dict[str, Any] = None):
+    def log_action(self, action: str, details: Optional[Dict[str, Any]] = None) -> None:
         """Log action to history"""
         self.ensure_palace_dir()
         history_file = self.palace_dir / "history.jsonl"
@@ -133,7 +133,7 @@ class Palace:
         sessions_dir.mkdir(parents=True, exist_ok=True)
         return sessions_dir
 
-    def save_session(self, session_id: str, state: Dict[str, Any]):
+    def save_session(self, session_id: str, state: Dict[str, Any]) -> Path:
         """Save session state for later resumption"""
         sessions_dir = self._get_sessions_dir()
         session_file = sessions_dir / f"{session_id}.json"
@@ -154,8 +154,11 @@ class Palace:
         if not session_file.exists():
             return None
 
-        with open(session_file, 'r') as f:
-            return json.load(f)
+        try:
+            with open(session_file, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return None
 
     def list_sessions(self) -> List[Dict[str, Any]]:
         """List all saved sessions"""
@@ -197,7 +200,7 @@ class Palace:
         export_data = {
             "version": "1.0",
             "exported_at": time.time(),
-            "palace_version": self.version,
+            "palace_version": VERSION,
             "session": session
         }
 
@@ -248,7 +251,7 @@ class Palace:
 
             # Generate new session ID if not provided
             if not new_session_id:
-                new_session_id = self.generate_session_id()
+                new_session_id = self._generate_session_id()
 
             # Update session ID
             session["session_id"] = new_session_id
@@ -260,6 +263,7 @@ class Palace:
 
             # Import history entries if present
             if "history" in import_data and import_data["history"]:
+                self.ensure_palace_dir()
                 history_file = self.palace_dir / "history.jsonl"
                 with open(history_file, 'a') as f:
                     for entry in import_data["history"]:
@@ -763,33 +767,46 @@ Parse this and return JSON."""
         import sys
         import tty
         import termios
+        import fcntl
+        import os
 
         # Only works in TTY
         if not sys.stdin.isatty():
             return False
 
+        fd = sys.stdin.fileno()
+
         try:
-            # Save terminal settings
-            old_settings = termios.tcgetattr(sys.stdin)
+            # Save current terminal settings and flags
+            old_settings = termios.tcgetattr(fd)
+            old_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
 
             try:
-                # Set terminal to raw mode (no echo, immediate input)
-                tty.setraw(sys.stdin.fileno())
+                # Set non-blocking
+                fcntl.fcntl(fd, fcntl.F_SETFL, old_flags | os.O_NONBLOCK)
 
-                # Check if input is available (non-blocking)
-                readable, _, _ = select.select([sys.stdin], [], [], 0)
+                # Set terminal to cbreak mode (char by char, no echo)
+                new_settings = termios.tcgetattr(fd)
+                new_settings[3] = new_settings[3] & ~(termios.ICANON | termios.ECHO)
+                new_settings[6][termios.VMIN] = 0
+                new_settings[6][termios.VTIME] = 0
+                termios.tcsetattr(fd, termios.TCSANOW, new_settings)
 
-                if readable:
-                    char = sys.stdin.read(1)
-                    result = self._check_escape_sequence(char)
-                    return result == "interrupt"
+                # Try to read
+                try:
+                    char = os.read(fd, 1)
+                    if char == b'\x1b':  # ESC
+                        result = self._check_escape_sequence(chr(27))
+                        return result == "interrupt"
+                except (BlockingIOError, OSError):
+                    pass
 
             finally:
                 # Restore terminal settings
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                fcntl.fcntl(fd, fcntl.F_SETFL, old_flags)
 
         except Exception:
-            # Terminal manipulation failed, skip escape detection
             pass
 
         return False
@@ -1050,7 +1067,7 @@ The "ACTIONS:" header is required (exact spelling with colon) - it triggers the 
                 text=True
             )
 
-            selected_action = self._process_stream_output(process.stdout)
+            selected_action = self._process_stream_output(process.stdout, process)
             process.wait()
             return process.returncode, selected_action
 
@@ -1279,14 +1296,50 @@ The "ACTIONS:" header is required (exact spelling with colon) - it triggers the 
                 return task
             return None
 
-    def _process_stream_output(self, stream):
+    def _process_stream_output(self, stream, process=None):
         """Process streaming JSON output and display succinct progress"""
+        import threading
+
         text_by_msg = {}  # Track text per message ID
         full_text = ""  # Buffer all text for menu detection
         seen_tools = set()
         current_line_len = 0  # Track chars on current line for clearing
 
+        # Start escape monitoring thread
+        stop_escape_monitor = threading.Event()
+        escape_detected = threading.Event()
+        self._setup_escape_handler()
+
+        def monitor_escape():
+            while not stop_escape_monitor.is_set():
+                if self._check_for_escape():
+                    escape_detected.set()
+                    break
+                time.sleep(0.05)  # Check 20 times per second
+
+        escape_thread = threading.Thread(target=monitor_escape, daemon=True)
+        escape_thread.start()
+
+        user_steering = None
+
         for line in stream:
+            # Check for ESC-ESC interrupt
+            if escape_detected.is_set():
+                stop_escape_monitor.set()
+                result = self._handle_user_interrupt()
+                if result and result.get("action") == "abort":
+                    # Kill the subprocess
+                    if process:
+                        process.terminate()
+                    return None
+                elif result and result.get("action") == "steer":
+                    user_steering = result.get("steering")
+                    # Continue processing but remember steering for next iteration
+                # Reset and continue
+                escape_detected.clear()
+                self._setup_escape_handler()
+                escape_thread = threading.Thread(target=monitor_escape, daemon=True)
+                escape_thread.start()
             line = line.strip()
             if not line:
                 continue
@@ -1359,13 +1412,25 @@ The "ACTIONS:" header is required (exact spelling with colon) - it triggers the 
             except (json.JSONDecodeError, Exception):
                 pass
 
+        # Stop escape monitoring
+        stop_escape_monitor.set()
+
         print()
 
         # Check for action menu and show selector
         actions = self._parse_actions_menu(full_text)
 
         # Always show the steering prompt
-        return self._show_steering_prompt(actions)
+        result = self._show_steering_prompt(actions)
+
+        # If user provided steering during execution, attach it
+        if user_steering and result:
+            for action in result:
+                if "_modifiers" not in action:
+                    action["_modifiers"] = []
+                action["_modifiers"].append(f"USER STEERING: {user_steering}")
+
+        return result
 
     def _show_steering_prompt(self, actions: List[dict]) -> Optional[List[dict]]:
         """Show persistent steering prompt - works with or without detected actions"""
