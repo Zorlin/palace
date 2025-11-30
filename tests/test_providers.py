@@ -81,9 +81,9 @@ class TestProviderConfig:
 
     def test_resolve_unknown_model_uses_anthropic(self, temp_palace):
         """Unknown model names pass through to Anthropic"""
-        provider, model = temp_palace.resolve_model("claude-opus-4-5-20250514")
+        provider, model = temp_palace.resolve_model("claude-opus-4-5")
         assert provider == "anthropic"
-        assert model == "claude-opus-4-5-20250514"
+        assert model == "claude-opus-4-5"
 
 
 class TestAnthropicFormat:
@@ -99,12 +99,12 @@ class TestAnthropicFormat:
         """Build request in Anthropic format"""
         request = temp_palace.build_api_request(
             provider="anthropic",
-            model="claude-sonnet-4-5-20250929",
+            model="claude-sonnet-4-5",
             messages=[{"role": "user", "content": "Hello"}],
             system="You are helpful"
         )
 
-        assert request["model"] == "claude-sonnet-4-5-20250929"
+        assert request["model"] == "claude-sonnet-4-5"
         assert request["messages"] == [{"role": "user", "content": "Hello"}]
         assert request["system"] == "You are helpful"
 
@@ -202,7 +202,7 @@ class TestProviderInvocation:
 
             response = temp_palace.invoke_provider(
                 provider="anthropic",
-                model="claude-haiku-4-20250514",
+                model="claude-haiku-4-5",
                 messages=[{"role": "user", "content": "Hi"}]
             )
 

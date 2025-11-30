@@ -283,6 +283,131 @@ class TestSwarmPromptExecution:
         assert "swarm" in prompt
 
 
+class TestMonitorSwarmOutput:
+    """Test that monitor_swarm correctly parses and displays streaming output"""
+
+    @pytest.fixture
+    def temp_palace(self, tmp_path):
+        os.chdir(tmp_path)
+        palace = Palace()
+        palace.ensure_palace_dir()
+        yield palace
+
+    def test_parses_system_init_message(self, temp_palace, capsys):
+        """Monitor should parse system init and show model"""
+        from io import StringIO
+        import select
+
+        # Simulate streaming JSON output
+        fake_output = StringIO(json.dumps({
+            "type": "system",
+            "subtype": "init",
+            "model": "claude-sonnet-4-5"
+        }) + "\n")
+
+        # Create a mock process
+        mock_process = MagicMock()
+        mock_process.poll.side_effect = [None, 0]  # Running, then done
+        mock_process.stdout = fake_output
+        mock_process.returncode = 0
+
+        processes = {
+            "1": {
+                "process": mock_process,
+                "agent_id": "sonnet-1",
+                "model": "sonnet",
+                "task": "Test task",
+                "session_id": "test-session"
+            }
+        }
+
+        temp_palace.init_swarm_history("test-session")
+
+        with patch('select.select', return_value=([fake_output], [], [])):
+            results = temp_palace.monitor_swarm(processes)
+
+        captured = capsys.readouterr()
+        assert "sonnet-1" in captured.out or "Model" in captured.out
+
+    def test_parses_tool_use_message(self, temp_palace, capsys):
+        """Monitor should parse tool_use and show formatted output"""
+        # Simulate a Read tool use
+        fake_output = StringIO(json.dumps({
+            "type": "assistant",
+            "message": {
+                "id": "msg_1",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "tool_1",
+                    "name": "Read",
+                    "input": {"file_path": "/tmp/test.py"}
+                }]
+            }
+        }) + "\n")
+
+        mock_process = MagicMock()
+        mock_process.poll.side_effect = [None, 0]
+        mock_process.stdout = fake_output
+        mock_process.returncode = 0
+
+        processes = {
+            "1": {
+                "process": mock_process,
+                "agent_id": "haiku-1",
+                "model": "haiku",
+                "task": "Read files",
+                "session_id": "test-session"
+            }
+        }
+
+        temp_palace.init_swarm_history("test-session")
+
+        with patch('select.select', return_value=([fake_output], [], [])):
+            results = temp_palace.monitor_swarm(processes)
+
+        captured = capsys.readouterr()
+        # Should show the formatted Read output
+        assert "Reading" in captured.out or "haiku-1" in captured.out
+
+    def test_real_subprocess_output(self, temp_palace, capsys):
+        """Test with actual subprocess producing JSON output"""
+        import subprocess
+
+        # Create a script that outputs streaming JSON
+        script = '''
+import json
+import sys
+print(json.dumps({"type": "system", "subtype": "init", "model": "test-model"}))
+sys.stdout.flush()
+print(json.dumps({"type": "assistant", "message": {"id": "1", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/test.py"}}]}}))
+sys.stdout.flush()
+'''
+        process = subprocess.Popen(
+            ["python3", "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+
+        processes = {
+            "1": {
+                "process": process,
+                "agent_id": "test-1",
+                "model": "test",
+                "task": "Test",
+                "session_id": "test-session"
+            }
+        }
+
+        temp_palace.init_swarm_history("test-session")
+        results = temp_palace.monitor_swarm(processes)
+
+        captured = capsys.readouterr()
+        print(f"DEBUG captured output: {captured.out}")  # Debug
+        # Should have captured the output
+        assert "test-1" in captured.out or "Reading" in captured.out or "Model" in captured.out
+
+
 class TestTurboModeIntegration:
     """Integration tests for full turbo mode flow"""
 

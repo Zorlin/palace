@@ -352,7 +352,7 @@ Parse this and return JSON."""
 
         client = anthropic.Anthropic()
         response = client.messages.create(
-            model="claude-haiku-4-20250514",
+            model="claude-haiku-4-5",
             max_tokens=256,
             system=system_prompt,
             messages=[{"role": "user", "content": prompt}]
@@ -933,9 +933,9 @@ Take this into account as you continue the task.
                 }
             },
             "model_aliases": {
-                "opus": {"provider": "anthropic", "model": "claude-opus-4-5-20250514"},
-                "sonnet": {"provider": "anthropic", "model": "claude-sonnet-4-5-20250929"},
-                "haiku": {"provider": "anthropic", "model": "claude-haiku-4-20250514"},
+                "opus": {"provider": "anthropic", "model": "claude-opus-4-5"},
+                "sonnet": {"provider": "anthropic", "model": "claude-sonnet-4-5"},
+                "haiku": {"provider": "anthropic", "model": "claude-haiku-4-5"},
                 "glm": {"provider": "z.ai", "model": "glm-4.6"},
                 "glm-fast": {"provider": "z.ai", "model": "glm-4-flash"}
             }
@@ -1230,7 +1230,7 @@ Respond with JSON only:
         try:
             result = self.invoke_provider(
                 provider="anthropic",
-                model="claude-opus-4-5-20250514",
+                model="claude-opus-4-5",
                 messages=[{"role": "user", "content": judge_prompt}],
                 max_tokens=512
             )
@@ -1552,19 +1552,35 @@ Return JSON only:
             if base_url and "anthropic.com" not in base_url:
                 env["ANTHROPIC_BASE_URL"] = base_url
 
-            # Build CLI command
+            # System prompt for swarm agent
+            swarm_system = f"""You are agent {agent_id} in a parallel swarm.
+Other agents are working on related tasks simultaneously.
+Execute your assigned task fully - use tools to read, write, and modify files.
+Do NOT just plan or discuss - actually DO the work."""
+
+            # Build CLI command - same pattern as invoke_claude_cli
+            # Use -p with streaming JSON for bidirectional communication
             cmd = [
                 "claude",
                 "-p", prompt,
                 "--model", model,
+                "--append-system-prompt", swarm_system,
+                "--verbose",
+                "--include-partial-messages",
+                "--input-format", "stream-json",
                 "--output-format", "stream-json",
+                "--permission-prompt-tool", "mcp__palace__handle_permission",
             ]
+
+            # Debug: show what we're running
+            print(f"   🚀 {agent_id}: claude --model {model}")
 
             try:
                 process = subprocess.Popen(
                     cmd,
                     env=env,
                     cwd=self.project_root,
+                    stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True
@@ -1606,10 +1622,13 @@ Return JSON only:
         print(f"\n🐝 Swarm active: {len(active)} agents")
         print("─" * 50)
 
-        # Track output buffers
+        # Track output buffers and seen tool IDs (to avoid duplicates)
         buffers = {num: "" for num in active}
+        seen_tools = set()
 
         while active:
+            # Debug: show we're still monitoring
+            # print(f"  [monitoring {len(active)} active agents]", end="\r", flush=True)
             for task_num, info in list(active.items()):
                 process = info["process"]
                 agent_id = info["agent_id"]
@@ -1633,7 +1652,16 @@ Return JSON only:
                         "output": buffers[task_num]
                     }
 
-                    print(f"✅ {agent_id} finished")
+                    # Debug: show exit code and output snippet if failed
+                    if process.returncode != 0:
+                        print(f"❌ {agent_id} failed (exit {process.returncode})")
+                        # Show first 500 chars of output for debugging
+                        output_preview = buffers[task_num][:500]
+                        if output_preview:
+                            print(f"   Output: {output_preview}")
+                    else:
+                        print(f"✅ {agent_id} finished")
+
                     del active[task_num]
                     continue
 
@@ -1646,19 +1674,61 @@ Return JSON only:
                         if line:
                             buffers[task_num] += line
 
-                            # Parse and log progress
+                            # Parse and show progress - SAME FORMAT as _process_stream_output
                             try:
                                 msg = json.loads(line)
-                                if msg.get("type") == "assistant":
-                                    # Extract tool use or text for swarm awareness
+                                msg_type = msg.get("type")
+
+                                if msg_type == "system" and msg.get("subtype") == "init":
+                                    model = msg.get("model", "unknown")
+                                    print(f"[{agent_id}] 📡 Model: {model}")
+
+                                elif msg_type == "assistant":
                                     content = msg.get("message", {}).get("content", [])
                                     for block in content:
                                         if block.get("type") == "tool_use":
+                                            tool_id = block.get("id", "")
+                                            if tool_id in seen_tools:
+                                                continue
+                                            seen_tools.add(tool_id)
+
+                                            tool_name = block.get("name", "unknown")
+                                            tool_input = block.get("input", {})
+
+                                            # Same formatting as _process_stream_output
+                                            if tool_name == "Read":
+                                                path = tool_input.get("file_path", "?").split("/")[-1]
+                                                print(f"[{agent_id}] 📖 Reading: {path}")
+                                            elif tool_name == "Edit":
+                                                path = tool_input.get("file_path", "?").split("/")[-1]
+                                                print(f"[{agent_id}] ✏️  Editing: {path}")
+                                            elif tool_name == "Write":
+                                                path = tool_input.get("file_path", "?").split("/")[-1]
+                                                print(f"[{agent_id}] 📝 Writing: {path}")
+                                            elif tool_name == "Bash":
+                                                cmd = tool_input.get("command", "")[:50]
+                                                print(f"[{agent_id}] 💻 Running: {cmd}...")
+                                            elif tool_name == "Glob":
+                                                print(f"[{agent_id}] 🔍 Finding: {tool_input.get('pattern', '')}")
+                                            elif tool_name == "Grep":
+                                                print(f"[{agent_id}] 🔎 Searching: {tool_input.get('pattern', '')}")
+                                            else:
+                                                print(f"[{agent_id}] 🔧 {tool_name}")
+
                                             self.write_swarm_event(session_id, {
                                                 "agent": agent_id,
                                                 "type": "tool_use",
-                                                "message": f"Using {block.get('name')}"
+                                                "message": f"Using {tool_name}"
                                             })
+
+                                        elif block.get("type") == "text":
+                                            text = block.get("text", "")
+                                            if text:
+                                                print(f"[{agent_id}] {text}", end="", flush=True)
+
+                                elif msg_type == "result":
+                                    print(f"[{agent_id}] ✅ Done")
+
                             except json.JSONDecodeError:
                                 pass
 
@@ -3267,7 +3337,7 @@ Based on the safety guidelines, should this operation be approved?"""
             # Call Haiku for fast safety assessment
             client = anthropic.Anthropic()
             response = client.messages.create(
-                model="claude-haiku-4-20250514",
+                model="claude-haiku-4-5",
                 max_tokens=256,
                 system=skill_content,
                 messages=[{"role": "user", "content": prompt}]
