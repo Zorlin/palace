@@ -3713,12 +3713,29 @@ def main():
                              help='Select actions: "1,2,3" or "do 1 but skip tests"')
     parser_next.add_argument('--turbo', '-t', action='store_true',
                              help='Turbo mode: parallel swarm execution with model-task ranking')
+    parser_next.add_argument('--claude', action='store_true',
+                             help='Use Claude models even in turbo mode (higher quality, higher cost)')
+    parser_next.add_argument('--glm', action='store_true',
+                             help='Use GLM model even in normal mode (lower cost, faster)')
 
     parser_new = subparsers.add_parser('new', help='Ask Claude to create a new project')
     parser_new.add_argument('name', nargs='?', help='Project name')
+    parser_new.add_argument('--claude', action='store_true',
+                            help='Use Claude models (higher quality, higher cost)')
+    parser_new.add_argument('--glm', action='store_true',
+                            help='Use GLM model (lower cost, faster)')
 
-    subparsers.add_parser('scaffold', help='Ask Claude to scaffold the project')
-    subparsers.add_parser('test', help='Ask Claude to run tests')
+    parser_scaffold = subparsers.add_parser('scaffold', help='Ask Claude to scaffold the project')
+    parser_scaffold.add_argument('--claude', action='store_true',
+                                 help='Use Claude models (higher quality, higher cost)')
+    parser_scaffold.add_argument('--glm', action='store_true',
+                                 help='Use GLM model (lower cost, faster)')
+
+    parser_test = subparsers.add_parser('test', help='Ask Claude to run tests')
+    parser_test.add_argument('--claude', action='store_true',
+                             help='Use Claude models (higher quality, higher cost)')
+    parser_test.add_argument('--glm', action='store_true',
+                             help='Use GLM model (lower cost, faster)')
 
     # Utility commands
     subparsers.add_parser('install', help='Install Palace commands to Claude Code')
