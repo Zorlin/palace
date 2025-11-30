@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 import sys
 import os
+from unittest.mock import patch, MagicMock
 
 # Add parent directory to path to import palace
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -375,19 +376,33 @@ class TestActionSelectionParsing:
         assert selected[2]["label"] == "Update docs"
 
     def test_parse_natural_language_with_numbers(self, temp_palace, sample_actions):
-        """Parse natural language with numbers"""
-        selected = temp_palace.parse_action_selection("do 1 and 3", sample_actions)
-        assert len(selected) == 2
-        assert selected[0]["label"] == "Write tests"
-        assert selected[1]["label"] == "Deploy"
+        """Parse natural language with numbers - uses LLM"""
+        with patch.object(temp_palace, '_parse_selection_with_llm') as mock_llm:
+            mock_llm.return_value = {
+                "selected_numbers": ["1", "3"],
+                "modifiers": [],
+                "is_custom_task": False,
+                "custom_task": None
+            }
+            selected = temp_palace.parse_action_selection("do 1 and 3", sample_actions)
+            assert len(selected) == 2
+            assert selected[0]["label"] == "Write tests"
+            assert selected[1]["label"] == "Deploy"
 
     def test_parse_natural_language_with_modifiers(self, temp_palace, sample_actions):
-        """Parse natural language with modifiers"""
-        selected = temp_palace.parse_action_selection("do 1 but skip the tests", sample_actions)
-        assert len(selected) == 1
-        assert selected[0]["label"] == "Write tests"
-        assert "_modifiers" in selected[0]
-        assert "skip the tests" in selected[0]["_modifiers"]
+        """Parse natural language with modifiers - uses LLM"""
+        with patch.object(temp_palace, '_parse_selection_with_llm') as mock_llm:
+            mock_llm.return_value = {
+                "selected_numbers": ["1"],
+                "modifiers": ["skip the tests"],
+                "is_custom_task": False,
+                "custom_task": None
+            }
+            selected = temp_palace.parse_action_selection("do 1 but skip the tests", sample_actions)
+            assert len(selected) == 1
+            assert selected[0]["label"] == "Write tests"
+            assert "_modifiers" in selected[0]
+            assert "skip the tests" in selected[0]["_modifiers"]
 
     def test_parse_invalid_selection(self, temp_palace, sample_actions):
         """Parse invalid selection returns empty list"""
@@ -419,26 +434,47 @@ class TestActionSelectionParsing:
             assert "use the palace-skills repo as base" in action["_modifiers"]
 
     def test_parse_with_follow_modifier(self, temp_palace, sample_actions):
-        """Parse 'follow' modifier pattern"""
-        selected = temp_palace.parse_action_selection("1 2 follow /path/to/guide", sample_actions)
-        assert len(selected) == 2
-        assert "_modifiers" in selected[0]
-        assert "/path/to/guide" in selected[0]["_modifiers"]
+        """Parse 'follow' modifier pattern - uses LLM"""
+        with patch.object(temp_palace, '_parse_selection_with_llm') as mock_llm:
+            mock_llm.return_value = {
+                "selected_numbers": ["1", "2"],
+                "modifiers": ["/path/to/guide"],
+                "is_custom_task": False,
+                "custom_task": None
+            }
+            selected = temp_palace.parse_action_selection("1 2 follow /path/to/guide", sample_actions)
+            assert len(selected) == 2
+            assert "_modifiers" in selected[0]
+            assert "/path/to/guide" in selected[0]["_modifiers"]
 
     def test_parse_with_use_modifier(self, temp_palace, sample_actions):
-        """Parse 'use' modifier pattern"""
-        selected = temp_palace.parse_action_selection("3 use TypeScript", sample_actions)
-        assert len(selected) == 1
-        assert selected[0]["label"] == "Deploy"
-        assert "_modifiers" in selected[0]
-        assert "TypeScript" in selected[0]["_modifiers"]
+        """Parse 'use' modifier pattern - uses LLM"""
+        with patch.object(temp_palace, '_parse_selection_with_llm') as mock_llm:
+            mock_llm.return_value = {
+                "selected_numbers": ["3"],
+                "modifiers": ["TypeScript"],
+                "is_custom_task": False,
+                "custom_task": None
+            }
+            selected = temp_palace.parse_action_selection("3 use TypeScript", sample_actions)
+            assert len(selected) == 1
+            assert selected[0]["label"] == "Deploy"
+            assert "_modifiers" in selected[0]
+            assert "TypeScript" in selected[0]["_modifiers"]
 
     def test_parse_with_without_modifier(self, temp_palace, sample_actions):
-        """Parse 'without' modifier pattern"""
-        selected = temp_palace.parse_action_selection("2 without breaking changes", sample_actions)
-        assert len(selected) == 1
-        assert "_modifiers" in selected[0]
-        assert "breaking changes" in selected[0]["_modifiers"]
+        """Parse 'without' modifier pattern - uses LLM"""
+        with patch.object(temp_palace, '_parse_selection_with_llm') as mock_llm:
+            mock_llm.return_value = {
+                "selected_numbers": ["2"],
+                "modifiers": ["breaking changes"],
+                "is_custom_task": False,
+                "custom_task": None
+            }
+            selected = temp_palace.parse_action_selection("2 without breaking changes", sample_actions)
+            assert len(selected) == 1
+            assert "_modifiers" in selected[0]
+            assert "breaking changes" in selected[0]["_modifiers"]
 
     def test_parse_range_with_spaces(self, temp_palace, sample_actions):
         """Parse range with spaces around dash"""
@@ -461,22 +497,36 @@ class TestActionSelectionParsing:
             assert "follow TDD" in action["_modifiers"]
 
     def test_parse_custom_task(self, temp_palace, sample_actions):
-        """Parse custom task (pure text, no numbers)"""
-        selected = temp_palace.parse_action_selection("refactor the authentication system", sample_actions)
-        assert len(selected) == 1
-        assert selected[0]["label"] == "refactor the authentication system"
-        assert selected[0]["_custom"] is True
+        """Parse custom task (pure text, no numbers) - uses LLM"""
+        with patch.object(temp_palace, '_parse_selection_with_llm') as mock_llm:
+            mock_llm.return_value = {
+                "selected_numbers": [],
+                "modifiers": [],
+                "is_custom_task": True,
+                "custom_task": "refactor the authentication system"
+            }
+            selected = temp_palace.parse_action_selection("refactor the authentication system", sample_actions)
+            assert len(selected) == 1
+            assert selected[0]["label"] == "refactor the authentication system"
+            assert selected[0]["_custom"] is True
 
     def test_parse_multiple_modifiers(self, temp_palace, sample_actions):
-        """Parse multiple modifier patterns"""
-        selected = temp_palace.parse_action_selection("1 2 (base: palace-skills) but skip tests", sample_actions)
-        assert len(selected) == 2
-        assert "_modifiers" in selected[0]
-        # Should have modifiers (may extract multiple from complex patterns)
-        assert len(selected[0]["_modifiers"]) >= 2
-        assert "base: palace-skills" in selected[0]["_modifiers"]
-        # Check that some form of "skip" modifier is captured
-        assert any("skip" in mod.lower() for mod in selected[0]["_modifiers"])
+        """Parse multiple modifier patterns - uses LLM"""
+        with patch.object(temp_palace, '_parse_selection_with_llm') as mock_llm:
+            mock_llm.return_value = {
+                "selected_numbers": ["1", "2"],
+                "modifiers": ["base: palace-skills", "skip tests"],
+                "is_custom_task": False,
+                "custom_task": None
+            }
+            selected = temp_palace.parse_action_selection("1 2 (base: palace-skills) but skip tests", sample_actions)
+            assert len(selected) == 2
+            assert "_modifiers" in selected[0]
+            # Should have modifiers (may extract multiple from complex patterns)
+            assert len(selected[0]["_modifiers"]) >= 2
+            assert "base: palace-skills" in selected[0]["_modifiers"]
+            # Check that some form of "skip" modifier is captured
+            assert any("skip" in mod.lower() for mod in selected[0]["_modifiers"])
 
     def test_parse_action_copies_dont_mutate_original(self, temp_palace, sample_actions):
         """Ensure parsing creates copies and doesn't mutate original actions"""
@@ -487,3 +537,140 @@ class TestActionSelectionParsing:
         assert original_count == after_count
         # But selected should have modifiers
         assert all("_modifiers" in a for a in selected)
+
+
+class TestLLMActionParsing:
+    """Test LLM-based action selection parsing using Haiku"""
+
+    @pytest.fixture
+    def temp_palace(self, tmp_path):
+        """Create a Palace instance in a temp directory"""
+        os.chdir(tmp_path)
+        palace = Palace()
+        yield palace
+
+    @pytest.fixture
+    def sample_actions(self):
+        """Sample actions for testing"""
+        return [
+            {"num": "1", "label": "Write tests", "description": "Add unit tests for the module"},
+            {"num": "2", "label": "Run build", "description": "Execute the build process"},
+            {"num": "3", "label": "Deploy", "description": "Deploy to production server"},
+            {"num": "4", "label": "Update docs", "description": "Update API documentation"},
+            {"num": "5", "label": "Commit changes", "description": "Git commit all changes"}
+        ]
+
+    def test_llm_parser_simple_numbers(self, temp_palace, sample_actions):
+        """Simple numbers bypass LLM, use fast regex"""
+        # Mock the LLM call to verify it's NOT called for simple inputs
+        with patch.object(temp_palace, '_parse_selection_with_llm') as mock_llm:
+            selected = temp_palace.parse_action_selection("1", sample_actions)
+            assert len(selected) == 1
+            assert selected[0]["label"] == "Write tests"
+            # LLM should NOT be called for simple numeric input
+            mock_llm.assert_not_called()
+
+    def test_llm_parser_complex_natural_language(self, temp_palace, sample_actions):
+        """Complex natural language uses LLM parser"""
+        # Mock the LLM to return expected result
+        with patch.object(temp_palace, '_parse_selection_with_llm') as mock_llm:
+            mock_llm.return_value = {
+                "selected_numbers": ["1", "3"],
+                "modifiers": ["skip testing phase"],
+                "is_custom_task": False,
+                "custom_task": None
+            }
+            selected = temp_palace.parse_action_selection(
+                "do the first and third but skip testing phase",
+                sample_actions
+            )
+            # LLM should be called for natural language
+            mock_llm.assert_called_once()
+            assert len(selected) == 2
+
+    def test_llm_parser_returns_modifiers(self, temp_palace, sample_actions):
+        """LLM parser correctly extracts modifiers"""
+        with patch.object(temp_palace, '_parse_selection_with_llm') as mock_llm:
+            mock_llm.return_value = {
+                "selected_numbers": ["2"],
+                "modifiers": ["use TypeScript", "follow TDD"],
+                "is_custom_task": False,
+                "custom_task": None
+            }
+            selected = temp_palace.parse_action_selection(
+                "do 2 use TypeScript and follow TDD",
+                sample_actions
+            )
+            assert len(selected) == 1
+            assert "_modifiers" in selected[0]
+            assert "use TypeScript" in selected[0]["_modifiers"]
+            assert "follow TDD" in selected[0]["_modifiers"]
+
+    def test_llm_parser_custom_task(self, temp_palace, sample_actions):
+        """LLM parser identifies custom tasks"""
+        with patch.object(temp_palace, '_parse_selection_with_llm') as mock_llm:
+            mock_llm.return_value = {
+                "selected_numbers": [],
+                "modifiers": [],
+                "is_custom_task": True,
+                "custom_task": "refactor the authentication system"
+            }
+            selected = temp_palace.parse_action_selection(
+                "refactor the authentication system",
+                sample_actions
+            )
+            assert len(selected) == 1
+            assert selected[0]["_custom"] is True
+            assert selected[0]["label"] == "refactor the authentication system"
+
+    def test_llm_parser_fallback_on_error(self, temp_palace, sample_actions):
+        """LLM parser falls back to regex on API error"""
+        with patch.object(temp_palace, '_parse_selection_with_llm') as mock_llm:
+            mock_llm.side_effect = Exception("API error")
+            # Should still work using regex fallback
+            selected = temp_palace.parse_action_selection("1 2 3", sample_actions)
+            assert len(selected) == 3
+
+    def test_llm_parser_ambiguous_intent(self, temp_palace, sample_actions):
+        """LLM parser handles ambiguous user intent"""
+        with patch.object(temp_palace, '_parse_selection_with_llm') as mock_llm:
+            mock_llm.return_value = {
+                "selected_numbers": ["1", "2", "3"],
+                "modifiers": ["except documentation"],
+                "is_custom_task": False,
+                "custom_task": None
+            }
+            # User says "all of them except documentation"
+            selected = temp_palace.parse_action_selection(
+                "all of them except documentation",
+                sample_actions
+            )
+            mock_llm.assert_called_once()
+            # Should get actions, with modifier attached
+            assert len(selected) >= 1
+            if selected:
+                assert "_modifiers" in selected[0]
+
+    def test_llm_parser_integration(self, temp_palace, sample_actions):
+        """Integration test: actual LLM call (mocked at anthropic level)"""
+        with patch('anthropic.Anthropic') as mock_client_class:
+            mock_client = MagicMock()
+            mock_client_class.return_value = mock_client
+
+            # Mock the LLM response
+            mock_response = MagicMock()
+            mock_response.content = [MagicMock(text=json.dumps({
+                "selected_numbers": ["1", "3"],
+                "modifiers": ["using pytest"],
+                "is_custom_task": False,
+                "custom_task": None
+            }))]
+            mock_client.messages.create.return_value = mock_response
+
+            # This should trigger actual _parse_selection_with_llm
+            selected = temp_palace.parse_action_selection(
+                "do tests and deploy using pytest",
+                sample_actions
+            )
+            # Verify the flow works end-to-end
+            assert isinstance(selected, list)

@@ -177,50 +177,109 @@ class Palace:
 
         return sorted(sessions, key=lambda s: s.get("updated_at", 0), reverse=True)
 
-    def parse_action_selection(self, selection: str, actions: List[dict]) -> List[dict]:
+    def _is_simple_selection(self, selection: str) -> bool:
         """
-        Parse action selection string into list of actions.
+        Check if selection is simple enough for regex parsing.
 
-        Supports:
-        - Numeric: "1 2 3" or "1,2,3" or "1-5" or "1,3-5,7"
-        - With modifiers: "1 2 3 (use the palace-skills repo as base)"
-        - Natural language: "do 5 but skip the tests"
+        Simple selections are:
+        - Pure numbers: "1", "1 2 3", "1,2,3"
+        - Ranges: "1-5", "2 - 4"
+        - Numbers with parenthetical modifiers: "1 2 (use TDD)"
 
-        Returns list of selected actions, potentially modified by instructions.
+        Complex selections require LLM:
+        - Natural language: "do the first and third"
+        - Word modifiers: "1 but skip tests"
+        - Ambiguous: "all of them except docs"
         """
-        selected = []
+        # Remove parenthetical content for simplicity check
+        clean = re.sub(r'\([^)]+\)', '', selection).strip()
+
+        # Check if remaining is only numbers, spaces, commas, dashes
+        return bool(re.match(r'^[\d,\s\-]+$', clean))
+
+    def _parse_selection_with_llm(self, selection: str, actions: List[dict]) -> dict:
+        """
+        Use Haiku to parse complex natural language selection.
+
+        Returns dict with:
+        - selected_numbers: List of action numbers to select
+        - modifiers: List of modifier strings
+        - is_custom_task: Whether this is a custom task (not selecting from menu)
+        - custom_task: The custom task description if is_custom_task
+        """
+        import anthropic
+
+        # Build action context for the LLM
+        action_context = "\n".join([
+            f"{a.get('num')}. {a.get('label')}: {a.get('description', '')}"
+            for a in actions
+        ])
+
+        system_prompt = """You parse user input selecting from a menu of actions.
+
+Return JSON with these fields:
+- selected_numbers: array of action number strings the user wants (e.g., ["1", "3"])
+- modifiers: array of instruction strings the user added (e.g., ["skip tests", "use TypeScript"])
+- is_custom_task: true if user is describing a NEW task not in the menu
+- custom_task: the custom task description if is_custom_task is true, else null
+
+Examples:
+- "1 2 3" → {"selected_numbers": ["1", "2", "3"], "modifiers": [], "is_custom_task": false, "custom_task": null}
+- "do the first and third but skip tests" → {"selected_numbers": ["1", "3"], "modifiers": ["skip tests"], "is_custom_task": false, "custom_task": null}
+- "all of them except documentation" → {"selected_numbers": ["1", "2", "3", "5"], "modifiers": ["except documentation"], "is_custom_task": false, "custom_task": null}
+- "refactor the auth system" → {"selected_numbers": [], "modifiers": [], "is_custom_task": true, "custom_task": "refactor the auth system"}
+
+IMPORTANT: Return ONLY valid JSON, no explanation."""
+
+        prompt = f"""Available actions:
+{action_context}
+
+User selection: {selection}
+
+Parse this and return JSON."""
+
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model="claude-haiku-4-20250514",
+            max_tokens=256,
+            system=system_prompt,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        response_text = response.content[0].text.strip()
+
+        # Parse JSON from response
+        if "{" in response_text and "}" in response_text:
+            json_start = response_text.find("{")
+            json_end = response_text.rfind("}") + 1
+            return json.loads(response_text[json_start:json_end])
+
+        # Fallback if parsing fails
+        return {
+            "selected_numbers": [],
+            "modifiers": [],
+            "is_custom_task": True,
+            "custom_task": selection
+        }
+
+    def _parse_simple_selection(self, selection: str) -> Tuple[List[str], List[str]]:
+        """
+        Fast regex-based parsing for simple numeric selections.
+
+        Returns (numbers, modifiers) tuple.
+        """
         modifiers = []
 
-        # Extract parenthetical text as modifiers first
+        # Extract parenthetical modifiers
         paren_match = re.search(r'\(([^)]+)\)', selection)
         if paren_match:
             modifiers.append(paren_match.group(1).strip())
-            # Remove parenthetical from selection for number parsing
             selection = re.sub(r'\([^)]+\)', '', selection)
 
-        # Check if there's non-numeric text (besides spaces, commas, dashes)
-        text_without_nums = re.sub(r'[\d,\s\-]+', '', selection).strip()
-
-        if text_without_nums:
-            # Has text - extract modifier patterns
-            modifier_patterns = [
-                r'\bbut\s+(.+)',
-                r'\bexcept\s+(.+)',
-                r'\bwith\s+(.+)',
-                r'\bwithout\s+(.+)',
-                r'\bskip\s+(.+)',
-                r'\bfollow\s+(.+)',
-                r'\buse\s+(.+)',
-            ]
-            for pattern in modifier_patterns:
-                match = re.search(pattern, selection, re.IGNORECASE)
-                if match:
-                    modifiers.append(match.group(1).strip())
-
-        # Collect all numbers (handling ranges properly)
+        # Collect all numbers
         numbers = set()
 
-        # First handle ranges like "1-5" or "2 - 4"
+        # Handle ranges
         range_matches = re.findall(r'(\d+)\s*-\s*(\d+)', selection)
         for start, end in range_matches:
             try:
@@ -229,33 +288,73 @@ class Palace:
             except:
                 pass
 
-        # Then extract standalone numbers (not part of ranges)
-        # Remove ranges from selection first
+        # Standalone numbers
         selection_no_ranges = re.sub(r'\d+\s*-\s*\d+', '', selection)
         standalone = re.findall(r'\b(\d+)\b', selection_no_ranges)
         for num in standalone:
             numbers.add(num)
 
-        # Sort numbers for consistent ordering
-        sorted_nums = sorted(numbers, key=lambda x: int(x))
+        return sorted(numbers, key=lambda x: int(x)), modifiers
 
-        # Find actions by number
-        for num in sorted_nums:
+    def parse_action_selection(self, selection: str, actions: List[dict]) -> List[dict]:
+        """
+        Parse action selection string into list of actions.
+
+        Supports:
+        - Numeric: "1 2 3" or "1,2,3" or "1-5" or "1,3-5,7"
+        - With modifiers: "1 2 3 (use the palace-skills repo as base)"
+        - Natural language: "do 5 but skip the tests" (uses LLM)
+
+        Returns list of selected actions, potentially modified by instructions.
+        """
+        selection = selection.strip()
+        if not selection:
+            return []
+
+        # Check if simple enough for fast regex parsing
+        if self._is_simple_selection(selection):
+            numbers, modifiers = self._parse_simple_selection(selection)
+        else:
+            # Use LLM for complex natural language
+            try:
+                llm_result = self._parse_selection_with_llm(selection, actions)
+
+                # Handle custom task
+                if llm_result.get("is_custom_task"):
+                    task = llm_result.get("custom_task", selection)
+                    return [{"num": "c", "label": task, "description": "Custom task", "_custom": True}]
+
+                numbers = llm_result.get("selected_numbers", [])
+                modifiers = llm_result.get("modifiers", [])
+            except Exception:
+                # Fallback to regex on LLM error
+                numbers, modifiers = self._parse_simple_selection(selection)
+                # Check for text that might be a custom task
+                text_without_nums = re.sub(r'[\d,\s\-]+', '', selection).strip()
+                text_without_nums = re.sub(r'\([^)]+\)', '', text_without_nums).strip()
+                if not numbers and text_without_nums:
+                    return [{"num": "c", "label": selection, "description": "Custom task", "_custom": True}]
+
+        # Build selected actions list
+        selected = []
+        for num in numbers:
             for a in actions:
                 if a.get("num") == num:
-                    # Make a copy so we don't mutate the original
                     action_copy = dict(a)
                     selected.append(action_copy)
                     break
 
-        # Attach modifiers to all selected actions
+        # Attach modifiers
         if modifiers:
             for a in selected:
                 a["_modifiers"] = modifiers
 
-        # Only treat as custom task if there's real text (not just invalid numbers)
-        if not selected and text_without_nums:
-            return [{"num": "c", "label": selection.strip(), "description": "Custom task", "_custom": True}]
+        # Handle case where no actions matched but there's text
+        if not selected:
+            text_without_nums = re.sub(r'[\d,\s\-]+', '', selection).strip()
+            text_without_nums = re.sub(r'\([^)]+\)', '', text_without_nums).strip()
+            if text_without_nums:
+                return [{"num": "c", "label": selection, "description": "Custom task", "_custom": True}]
 
         return selected
 
@@ -275,6 +374,260 @@ class Palace:
         ]
 
         return "".join(prompt_parts)
+
+    # ========================================================================
+    # Mask System
+    # ========================================================================
+
+    def load_mask(self, mask_name: str) -> Optional[str]:
+        """
+        Load a mask from .palace/masks/
+
+        Searches in order:
+        1. .palace/masks/available/{mask_name}/SKILL.md
+        2. .palace/masks/custom/{mask_name}/SKILL.md
+
+        Returns mask content or None if not found.
+        """
+        # Try available masks first
+        mask_file = self.palace_dir / "masks" / "available" / mask_name / "SKILL.md"
+        if mask_file.exists():
+            return mask_file.read_text()
+
+        # Try custom masks
+        mask_file = self.palace_dir / "masks" / "custom" / mask_name / "SKILL.md"
+        if mask_file.exists():
+            return mask_file.read_text()
+
+        return None
+
+    def get_mask_metadata(self, mask_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Extract metadata from mask frontmatter.
+
+        Parses YAML frontmatter if present, otherwise returns minimal metadata.
+        """
+        content = self.load_mask(mask_name)
+        if not content:
+            return None
+
+        metadata = {"name": mask_name}
+
+        # Check for frontmatter (--- at start)
+        if content.startswith("---"):
+            try:
+                # Extract frontmatter block
+                parts = content.split("---", 2)
+                if len(parts) >= 3:
+                    frontmatter_text = parts[1].strip()
+                    # Simple YAML-like parsing (key: value)
+                    for line in frontmatter_text.split("\n"):
+                        if ":" in line:
+                            key, value = line.split(":", 1)
+                            metadata[key.strip()] = value.strip()
+            except:
+                pass
+
+        return metadata
+
+    def list_masks(self) -> List[Dict[str, Any]]:
+        """
+        List all available masks.
+
+        Returns list of dicts with:
+        - name: mask name
+        - type: "available" or "custom"
+        - path: full path to mask
+        """
+        masks = []
+        masks_dir = self.palace_dir / "masks"
+
+        if not masks_dir.exists():
+            return masks
+
+        # List available masks
+        available_dir = masks_dir / "available"
+        if available_dir.exists():
+            for mask_dir in available_dir.iterdir():
+                if mask_dir.is_dir() and (mask_dir / "SKILL.md").exists():
+                    masks.append({
+                        "name": mask_dir.name,
+                        "type": "available",
+                        "path": str(mask_dir / "SKILL.md")
+                    })
+
+        # List custom masks
+        custom_dir = masks_dir / "custom"
+        if custom_dir.exists():
+            for mask_dir in custom_dir.iterdir():
+                if mask_dir.is_dir() and (mask_dir / "SKILL.md").exists():
+                    masks.append({
+                        "name": mask_dir.name,
+                        "type": "custom",
+                        "path": str(mask_dir / "SKILL.md")
+                    })
+
+        return masks
+
+    def build_prompt_with_mask(self, task_prompt: str, mask_name: Optional[str] = None,
+                               context: Dict[str, Any] = None) -> Optional[str]:
+        """
+        Build prompt with optional mask loaded.
+
+        If mask_name is provided, prepends mask content to the prompt.
+        Returns None if mask not found.
+        """
+        # Load mask if specified
+        mask_content = None
+        if mask_name:
+            mask_content = self.load_mask(mask_name)
+            if not mask_content:
+                return None
+
+        # Build base prompt
+        base_prompt = self.build_prompt(task_prompt, context)
+
+        # Prepend mask content if loaded
+        if mask_content:
+            return f"{mask_content}\n\n{base_prompt}"
+
+        return base_prompt
+
+    # ========================================================================
+    # Error Recovery
+    # ========================================================================
+
+    def is_transient_error(self, exit_code: int, error_msg: str = "") -> bool:
+        """
+        Determine if an error is transient (retryable) or permanent.
+
+        Transient errors:
+        - Network timeouts
+        - Rate limits (429)
+        - Temporary file locks
+
+        Permanent errors:
+        - Permission denied (403)
+        - User interrupts (Ctrl-C, exit code 130)
+        - Invalid syntax
+        """
+        # User interrupt
+        if exit_code == 130:
+            return False
+
+        # Permission errors
+        if exit_code == 403:
+            return False
+
+        # Rate limits are transient
+        if exit_code == 429:
+            return True
+
+        # Check error message for transient indicators
+        error_lower = error_msg.lower()
+        transient_keywords = ["timeout", "network", "connection", "temporary", "rate limit"]
+        permanent_keywords = ["permission denied", "forbidden", "interrupt", "syntax"]
+
+        if any(kw in error_lower for kw in permanent_keywords):
+            return False
+
+        if any(kw in error_lower for kw in transient_keywords):
+            return True
+
+        # Default: assume non-zero exit codes from Claude are retryable
+        return exit_code != 0
+
+    def checkpoint_session(self, session_id: str, state: Dict[str, Any]):
+        """
+        Checkpoint session state for recovery.
+
+        Similar to save_session but adds checkpoint_at timestamp.
+        """
+        state["checkpoint_at"] = time.time()
+        self.save_session(session_id, state)
+
+    def log_retry_attempt(self, attempt: int, max_retries: int, error: str, wait_time: float):
+        """Log retry attempt to history"""
+        self.log_action("retry_attempt", {
+            "attempt": attempt,
+            "max_retries": max_retries,
+            "error": error,
+            "wait_time": wait_time
+        })
+
+    def log_error_recovery(self, error_type: str, recovered: bool, attempts: int):
+        """Log error recovery outcome to history"""
+        self.log_action("error_recovery", {
+            "error_type": error_type,
+            "recovered": recovered,
+            "attempts": attempts
+        })
+
+    def get_degradation_mode(self, attempt: int) -> str:
+        """
+        Get degradation mode based on failure attempt number.
+
+        Returns:
+        - "retry": Normal retry
+        - "no-stream": Disable streaming
+        - "prompt-file": Fall back to prompt file only
+        - "fatal": Fatal error, exit
+        """
+        if attempt == 0:
+            return "retry"
+        elif attempt == 1:
+            return "no-stream"
+        elif attempt == 2:
+            return "prompt-file"
+        else:
+            return "fatal"
+
+    def invoke_with_retry(self, prompt: str, max_retries: int = 3) -> Tuple[int, Optional[List[dict]]]:
+        """
+        Invoke Claude with retry and exponential backoff.
+
+        For transient failures (network, rate limits), retries with
+        exponential backoff: 1s, 2s, 4s, etc.
+
+        Returns (exit_code, actions) tuple.
+        """
+        for attempt in range(max_retries):
+            try:
+                exit_code, actions = self.invoke_claude_cli(prompt)
+
+                # Success
+                if exit_code == 0:
+                    if attempt > 0:
+                        # Log successful recovery
+                        self.log_error_recovery("transient_error", recovered=True, attempts=attempt + 1)
+                    return exit_code, actions
+
+                # Check if error is transient
+                if not self.is_transient_error(exit_code):
+                    # Permanent error, don't retry
+                    self.log_error_recovery("permanent_error", recovered=False, attempts=attempt + 1)
+                    return exit_code, actions
+
+                # Transient error - retry with backoff
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4, ...
+                    self.log_retry_attempt(attempt + 1, max_retries, f"Exit code {exit_code}", wait_time)
+                    print(f"⏳ Retry {attempt + 1}/{max_retries} in {wait_time}s...")
+                    time.sleep(wait_time)
+
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    self.log_error_recovery("exception", recovered=False, attempts=max_retries)
+                    raise
+
+                wait_time = 2 ** attempt
+                self.log_retry_attempt(attempt + 1, max_retries, str(e), wait_time)
+                print(f"⚠️  Error: {e}, retrying in {wait_time}s...")
+                time.sleep(wait_time)
+
+        # All retries exhausted
+        self.log_error_recovery("exhausted_retries", recovered=False, attempts=max_retries)
+        return 1, None
 
     def invoke_claude_cli(self, prompt: str) -> Tuple[int, Optional[List[dict]]]:
         """
@@ -1207,6 +1560,58 @@ After running this, read the generated prompt and run the tests.
         print('  python3 palace.py next --resume SESSION_ID --select "1,2,3"')
         print()
 
+    def cmd_cleanup(self, args):
+        """Cleanup old sessions and history"""
+        import datetime
+
+        # Determine cleanup mode
+        all_sessions = getattr(args, 'all', False)
+        days = getattr(args, 'days', 30)
+
+        sessions_dir = self._get_sessions_dir()
+
+        if all_sessions:
+            # Delete all sessions
+            count = 0
+            for session_file in sessions_dir.glob("*.json"):
+                session_file.unlink()
+                count += 1
+            print(f"🗑️  Deleted {count} session(s)")
+
+        else:
+            # Delete old sessions
+            cutoff = time.time() - (days * 24 * 60 * 60)
+            count = 0
+
+            for session_file in sessions_dir.glob("*.json"):
+                try:
+                    with open(session_file, 'r') as f:
+                        session = json.load(f)
+                    updated_at = session.get("updated_at", 0)
+
+                    if updated_at < cutoff:
+                        session_file.unlink()
+                        count += 1
+                except:
+                    pass
+
+            print(f"🗑️  Deleted {count} session(s) older than {days} days")
+
+        # Optionally trim history
+        if getattr(args, 'history', False):
+            history_file = self.palace_dir / "history.jsonl"
+            if history_file.exists():
+                # Keep only last N entries
+                keep_lines = getattr(args, 'keep_history', 1000)
+
+                lines = history_file.read_text().strip().split('\n')
+                if len(lines) > keep_lines:
+                    trimmed = lines[-keep_lines:]
+                    history_file.write_text('\n'.join(trimmed) + '\n')
+                    print(f"📝 Trimmed history to {keep_lines} entries (removed {len(lines) - keep_lines})")
+
+        print("✅ Cleanup complete")
+
     def cmd_permissions(self, args):
         """
         Handle permission prompts from Claude Code
@@ -1266,6 +1671,13 @@ def main():
     subparsers.add_parser('install', help='Install Palace commands to Claude Code')
     subparsers.add_parser('init', help='Initialize Palace in current directory')
     subparsers.add_parser('sessions', help='List saved sessions')
+
+    parser_cleanup = subparsers.add_parser('cleanup', help='Cleanup old sessions and history')
+    parser_cleanup.add_argument('--all', action='store_true', help='Delete all sessions')
+    parser_cleanup.add_argument('--days', type=int, default=30, help='Delete sessions older than N days')
+    parser_cleanup.add_argument('--history', action='store_true', help='Trim history log')
+    parser_cleanup.add_argument('--keep-history', type=int, default=1000, help='Keep last N history entries')
+
     subparsers.add_parser('permissions', help='Handle Claude Code permission requests (internal)')
 
     args = parser.parse_args()
@@ -1284,6 +1696,7 @@ def main():
         'install': palace.cmd_install,
         'init': palace.cmd_init,
         'sessions': palace.cmd_sessions,
+        'cleanup': palace.cmd_cleanup,
         'permissions': palace.cmd_permissions,
     }
 
