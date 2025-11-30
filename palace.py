@@ -15,8 +15,9 @@ import sys
 import os
 import json
 import subprocess
+import re
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 VERSION = "0.1.0"
 
@@ -174,9 +175,103 @@ class Palace:
             print(f"❌ Error invoking Claude: {e}")
             return 1
 
+    def _parse_actions_menu(self, text: str) -> List[dict]:
+        """Parse ACTIONS: menu from text, return list of action dicts"""
+        if "ACTIONS:" not in text:
+            return []
+
+        actions = []
+        lines = text.split("ACTIONS:", 1)[1].strip().split("\n")
+        current_action = None
+
+        for line in lines:
+            # Empty line ends menu
+            if not line.strip() and current_action:
+                actions.append(current_action)
+                current_action = None
+                continue
+
+            # Numbered action: "1. Label text here"
+            match = re.match(r'^(\d+)\.\s+(.+)$', line)
+            if match:
+                if current_action:
+                    actions.append(current_action)
+                current_action = {
+                    "num": match.group(1),
+                    "label": match.group(2),
+                    "description": "",
+                    "subactions": []
+                }
+                continue
+
+            # Sub-action: "   a. Sub label"
+            match = re.match(r'^\s+([a-z])\.\s+(.+)$', line)
+            if match and current_action:
+                current_action["subactions"].append({
+                    "letter": match.group(1),
+                    "label": match.group(2)
+                })
+                continue
+
+            # Description line (indented, no number/letter)
+            if line.startswith("   ") and current_action:
+                if current_action["description"]:
+                    current_action["description"] += " " + line.strip()
+                else:
+                    current_action["description"] = line.strip()
+
+        if current_action:
+            actions.append(current_action)
+
+        return actions
+
+    def _show_action_menu(self, actions: List[dict]) -> Optional[str]:
+        """Show interactive menu and return selected action"""
+        try:
+            import questionary
+        except ImportError:
+            # Fallback to simple numbered input
+            print("\nSelect an action:")
+            for a in actions:
+                print(f"  {a['num']}. {a['label']}")
+            choice = input("\nEnter number: ").strip()
+            for a in actions:
+                if a["num"] == choice:
+                    return a["label"]
+            return None
+
+        choices = []
+        for a in actions:
+            label = f"{a['num']}. {a['label']}"
+            if a["description"]:
+                label += f"\n   {a['description'][:100]}..."
+            choices.append(questionary.Choice(label, value=a))
+
+        selected = questionary.select(
+            "Select action:",
+            choices=choices,
+            use_indicator=True,
+            use_shortcuts=True
+        ).ask()
+
+        if selected and selected.get("subactions"):
+            # Show submenu
+            sub_choices = [
+                questionary.Choice(f"{s['letter']}. {s['label']}", value=s)
+                for s in selected["subactions"]
+            ]
+            sub = questionary.select(
+                f"Sub-action for: {selected['label'][:50]}...",
+                choices=sub_choices
+            ).ask()
+            return sub["label"] if sub else selected["label"]
+
+        return selected["label"] if selected else None
+
     def _process_stream_output(self, stream):
         """Process streaming JSON output and display succinct progress"""
         text_by_msg = {}  # Track text per message ID
+        full_text = ""  # Buffer all text for menu detection
         seen_tools = set()
         current_line_len = 0  # Track chars on current line for clearing
 
@@ -207,6 +302,7 @@ class Palace:
                                 new_text = text[len(prev_text):]
                                 print(new_text, end="", flush=True)
                                 text_by_msg[msg_id] = text
+                                full_text += new_text  # Buffer for menu detection
                                 # Track if we're mid-line
                                 if "\n" in new_text:
                                     current_line_len = len(new_text.split("\n")[-1])
@@ -260,6 +356,16 @@ class Palace:
                 pass
 
         print()
+
+        # Check for action menu and show selector
+        actions = self._parse_actions_menu(full_text)
+        if actions:
+            print()
+            selected = self._show_action_menu(actions)
+            if selected:
+                print(f"\n🎯 Selected: {selected}")
+                return selected
+        return None
 
     def invoke_claude(self, prompt: str, context: Dict[str, Any] = None):
         """
