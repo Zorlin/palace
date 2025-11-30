@@ -177,6 +177,102 @@ class Palace:
 
         return sorted(sessions, key=lambda s: s.get("updated_at", 0), reverse=True)
 
+    def export_session(self, session_id: str, output_path: Optional[str] = None) -> Optional[str]:
+        """
+        Export a session to a portable JSON file.
+
+        Includes full session state, history, and metadata for sharing or backup.
+
+        Args:
+            session_id: The session ID to export
+            output_path: Optional output file path (defaults to current dir)
+
+        Returns path to exported file or None if session not found.
+        """
+        session = self.load_session(session_id)
+        if not session:
+            return None
+
+        # Build export bundle
+        export_data = {
+            "version": "1.0",
+            "exported_at": time.time(),
+            "palace_version": self.version,
+            "session": session
+        }
+
+        # Add relevant history entries for this session
+        history_entries = []
+        history_file = self.palace_dir / "history.jsonl"
+        if history_file.exists():
+            for line in history_file.read_text().strip().split('\n'):
+                try:
+                    entry = json.loads(line)
+                    # Include entries from this session
+                    if entry.get("details", {}).get("session_id") == session_id:
+                        history_entries.append(entry)
+                except:
+                    pass
+
+        export_data["history"] = history_entries
+
+        # Determine output path
+        if not output_path:
+            output_path = f"{session_id}_export.json"
+
+        # Write export file
+        with open(output_path, 'w') as f:
+            json.dump(export_data, f, indent=2)
+
+        return output_path
+
+    def import_session(self, import_path: str, new_session_id: Optional[str] = None) -> Optional[str]:
+        """
+        Import a session from an exported JSON file.
+
+        Args:
+            import_path: Path to the exported session file
+            new_session_id: Optional new session ID (generates one if not provided)
+
+        Returns the imported session ID or None if import failed.
+        """
+        try:
+            with open(import_path, 'r') as f:
+                import_data = json.load(f)
+
+            # Validate export format
+            if "session" not in import_data:
+                return None
+
+            session = import_data["session"]
+
+            # Generate new session ID if not provided
+            if not new_session_id:
+                new_session_id = self.generate_session_id()
+
+            # Update session ID
+            session["session_id"] = new_session_id
+            session["imported_at"] = time.time()
+            session["imported_from"] = import_path
+
+            # Save imported session
+            self.save_session(new_session_id, session)
+
+            # Import history entries if present
+            if "history" in import_data and import_data["history"]:
+                history_file = self.palace_dir / "history.jsonl"
+                with open(history_file, 'a') as f:
+                    for entry in import_data["history"]:
+                        # Update session_id in history entries
+                        if "details" in entry and isinstance(entry["details"], dict):
+                            entry["details"]["session_id"] = new_session_id
+                        f.write(json.dumps(entry) + '\n')
+
+            return new_session_id
+
+        except Exception as e:
+            return None
+
     def _is_simple_selection(self, selection: str) -> bool:
         """
         Check if selection is simple enough for regex parsing.
@@ -1732,6 +1828,139 @@ After running this, read the generated prompt and run the tests.
 
         print("✅ Cleanup complete")
 
+    def cmd_export(self, args):
+        """Export a session to a file"""
+        session_id = args.session_id
+        output = getattr(args, 'output', None)
+
+        result = self.export_session(session_id, output)
+        if result:
+            print(f"📦 Exported session {session_id}")
+            print(f"   → {result}")
+        else:
+            print(f"❌ Session {session_id} not found")
+
+    def cmd_import(self, args):
+        """Import a session from a file"""
+        import_path = args.file
+        new_id = getattr(args, 'session_id', None)
+
+        result = self.import_session(import_path, new_id)
+        if result:
+            print(f"📥 Imported session from {import_path}")
+            print(f"   → New session ID: {result}")
+            print()
+            print("Resume with:")
+            print(f'  python3 palace.py next --resume {result}')
+        else:
+            print(f"❌ Failed to import session from {import_path}")
+
+    def cmd_analyze(self, args):
+        """Self-analysis: Palace analyzes itself"""
+        print("🔍 Palace Self-Analysis")
+        print()
+        print("Analyzing Palace's own codebase...")
+        print()
+
+        # Gather metrics about Palace itself
+        metrics = {}
+
+        # Code metrics
+        palace_file = Path(__file__)
+        if palace_file.exists():
+            lines = palace_file.read_text().split('\n')
+            metrics['total_lines'] = len(lines)
+            metrics['code_lines'] = len([l for l in lines if l.strip() and not l.strip().startswith('#')])
+            metrics['comment_lines'] = len([l for l in lines if l.strip().startswith('#')])
+
+        # Test coverage
+        test_files = list(Path('tests').glob('test_*.py'))
+        metrics['test_files'] = len(test_files)
+        metrics['test_lines'] = sum(len(f.read_text().split('\n')) for f in test_files if f.exists())
+
+        # Session data
+        sessions = self.list_sessions()
+        metrics['total_sessions'] = len(sessions)
+
+        # History depth
+        history_file = self.palace_dir / "history.jsonl"
+        if history_file.exists():
+            metrics['history_entries'] = len(history_file.read_text().strip().split('\n'))
+
+        # Mask system
+        masks = self.list_masks()
+        metrics['available_masks'] = len([m for m in masks if m['type'] == 'available'])
+        metrics['custom_masks'] = len([m for m in masks if m['type'] == 'custom'])
+
+        # Display metrics
+        print("📊 Code Metrics:")
+        print(f"   Total lines: {metrics.get('total_lines', 0)}")
+        print(f"   Code lines: {metrics.get('code_lines', 0)}")
+        print(f"   Comment lines: {metrics.get('comment_lines', 0)}")
+        print(f"   Test files: {metrics.get('test_files', 0)}")
+        print(f"   Test lines: {metrics.get('test_lines', 0)}")
+        print()
+
+        print("📋 Session Data:")
+        print(f"   Total sessions: {metrics.get('total_sessions', 0)}")
+        print(f"   History entries: {metrics.get('history_entries', 0)}")
+        print()
+
+        print("🎭 Mask System:")
+        print(f"   Available masks: {metrics.get('available_masks', 0)}")
+        print(f"   Custom masks: {metrics.get('custom_masks', 0)}")
+        print()
+
+        # Analyze recent history for patterns
+        if history_file.exists():
+            print("📈 Recent Activity Patterns:")
+            action_types = {}
+            for line in history_file.read_text().strip().split('\n')[-50:]:
+                try:
+                    entry = json.loads(line)
+                    action = entry.get('action', 'unknown')
+                    action_types[action] = action_types.get(action, 0) + 1
+                except:
+                    pass
+
+            for action, count in sorted(action_types.items(), key=lambda x: x[1], reverse=True)[:5]:
+                print(f"   {action}: {count}")
+            print()
+
+        # Suggestions for improvement
+        print("💡 Suggestions:")
+        suggestions = []
+
+        code_to_test_ratio = metrics.get('code_lines', 0) / max(metrics.get('test_lines', 1), 1)
+        if code_to_test_ratio > 1.5:
+            suggestions.append("Consider adding more tests (current ratio: {:.1f}:1)".format(code_to_test_ratio))
+
+        if metrics.get('total_sessions', 0) > 10:
+            suggestions.append("Run 'palace cleanup' to remove old sessions")
+
+        if metrics.get('custom_masks', 0) == 0:
+            suggestions.append("Create custom masks for project-specific expertise")
+
+        if not suggestions:
+            suggestions.append("Palace is in good shape!")
+
+        for i, suggestion in enumerate(suggestions, 1):
+            print(f"   {i}. {suggestion}")
+        print()
+
+        # Save analysis
+        analysis = {
+            "timestamp": time.time(),
+            "metrics": metrics,
+            "suggestions": suggestions
+        }
+
+        analysis_file = self.palace_dir / "self_analysis.json"
+        with open(analysis_file, 'w') as f:
+            json.dump(analysis, f, indent=2)
+
+        print(f"📝 Analysis saved to {analysis_file}")
+
     def cmd_permissions(self, args):
         """
         Handle permission prompts from Claude Code
@@ -1798,6 +2027,16 @@ def main():
     parser_cleanup.add_argument('--history', action='store_true', help='Trim history log')
     parser_cleanup.add_argument('--keep-history', type=int, default=1000, help='Keep last N history entries')
 
+    parser_export = subparsers.add_parser('export', help='Export a session to a file')
+    parser_export.add_argument('session_id', help='Session ID to export')
+    parser_export.add_argument('--output', '-o', help='Output file path (default: SESSION_ID_export.json)')
+
+    parser_import = subparsers.add_parser('import', help='Import a session from a file')
+    parser_import.add_argument('file', help='Path to exported session file')
+    parser_import.add_argument('--session-id', help='New session ID (default: auto-generate)')
+
+    subparsers.add_parser('analyze', help='Self-analysis: Palace analyzes itself')
+
     subparsers.add_parser('permissions', help='Handle Claude Code permission requests (internal)')
 
     args = parser.parse_args()
@@ -1817,6 +2056,9 @@ def main():
         'init': palace.cmd_init,
         'sessions': palace.cmd_sessions,
         'cleanup': palace.cmd_cleanup,
+        'export': palace.cmd_export,
+        'import': palace.cmd_import,
+        'analyze': palace.cmd_analyze,
         'permissions': palace.cmd_permissions,
     }
 
