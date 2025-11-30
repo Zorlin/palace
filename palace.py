@@ -339,7 +339,6 @@ The "ACTIONS:" header is required (exact spelling with colon) - it triggers the 
         # Also detect numbered lists anywhere in the text
         if not action_section:
             # Look for numbered list patterns like "1. Do something"
-            import re
             numbered = re.findall(r'^\s*(\d+)\.\s+\*?\*?([^\n*]+)', text, re.MULTILINE)
             if numbered:
                 for num, label in numbered[:7]:  # Max 7 actions
