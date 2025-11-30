@@ -31,9 +31,9 @@ class Palace(PalaceCore, ActionParser, PromptBuilder, SteeringSystem,
     - StreamProcessor: Stream processing and output formatting
     """
 
-    def __init__(self, strict_mode: bool = True):
-        # Initialize core with strict mode
-        PalaceCore.__init__(self, strict_mode=strict_mode)
+    def __init__(self, strict_mode: bool = True, force_claude: bool = False, force_glm: bool = False):
+        # Initialize core with strict mode and provider overrides
+        PalaceCore.__init__(self, strict_mode=strict_mode, force_claude=force_claude, force_glm=force_glm)
 
         # Initialize other components that need setup
         SteeringSystem.__init__(self)

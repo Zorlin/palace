@@ -135,6 +135,42 @@ Use `--yolo` to disable test validation:
 
 **Note**: YOLO mode logs a warning to history for audit purposes.
 
+## Provider Overrides 💎💰
+
+Control which AI models Palace uses with provider override flags.
+
+### Default Behavior
+
+- **Normal mode** (`pal next`): Uses Claude Sonnet 4.5 (high quality)
+- **Turbo mode** (`pal next -t`): Uses GLM-4.6 (cost-efficient)
+
+### Override Flags
+
+```bash
+# Use Claude models even in turbo mode (higher quality, higher cost)
+pal next -t --claude
+
+# Use GLM even in normal mode (lower cost, faster)
+pal next --glm
+
+# Combine with other flags
+pal next -t --claude --yolo  # Quality + speed
+```
+
+### When to Use
+
+**`--claude` (ENGAGE mode)**
+- You want max quality in turbo mode
+- Complex reasoning tasks need Claude
+- "I want to spend money for better results"
+
+**`--glm` (Economy mode)**
+- Cost savings in normal mode
+- Simple tasks don't need Claude
+- Fast iteration on straightforward work
+
+Both flags work with all commands that invoke Claude.
+
 ## Documentation
 
 - **[Quick Start](QUICKSTART.md)** - Get up and running in 5 minutes

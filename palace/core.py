@@ -12,12 +12,14 @@ from typing import Optional, Dict, Any, List
 class Palace:
     """Palace orchestration layer - coordinates Claude invocations"""
 
-    def __init__(self, strict_mode: bool = True) -> None:
+    def __init__(self, strict_mode: bool = True, force_claude: bool = False, force_glm: bool = False) -> None:
         self.project_root = Path.cwd()
         self.palace_dir = self.project_root / ".palace"
         self.config_file = self.palace_dir / "config.json"
         self.strict_mode = strict_mode
         self.modified_files = set()  # Track files modified during execution
+        self.force_claude = force_claude  # Use Claude even in turbo mode
+        self.force_glm = force_glm  # Use GLM even in normal mode
 
     def ensure_palace_dir(self) -> None:
         """Ensure .palace directory exists"""

@@ -47,12 +47,14 @@ def is_interactive() -> bool:
 class Palace:
     """Palace orchestration layer - coordinates Claude invocations"""
 
-    def __init__(self, strict_mode: bool = True) -> None:
+    def __init__(self, strict_mode: bool = True, force_claude: bool = False, force_glm: bool = False) -> None:
         self.project_root = Path.cwd()
         self.palace_dir = self.project_root / ".palace"
         self.config_file = self.palace_dir / "config.json"
         self.strict_mode = strict_mode
         self.modified_files = set()  # Track files modified during execution
+        self.force_claude = force_claude  # Use Claude even in turbo mode
+        self.force_glm = force_glm  # Use GLM even in normal mode
 
     def ensure_palace_dir(self) -> None:
         """Ensure .palace directory exists"""
@@ -1614,11 +1616,22 @@ Reply with JSON only:
             task = assignment.get("task", {})
             task_label = task.get("label", f"Task {task_num}")
 
-            # TURBO MODE: Always use GLM-4.6 via Z.ai for cheap parallel execution
+            # TURBO MODE: Default to GLM-4.6 via Z.ai for cheap parallel execution
+            # Override with --claude flag to use Claude models for higher quality
             # The model_alias (haiku/sonnet/opus) indicates ranked effort level
-            # but actual execution always uses GLM for cost efficiency
-            provider = "z.ai"
-            model = "glm-4.6"
+            if self.force_claude:
+                # Use Claude models via Anthropic (higher cost, higher quality)
+                provider = "anthropic"
+                model_map = {
+                    "haiku": "claude-3-5-haiku-20241022",
+                    "sonnet": "claude-sonnet-4-5",
+                    "opus": "claude-3-opus-20240229"
+                }
+                model = model_map.get(model_alias, "claude-sonnet-4-5")
+            else:
+                # Use GLM for cost efficiency (default turbo behavior)
+                provider = "z.ai"
+                model = "glm-4.6"
             provider_config = config["providers"].get(provider, {})
 
             agent_id = f"{model_alias}-{task_num}"
@@ -2009,6 +2022,10 @@ This tells Palace to stop that agent."""
         Returns results from all swarm agents.
         """
         print("\n🚀 TURBO MODE ACTIVATED")
+        if self.force_claude:
+            print("💎 Using Claude models (high quality, higher cost)")
+        else:
+            print("💰 Using GLM-4.6 (cost-efficient, fast)")
         print("─" * 50)
 
         # Step 1: Rank tasks by model
@@ -2188,9 +2205,24 @@ ACTIONS:
 
 The "ACTIONS:" header is required (exact spelling with colon) - it triggers the interactive menu system."""
 
+        # Determine which model to use
+        if self.force_glm:
+            # Use GLM for cost savings (requires Z.ai API key)
+            model = "glm-4.6"
+            # Set up environment for Z.ai
+            env = os.environ.copy()
+            zai_key = os.environ.get("ZAI_API_KEY", "")
+            if zai_key:
+                env["ANTHROPIC_AUTH_TOKEN"] = zai_key
+                env["ANTHROPIC_BASE_URL"] = "https://api.z.ai/api/anthropic"
+        else:
+            # Use Claude Sonnet (default)
+            model = "claude-sonnet-4-5"
+            env = None  # Use default environment
+
         cmd = [
             "claude",
-            "--model", "claude-sonnet-4-5",
+            "--model", model,
             "--append-system-prompt", menu_prompt,
             "--verbose",
             "--input-format", "stream-json",
@@ -2201,18 +2233,23 @@ The "ACTIONS:" header is required (exact spelling with colon) - it triggers the 
         print("🏛️  Palace - Invoking Claude...")
         if not self.strict_mode:
             print("⚡ YOLO mode active - test validation disabled")
+        if self.force_glm:
+            print("💰 GLM mode active - using GLM-4.6 for cost savings")
         print()
 
         try:
             # Bidirectional streaming JSON
-            process = subprocess.Popen(
-                cmd,
-                cwd=self.project_root,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True
-            )
+            popen_args = {
+                "cwd": self.project_root,
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "text": True
+            }
+            if env is not None:
+                popen_args["env"] = env
+
+            process = subprocess.Popen(cmd, **popen_args)
 
             # Send initial prompt via streaming JSON
             initial_message = {
@@ -3659,6 +3696,10 @@ def main():
                         help='Strict mode: Enforce test validation (default)')
     parser.add_argument('--yolo', action='store_true',
                         help='YOLO mode: Skip all test validation (--no-strict)')
+    parser.add_argument('--claude', action='store_true',
+                        help='Use Claude models even in turbo mode (higher quality, higher cost)')
+    parser.add_argument('--glm', action='store_true',
+                        help='Use GLM model even in normal mode (lower cost, faster)')
 
     subparsers = parser.add_subparsers(dest='command', help='Commands')
 
@@ -3711,7 +3752,11 @@ def main():
     # Determine strict mode: --yolo disables, otherwise default to --strict
     strict_mode = not args.yolo if hasattr(args, 'yolo') else args.strict
 
-    palace = Palace(strict_mode=strict_mode)
+    # Determine provider overrides
+    force_claude = getattr(args, 'claude', False)
+    force_glm = getattr(args, 'glm', False)
+
+    palace = Palace(strict_mode=strict_mode, force_claude=force_claude, force_glm=force_glm)
 
     commands = {
         'next': palace.cmd_next,
