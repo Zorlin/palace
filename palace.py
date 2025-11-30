@@ -141,20 +141,27 @@ class Palace:
         cmd = [
             "claude",
             "-p", prompt,
-            "--verbose",
-            "--system-prompt",
-            "--include-partial-messages",
-            "--input-format", "stream-json",
             "--output-format", "stream-json",
-            "--permission-prompt-tool", "mcp__palace__handle_permission"
+            "--dangerously-skip-permissions"  # Auto-approve for RHSI loops
         ]
 
-        print("🏛️  Palace - Invoking Claude Code CLI...")
+        print("🏛️  Palace - Invoking Claude...")
         print()
 
         try:
-            result = subprocess.run(cmd, cwd=self.project_root)
-            return result.returncode
+            # Stream output and parse JSON for succinct display
+            process = subprocess.Popen(
+                cmd,
+                cwd=self.project_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+
+            self._process_stream_output(process.stdout)
+            process.wait()
+            return process.returncode
+
         except FileNotFoundError:
             print("❌ Claude Code CLI not found. Make sure 'claude' is in your PATH.")
             print("   Install from: https://code.claude.com/")
@@ -162,6 +169,87 @@ class Palace:
         except Exception as e:
             print(f"❌ Error invoking Claude: {e}")
             return 1
+
+    def _process_stream_output(self, stream):
+        """Process streaming JSON output and display succinct progress"""
+        current_text = ""
+        seen_tools = set()
+
+        for line in stream:
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                msg = json.loads(line)
+                msg_type = msg.get("type", "")
+
+                if msg_type == "system" and msg.get("subtype") == "init":
+                    # Session started
+                    model = msg.get("model", "unknown")
+                    print(f"📡 Model: {model}")
+                    print()
+
+                elif msg_type == "assistant":
+                    # Assistant message with content
+                    message = msg.get("message", {})
+                    content = message.get("content", [])
+
+                    for block in content:
+                        if block.get("type") == "text":
+                            text = block.get("text", "")
+                            if text and text != current_text:
+                                # Print new text (delta)
+                                new_text = text[len(current_text):]
+                                if new_text:
+                                    print(new_text, end="", flush=True)
+                                current_text = text
+
+                        elif block.get("type") == "tool_use":
+                            tool_name = block.get("name", "unknown")
+                            tool_id = block.get("id", "")
+
+                            if tool_id not in seen_tools:
+                                seen_tools.add(tool_id)
+                                # Show tool use succinctly
+                                tool_input = block.get("input", {})
+                                if tool_name == "Read":
+                                    file_path = tool_input.get("file_path", "")
+                                    short_path = file_path.split("/")[-1] if file_path else "?"
+                                    print(f"\n📖 Reading: {short_path}")
+                                elif tool_name == "Edit":
+                                    file_path = tool_input.get("file_path", "")
+                                    short_path = file_path.split("/")[-1] if file_path else "?"
+                                    print(f"\n✏️  Editing: {short_path}")
+                                elif tool_name == "Write":
+                                    file_path = tool_input.get("file_path", "")
+                                    short_path = file_path.split("/")[-1] if file_path else "?"
+                                    print(f"\n📝 Writing: {short_path}")
+                                elif tool_name == "Bash":
+                                    cmd = tool_input.get("command", "")[:50]
+                                    print(f"\n💻 Running: {cmd}...")
+                                elif tool_name == "Glob":
+                                    pattern = tool_input.get("pattern", "")
+                                    print(f"\n🔍 Finding: {pattern}")
+                                elif tool_name == "Grep":
+                                    pattern = tool_input.get("pattern", "")
+                                    print(f"\n🔎 Searching: {pattern}")
+                                else:
+                                    print(f"\n🔧 {tool_name}")
+
+                elif msg_type == "result":
+                    # Final result
+                    print("\n")
+                    print("✅ Done")
+
+            except json.JSONDecodeError:
+                # Not valid JSON, might be partial
+                pass
+            except Exception as e:
+                # Silently skip parsing errors
+                pass
+
+        print()  # Final newline
 
     def invoke_claude(self, prompt: str, context: Dict[str, Any] = None):
         """
@@ -541,12 +629,17 @@ try:
     mcp = FastMCP("Palace")
 
     @mcp.tool()
-    def handle_permission(request: dict) -> dict:
+    def handle_permission(
+        tool_name: str = "",
+        input: dict = None,
+        tool_use_id: str = "",
+        **kwargs
+    ) -> dict:
         """
         Handle permission requests from Claude during RHSI loops.
 
-        Args:
-            request: Permission request containing action details
+        Claude Code sends permission requests with tool_name, input, and tool_use_id.
+        We auto-approve all requests for RHSI autonomous operation.
 
         Returns:
             dict with 'approved' (bool) and optional 'reason' (str)
@@ -555,9 +648,15 @@ try:
         palace = Palace()
 
         # Log the permission request
-        palace.log_action("permission_request", {"request": request})
+        request_data = {
+            "tool_name": tool_name,
+            "input": input or {},
+            "tool_use_id": tool_use_id,
+            **kwargs
+        }
+        palace.log_action("permission_request", {"request": request_data})
 
-        # For now, approve all requests
+        # Auto-approve all requests for RHSI loops
         # TODO: Add smart permission logic based on learning from history
         return {"approved": True}
 

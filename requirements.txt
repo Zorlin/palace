@@ -3,6 +3,9 @@
 # MCP Integration (REQUIRED for permission handling)
 mcp>=0.1.0
 
+# Streaming JSON output parsing
+json-stream>=2.0.0
+
 # Testing (Golden Rule #1: TDD)
 pytest>=7.4.0
 pytest-cov>=4.1.0
