@@ -47,10 +47,12 @@ def is_interactive() -> bool:
 class Palace:
     """Palace orchestration layer - coordinates Claude invocations"""
 
-    def __init__(self) -> None:
+    def __init__(self, strict_mode: bool = True) -> None:
         self.project_root = Path.cwd()
         self.palace_dir = self.project_root / ".palace"
         self.config_file = self.palace_dir / "config.json"
+        self.strict_mode = strict_mode
+        self.modified_files = set()  # Track files modified during execution
 
     def ensure_palace_dir(self) -> None:
         """Ensure .palace directory exists"""
@@ -1392,6 +1394,118 @@ Return JSON only:
             for t in tasks
         }
 
+    def _evaluate_continuation_strategy(self, next_tasks: List[str], iteration: int) -> Dict[str, Any]:
+        """
+        Evaluate whether to auto-continue turbo mode or present options to user.
+
+        Args:
+            next_tasks: List of next task descriptions
+            iteration: Current RHSI iteration number
+
+        Returns:
+            {
+                "strategy": "auto_continue" | "present_options",
+                "reason": "explanation",
+                "confidence": 0.0-1.0
+            }
+        """
+        import anthropic
+
+        if not next_tasks:
+            return {
+                "strategy": "present_options",
+                "reason": "No specific tasks identified - user input needed",
+                "confidence": 1.0
+            }
+
+        # Get recent history to check for rehashes
+        history_context = ""
+        history_file = self.palace_dir / "history.jsonl"
+        if history_file.exists():
+            recent_actions = []
+            with open(history_file, 'r') as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            entry = json.loads(line)
+                            if entry.get("action") in ["turbo_complete", "next"]:
+                                recent_actions.append(entry)
+                        except:
+                            pass
+            # Last 5 actions
+            for action in recent_actions[-5:]:
+                history_context += f"- {action.get('action')}: {action.get('details', {})}\n"
+
+        prompt = f"""Evaluate continuation strategy for an RHSI turbo mode loop.
+
+Current iteration: {iteration}
+
+Next tasks identified:
+{chr(10).join(f"- {t}" for t in next_tasks)}
+
+Recent history:
+{history_context if history_context else "No recent history"}
+
+Decision criteria:
+1. **Auto-continue** if:
+   - Tasks are obvious completions of previous work
+   - Tasks are fixing known issues from last iteration
+   - No novel strategic decisions required
+   - High confidence the right path is clear
+
+2. **Present options** if:
+   - Tasks represent new strategic directions
+   - Multiple valid approaches exist
+   - User input would materially improve outcome
+   - Tasks require clarification or prioritization
+
+Reply with JSON only:
+{{"strategy": "auto_continue" or "present_options", "reason": "1-sentence explanation", "confidence": 0.0-1.0}}"""
+
+        try:
+            # Use GLM for quick evaluation
+            zai_key = os.environ.get("ZAI_API_KEY", "")
+            if zai_key:
+                client = anthropic.Anthropic(
+                    api_key=zai_key,
+                    base_url="https://api.z.ai/api/anthropic"
+                )
+            else:
+                client = anthropic.Anthropic()
+
+            response = client.messages.create(
+                model="glm-4.6",
+                max_tokens=300,
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+            response_text = response.content[0].text.strip()
+
+            # Parse JSON
+            if "{" in response_text:
+                json_start = response_text.find("{")
+                json_end = response_text.rfind("}") + 1
+                result = json.loads(response_text[json_start:json_end])
+
+                # Validate and return
+                if result.get("strategy") in ["auto_continue", "present_options"]:
+                    return result
+
+            # Fallback
+            return {
+                "strategy": "present_options",
+                "reason": "Unable to evaluate - defaulting to user input",
+                "confidence": 0.5
+            }
+
+        except Exception as e:
+            # On error, default to presenting options (safer)
+            return {
+                "strategy": "present_options",
+                "reason": f"Evaluation error: {str(e)[:30]}",
+                "confidence": 0.0
+            }
+
     def evaluate_turbo_completion(self) -> Dict[str, Any]:
         """
         Evaluate if turbo mode goals are complete using Opus.
@@ -2079,6 +2193,8 @@ The "ACTIONS:" header is required (exact spelling with colon) - it triggers the 
         ]
 
         print("🏛️  Palace - Invoking Claude...")
+        if not self.strict_mode:
+            print("⚡ YOLO mode active - test validation disabled")
         print()
 
         try:
@@ -2103,6 +2219,43 @@ The "ACTIONS:" header is required (exact spelling with colon) - it triggers the 
 
             selected_action = self._process_stream_output(process.stdout, process)
             process.wait()
+
+            # COMPLETION HOOK: Validate tests in strict mode
+            if self.strict_mode:
+                modified_files_path = self.palace_dir / "modified_files.json"
+                modified_files = set()
+
+                if modified_files_path.exists():
+                    try:
+                        with open(modified_files_path, 'r') as f:
+                            modified_files = set(json.load(f))
+                    except Exception:
+                        pass  # Ignore read errors
+
+                if modified_files:
+                    print("\n🔒 Strict mode: Validating tests for modified files...")
+                    test_files = self.detect_affected_tests(modified_files)
+
+                    if test_files:
+                        print(f"📝 Running {len(test_files)} test file(s)...")
+                        tests_passed = self.run_test_subset(test_files)
+
+                        if not tests_passed:
+                            print("\n❌ Strict mode: Tests must pass before completion")
+                            print("   Modified files:", ", ".join(sorted(modified_files)))
+                            print("   Fix the failing tests to complete this session.")
+                            return 1, selected_action  # Non-zero exit code
+
+                        print("✅ All tests passed!")
+
+                        # Clear modified files after successful test run
+                        try:
+                            modified_files_path.unlink()
+                        except Exception:
+                            pass
+                    else:
+                        print("⚠️  No tests found for modified files (consider adding tests)")
+
             return process.returncode, selected_action
 
         except FileNotFoundError:
@@ -2733,16 +2886,29 @@ Be concrete and actionable. The user will select which action(s) to execute."""
                     print(f"\n🏆 {evaluation.get('reason', 'Goals achieved!')}")
                     break
                 else:
-                    # Continue with next RHSI loop
+                    # Not complete - intelligently decide next steps
                     print(f"\n🔄 {evaluation.get('reason', 'More work needed...')}")
                     next_tasks = evaluation.get("next_tasks", [])
-                    if next_tasks:
-                        # Convert to action format for next iteration
+
+                    # Evaluate if we should present options or auto-continue
+                    continuation = self._evaluate_continuation_strategy(next_tasks, iteration)
+
+                    if continuation["strategy"] == "auto_continue":
+                        print(f"🤖 {continuation['reason']}")
+                        print("🚀 Auto-continuing turbo mode...")
+                        # Convert tasks to actions and continue automatically
                         selected_actions = [{"label": t, "description": ""} for t in next_tasks]
                         current_prompt = self._build_action_prompt(selected_actions)
                         continue
+                    elif continuation["strategy"] == "present_options":
+                        print(f"💡 {continuation['reason']}")
+                        print("📋 Generating options for user selection...")
+                        # Generate and present action menu to user
+                        # Break out to normal RHSI loop with action menu
+                        current_prompt = "Evaluate the current state and suggest next actions. Include an ACTIONS: section."
+                        break  # Exit turbo loop, present menu to user
                     else:
-                        # No specific tasks, let Claude decide
+                        # Fallback: let Claude decide
                         current_prompt = "Evaluate the current state and suggest next actions. Include an ACTIONS: section."
                         continue
 
@@ -2885,6 +3051,95 @@ Ask questions if needed to clarify the project type or goals."""
         print("🤖 CLAUDE: Please analyze the project and create appropriate scaffolding.")
 
         self.log_action("scaffold")
+
+    def detect_affected_tests(self, modified_files: set) -> set:
+        """
+        Detect which test files should run based on modified files.
+
+        Uses pytest --collect-only to map files to tests.
+        Returns set of test file paths.
+        """
+        if not modified_files:
+            return set()
+
+        test_files = set()
+        tests_dir = self.project_root / "tests"
+
+        if not tests_dir.exists():
+            return set()
+
+        # For each modified file, try to find corresponding test file
+        for modified_file in modified_files:
+            try:
+                file_path = Path(modified_file)
+
+                # Skip if file is already a test
+                if file_path.parts and file_path.parts[0] == "tests":
+                    test_files.add(str(file_path))
+                    continue
+
+                # Try to find test file by naming convention
+                # e.g., palace.py -> test_palace.py or test_core.py
+                filename = file_path.stem
+
+                # Look for test files that might test this module
+                possible_patterns = [
+                    f"test_{filename}.py",
+                    f"test_*{filename}*.py",
+                    f"test_core.py",  # Core tests likely test main module
+                ]
+
+                for pattern in possible_patterns:
+                    matching_tests = list(tests_dir.glob(f"**/{pattern}"))
+                    for test_file in matching_tests:
+                        test_files.add(str(test_file.relative_to(self.project_root)))
+
+            except Exception as e:
+                # If detection fails, skip this file
+                print(f"⚠️  Could not detect tests for {modified_file}: {e}")
+                continue
+
+        # If no specific tests found, run all tests (safer in strict mode)
+        if not test_files and modified_files:
+            all_tests = list(tests_dir.glob("**test_*.py"))
+            test_files = {str(t.relative_to(self.project_root)) for t in all_tests}
+
+        return test_files
+
+    def run_test_subset(self, test_files: set = None) -> bool:
+        """
+        Run a subset of tests.
+
+        Args:
+            test_files: Set of test file paths to run. If None, runs all tests.
+
+        Returns:
+            True if tests pass, False otherwise
+        """
+        if not test_files:
+            # Run all tests
+            cmd = ["python3", "-m", "pytest", "tests/", "-x", "--tb=short"]
+        else:
+            # Run specific test files
+            cmd = ["python3", "-m", "pytest", "-x", "--tb=short"] + list(test_files)
+
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=self.project_root,
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode != 0:
+                print(f"\n❌ Tests failed:\n{result.stdout}\n{result.stderr}")
+                return False
+
+            return True
+
+        except Exception as e:
+            print(f"⚠️  Error running tests: {e}")
+            return False
 
     def cmd_test(self, args):
         """Ask Claude to run tests"""
@@ -3394,6 +3649,10 @@ def main():
     )
 
     parser.add_argument('--version', action='version', version=f'Palace {VERSION}')
+    parser.add_argument('--strict', action='store_true', default=True,
+                        help='Strict mode: Enforce test validation (default)')
+    parser.add_argument('--yolo', action='store_true',
+                        help='YOLO mode: Skip all test validation (--no-strict)')
 
     subparsers = parser.add_subparsers(dest='command', help='Commands')
 
@@ -3443,7 +3702,10 @@ def main():
         parser.print_help()
         return
 
-    palace = Palace()
+    # Determine strict mode: --yolo disables, otherwise default to --strict
+    strict_mode = not args.yolo if hasattr(args, 'yolo') else args.strict
+
+    palace = Palace(strict_mode=strict_mode)
 
     commands = {
         'next': palace.cmd_next,
@@ -3608,6 +3870,28 @@ Based on the safety guidelines, should this operation be approved?"""
 
         # Assess safety using Haiku and the command-safety skill
         result = _assess_permission_safety(tool_name, tool_input)
+
+        # Track file modifications in strict mode
+        if result.get("behavior") == "allow" and tool_name in ["Write", "Edit"]:
+            file_path = tool_input.get("file_path", "")
+            if file_path:
+                # Store modified file in session tracker
+                modified_files_path = palace.palace_dir / "modified_files.json"
+                try:
+                    if modified_files_path.exists():
+                        with open(modified_files_path, 'r') as f:
+                            modified_files = set(json.load(f))
+                    else:
+                        modified_files = set()
+
+                    modified_files.add(file_path)
+
+                    palace.ensure_palace_dir()
+                    with open(modified_files_path, 'w') as f:
+                        json.dump(list(modified_files), f)
+                except Exception as e:
+                    # Don't fail on tracking errors
+                    print(f"⚠️  Could not track modified file: {e}")
 
         # Log the decision
         palace.log_action("permission_decision", {

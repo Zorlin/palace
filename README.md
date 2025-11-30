@@ -34,6 +34,7 @@ Each iteration builds on the last. Palace remembers what you've done and suggest
 - **🎭 Mask System**: Apply expert personas for specialized workflows (testing, security, architecture)
 - **⚡ Error Recovery**: Automatic retry with backoff, graceful degradation, session checkpointing
 - **🧪 Test-Driven**: Enforces TDD by default - every change requires tests
+- **🔒 Strict Mode**: Validates tests before completion - ensures code quality (use `--yolo` to disable)
 - **🎨 Flexible Selection**: Choose actions with numbers, ranges, modifiers, or natural language
 
 ## Quick Start
@@ -92,6 +93,47 @@ claude
 | `pal import <file>` | Import a session |
 | `pal analyze` | Self-analysis of Palace metrics |
 | `pal install` | Install Palace into Claude Code |
+
+## Strict Mode 🔒
+
+Palace enforces **strict mode** by default, ensuring all tests pass before a session completes.
+
+### How It Works
+
+1. **During Execution**: Claude can freely write and edit files
+2. **At Completion**: Palace detects which tests are affected by modified files
+3. **Validation**: Runs only the relevant tests (not the entire suite)
+4. **Enforcement**: Session cannot complete until all affected tests pass
+
+### Usage
+
+```bash
+# Default: Strict mode enabled
+pal next
+
+# Disable strict mode (YOLO mode)
+pal next --yolo
+
+# Also works with all commands
+pal scaffold --yolo
+```
+
+### Why Strict Mode?
+
+- **Prevents broken code**: Catches test failures immediately
+- **Fast feedback**: Runs only affected tests, not the full suite
+- **TDD enforcement**: Aligns with Golden Rule #1
+- **CI/CD ready**: Code that completes in strict mode is deploy-ready
+
+### YOLO Mode
+
+Use `--yolo` to disable test validation:
+- For rapid prototyping
+- When tests don't exist yet
+- For exploration and experimentation
+- When you know what you're doing
+
+**Note**: YOLO mode logs a warning to history for audit purposes.
 
 ## Documentation
 

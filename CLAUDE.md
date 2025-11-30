@@ -52,6 +52,55 @@ This applies to:
 
 **The permission system exists for safety. Respect it.**
 
+## 🏆 Golden Rule #4: Respect Strict Mode
+
+**Strict mode ensures tests pass before completion. Don't fight it.**
+
+- By default, Palace runs in strict mode (`--strict`)
+- At session completion, Palace validates that all affected tests pass
+- You CAN write and edit files during execution
+- You CANNOT complete the session until tests pass
+- Use `--yolo` flag to disable strict mode (for prototyping/exploration)
+
+### How Strict Mode Works
+
+1. **During Execution**:
+   - Permission handler tracks all Write/Edit operations
+   - Stores modified file paths in `.palace/modified_files.json`
+   - Files are tracked but NOT blocked
+
+2. **At Completion**:
+   - Palace detects which tests are affected by modified files
+   - Runs ONLY the relevant tests (not entire suite)
+   - If tests fail: session exits with error, you must fix tests
+   - If tests pass: tracking file is cleared, session completes
+
+3. **Test Detection**:
+   - Maps modified files to test files using naming conventions
+   - Example: `palace.py` → `tests/test_palace.py`
+   - Falls back to running all tests if no specific mapping found
+
+### When to Use YOLO Mode
+
+```bash
+python palace.py next --yolo
+```
+
+Use YOLO mode (`--yolo` flag) when:
+- Rapid prototyping without tests
+- Exploring new ideas
+- Tests don't exist yet for the feature
+- You explicitly want to bypass validation
+
+**Important**: YOLO mode logs a warning to history for audit purposes.
+
+### What This Means For You (Claude)
+
+- **Write freely**: Strict mode doesn't prevent file operations
+- **Fix tests**: If completion fails, analyze test output and fix the issues
+- **Add tests**: If no tests exist, create them before implementation (TDD!)
+- **Don't panic**: Test failures are feedback, not roadblocks
+
 ## MCP Server Integration
 
 Palace is both a CLI tool AND an MCP server, providing tools that Claude can call directly.
