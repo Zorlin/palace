@@ -182,64 +182,80 @@ class Palace:
         Parse action selection string into list of actions.
 
         Supports:
-        - Numeric: "0,1,2,3,5,10" or "1-5" or "1,3-5,7"
-        - Natural language: "do 5 but skip the tests" (parsed by Claude)
+        - Numeric: "1 2 3" or "1,2,3" or "1-5" or "1,3-5,7"
+        - With modifiers: "1 2 3 (use the palace-skills repo as base)"
+        - Natural language: "do 5 but skip the tests"
 
-        Returns list of selected actions, potentially modified by natural language instructions.
+        Returns list of selected actions, potentially modified by instructions.
         """
         selected = []
         modifiers = []
 
-        # Check if it's purely numeric selection
-        numeric_pattern = r'^[\d,\s\-]+$'
-        if re.match(numeric_pattern, selection.strip()):
-            # Parse numeric selection
-            parts = selection.replace(" ", "").split(",")
-            for part in parts:
-                if "-" in part:
-                    # Range: "1-5"
-                    try:
-                        start, end = part.split("-")
-                        for i in range(int(start), int(end) + 1):
-                            for a in actions:
-                                if a.get("num") == str(i):
-                                    selected.append(a)
-                                    break
-                    except:
-                        pass
-                else:
-                    # Single number
-                    for a in actions:
-                        if a.get("num") == part:
-                            selected.append(a)
-                            break
-        else:
-            # Natural language selection - extract numbers and modifiers
-            # Pattern: "do 1,2,3 but don't do X" or "5 but with Y"
-            numbers = re.findall(r'\b(\d+)\b', selection)
-            for num in numbers:
-                for a in actions:
-                    if a.get("num") == num:
-                        selected.append(a)
-                        break
+        # Extract parenthetical text as modifiers first
+        paren_match = re.search(r'\(([^)]+)\)', selection)
+        if paren_match:
+            modifiers.append(paren_match.group(1).strip())
+            # Remove parenthetical from selection for number parsing
+            selection = re.sub(r'\([^)]+\)', '', selection)
 
-            # Extract modifiers (text after "but", "except", "with", etc.)
+        # Check if there's non-numeric text (besides spaces, commas, dashes)
+        text_without_nums = re.sub(r'[\d,\s\-]+', '', selection).strip()
+
+        if text_without_nums:
+            # Has text - extract modifier patterns
             modifier_patterns = [
                 r'\bbut\s+(.+)',
                 r'\bexcept\s+(.+)',
                 r'\bwith\s+(.+)',
                 r'\bwithout\s+(.+)',
                 r'\bskip\s+(.+)',
+                r'\bfollow\s+(.+)',
+                r'\buse\s+(.+)',
             ]
             for pattern in modifier_patterns:
                 match = re.search(pattern, selection, re.IGNORECASE)
                 if match:
                     modifiers.append(match.group(1).strip())
 
-            # Store modifiers in each selected action
-            if modifiers:
-                for a in selected:
-                    a["_modifiers"] = modifiers
+        # Collect all numbers (handling ranges properly)
+        numbers = set()
+
+        # First handle ranges like "1-5" or "2 - 4"
+        range_matches = re.findall(r'(\d+)\s*-\s*(\d+)', selection)
+        for start, end in range_matches:
+            try:
+                for i in range(int(start), int(end) + 1):
+                    numbers.add(str(i))
+            except:
+                pass
+
+        # Then extract standalone numbers (not part of ranges)
+        # Remove ranges from selection first
+        selection_no_ranges = re.sub(r'\d+\s*-\s*\d+', '', selection)
+        standalone = re.findall(r'\b(\d+)\b', selection_no_ranges)
+        for num in standalone:
+            numbers.add(num)
+
+        # Sort numbers for consistent ordering
+        sorted_nums = sorted(numbers, key=lambda x: int(x))
+
+        # Find actions by number
+        for num in sorted_nums:
+            for a in actions:
+                if a.get("num") == num:
+                    # Make a copy so we don't mutate the original
+                    action_copy = dict(a)
+                    selected.append(action_copy)
+                    break
+
+        # Attach modifiers to all selected actions
+        if modifiers:
+            for a in selected:
+                a["_modifiers"] = modifiers
+
+        # Only treat as custom task if there's real text (not just invalid numbers)
+        if not selected and text_without_nums:
+            return [{"num": "c", "label": selection.strip(), "description": "Custom task", "_custom": True}]
 
         return selected
 
@@ -465,31 +481,47 @@ The "ACTIONS:" header is required (exact spelling with colon) - it triggers the 
         return selected
 
     def _show_simple_menu(self, actions: List[dict]) -> Optional[List[dict]]:
-        """Simple fallback menu without questionary"""
-        print("\n💡 Select action(s) (comma-separated, 0 to exit, or type custom task):")
-        for a in actions:
-            print(f"  {a['num']}. {a['label']}")
-        print("  0. Exit loop")
+        """Fallback menu with rich formatting"""
+        try:
+            from rich.console import Console
+            from rich.table import Table
+            from rich.prompt import Prompt
 
-        choice = input("\nEnter number(s) or custom task: ").strip()
+            console = Console()
+            console.print()
+            console.print("[bold cyan]💡 Select action(s):[/bold cyan]")
+            console.print("[dim]   Numbers (space or comma separated), 0 to exit, or type custom task[/dim]")
+            console.print()
 
-        if choice == "0" or choice.lower() in ("q", "quit", "exit"):
+            # Create a nice table
+            table = Table(show_header=False, box=None, padding=(0, 2))
+            table.add_column("Num", style="bold yellow", width=4)
+            table.add_column("Action", style="white")
+
+            for a in actions:
+                # Truncate long labels
+                label = a['label'][:80] + "..." if len(a['label']) > 80 else a['label']
+                table.add_row(f"{a['num']}.", label)
+
+            table.add_row("[dim]0.[/dim]", "[dim]Exit loop[/dim]")
+            console.print(table)
+            console.print()
+
+            choice = Prompt.ask("[bold green]>[/bold green]")
+
+        except ImportError:
+            # Plain fallback if rich not available
+            print("\n💡 Select action(s) (space/comma separated, 0 to exit, or type custom task):")
+            for a in actions:
+                print(f"  {a['num']}. {a['label'][:80]}")
+            print("  0. Exit loop")
+            choice = input("\n> ").strip()
+
+        if not choice or choice == "0" or choice.lower() in ("q", "quit", "exit"):
             return None
 
-        # Check if it's a custom task (not a number)
-        if choice and not choice.replace(",", "").replace(" ", "").isdigit():
-            return [{"num": "c", "label": choice, "description": "Custom task", "_custom": True}]
-
-        # Parse comma-separated numbers
-        selected = []
-        for num in choice.split(","):
-            num = num.strip()
-            for a in actions:
-                if a["num"] == num:
-                    selected.append(a)
-                    break
-
-        return selected if selected else None
+        # Parse the selection using the smart parser
+        return self.parse_action_selection(choice, actions)
 
     def _prompt_custom_task(self) -> Optional[str]:
         """Prompt user for custom task when no actions available"""
@@ -995,9 +1027,39 @@ for this project type."""
         self.log_action("test")
 
     def cmd_install(self, args):
-        """Install Palace commands and output style into Claude Code"""
+        """Install Palace commands, dependencies, and output style into Claude Code"""
 
         print("🏛️  Palace - Installing to Claude Code")
+        print()
+
+        # Install Python dependencies using uv (preferred) or pip
+        print("📦 Installing dependencies...")
+        deps = ["questionary", "rich", "anthropic", "mcp"]
+
+        # Check for palace venv or use uv
+        palace_venv = Path(__file__).resolve().parent / ".venv" / "bin" / "python"
+        uv_path = Path.home() / ".local" / "bin" / "uv"
+
+        try:
+            if uv_path.exists():
+                # Use uv pip install
+                cmd = [str(uv_path), "pip", "install", "--quiet"] + deps
+                result = subprocess.run(cmd, capture_output=True, text=True)
+            elif palace_venv.exists():
+                # Use palace venv pip
+                cmd = [str(palace_venv), "-m", "pip", "install", "--quiet"] + deps
+                result = subprocess.run(cmd, capture_output=True, text=True)
+            else:
+                # Fallback to system pip (may fail on managed environments)
+                cmd = [sys.executable, "-m", "pip", "install", "--quiet"] + deps
+                result = subprocess.run(cmd, capture_output=True, text=True)
+
+            if result.returncode == 0:
+                print(f"✅ Installed: {', '.join(deps)}")
+            else:
+                print(f"⚠️  Install failed. Try: uv pip install {' '.join(deps)}")
+        except Exception as e:
+            print(f"⚠️  Could not install dependencies: {e}")
         print()
 
         # Find Claude Code config directory
