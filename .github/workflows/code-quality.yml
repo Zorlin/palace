@@ -1,0 +1,87 @@
+name: Code Quality
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.13'
+
+    - name: Install uv
+      run: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Install dependencies
+      run: |
+        uv venv
+        uv pip install -r requirements.txt
+
+    - name: Generate coverage report
+      run: |
+        source .venv/bin/activate
+        pytest tests/ --cov=palace --cov-report=term --cov-report=html
+
+    - name: Upload coverage report
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: htmlcov/
+
+  test-documentation:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Check for broken links in docs
+      uses: gaurav-nelson/github-action-markdown-link-check@v1
+      with:
+        use-quiet-mode: 'yes'
+        config-file: '.github/markdown-link-check.json'
+      continue-on-error: true
+
+  validate-structure:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Validate project structure
+      run: |
+        # Check for required files
+        required_files=(
+          "README.md"
+          "SPEC.md"
+          "requirements.txt"
+          "palace.py"
+          "tests/test_core.py"
+        )
+
+        for file in "${required_files[@]}"; do
+          if [ ! -f "$file" ]; then
+            echo "Missing required file: $file"
+            exit 1
+          fi
+        done
+
+        echo "All required files present"
+
+    - name: Check test naming conventions
+      run: |
+        # Ensure all test files start with test_
+        if find tests/ -name "*.py" -not -name "test_*.py" -not -name "__init__.py" | grep -q .; then
+          echo "Found test files not following test_*.py convention:"
+          find tests/ -name "*.py" -not -name "test_*.py" -not -name "__init__.py"
+          exit 1
+        fi
+        echo "Test naming conventions followed"

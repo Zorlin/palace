@@ -242,3 +242,156 @@ Content here.
         metadata = palace.get_mask_metadata("simple-mask")
         assert metadata is not None
         assert metadata.get("name") == "simple-mask"
+
+
+class TestMaskComposition:
+    """Test mask composition functionality"""
+
+    @pytest.fixture
+    def temp_palace(self, tmp_path):
+        """Create a Palace instance with multiple composable masks"""
+        os.chdir(tmp_path)
+        palace = Palace()
+        palace.ensure_palace_dir()
+
+        # Create several masks for composition
+        masks_dir = palace.palace_dir / "masks" / "available"
+
+        # Mask 1: TDD Expert
+        tdd_dir = masks_dir / "tdd-expert"
+        tdd_dir.mkdir(parents=True, exist_ok=True)
+        (tdd_dir / "SKILL.md").write_text("""---
+name: tdd-expert
+priority: 1
+---
+
+# TDD Expert
+
+## Core Principles
+- Write tests first
+- Red-Green-Refactor cycle
+""")
+
+        # Mask 2: Python Expert
+        python_dir = masks_dir / "python-expert"
+        python_dir.mkdir(parents=True, exist_ok=True)
+        (python_dir / "SKILL.md").write_text("""---
+name: python-expert
+priority: 2
+---
+
+# Python Expert
+
+## Core Expertise
+- Type hints
+- Pythonic patterns
+""")
+
+        # Mask 3: Security Expert
+        security_dir = masks_dir / "security-expert"
+        security_dir.mkdir(parents=True, exist_ok=True)
+        (security_dir / "SKILL.md").write_text("""# Security Expert
+
+## Security Principles
+- Input validation
+- Secure defaults
+""")
+
+        yield palace
+
+    def test_compose_masks_merge_strategy(self, temp_palace):
+        """Compose masks with merge strategy"""
+        composed = temp_palace.compose_masks(
+            ["tdd-expert", "python-expert"],
+            strategy="merge"
+        )
+
+        assert composed is not None
+        assert "TDD Expert" in composed
+        assert "Python Expert" in composed
+        assert "Mask: tdd-expert" in composed
+        assert "Mask: python-expert" in composed
+
+    def test_compose_masks_layer_strategy(self, temp_palace):
+        """Compose masks with layer strategy (priority-based)"""
+        composed = temp_palace.compose_masks(
+            ["tdd-expert", "python-expert"],
+            strategy="layer"
+        )
+
+        assert composed is not None
+        assert "Layer: tdd-expert" in composed
+        assert "Layer: python-expert" in composed
+        # Lower priority number should come first
+        tdd_pos = composed.find("tdd-expert")
+        python_pos = composed.find("python-expert")
+        assert tdd_pos < python_pos
+
+    def test_compose_masks_blend_strategy(self, temp_palace):
+        """Compose masks with blend strategy"""
+        composed = temp_palace.compose_masks(
+            ["tdd-expert", "security-expert"],
+            strategy="blend"
+        )
+
+        assert composed is not None
+        assert "TDD Expert" in composed
+        assert "Security Expert" in composed
+        assert "From tdd-expert" in composed or "From security-expert" in composed
+
+    def test_compose_masks_with_missing_mask(self, temp_palace):
+        """Composing with missing mask returns None"""
+        composed = temp_palace.compose_masks(
+            ["tdd-expert", "nonexistent"],
+            strategy="merge"
+        )
+
+        assert composed is None
+
+    def test_compose_masks_empty_list(self, temp_palace):
+        """Composing empty list returns None"""
+        composed = temp_palace.compose_masks([], strategy="merge")
+        assert composed is None
+
+    def test_build_prompt_with_masks(self, temp_palace):
+        """Build prompt with multiple masks composed"""
+        prompt = "Write a secure Python web app"
+        full_prompt = temp_palace.build_prompt_with_masks(
+            prompt,
+            ["python-expert", "security-expert"],
+            strategy="merge"
+        )
+
+        assert full_prompt is not None
+        assert "Python Expert" in full_prompt
+        assert "Security Expert" in full_prompt
+        assert "Write a secure Python web app" in full_prompt
+
+    def test_build_prompt_with_masks_invalid(self, temp_palace):
+        """Build prompt with invalid mask in list returns None"""
+        prompt = "Write a secure Python web app"
+        full_prompt = temp_palace.build_prompt_with_masks(
+            prompt,
+            ["python-expert", "nonexistent"],
+            strategy="merge"
+        )
+
+        assert full_prompt is None
+
+    def test_split_mask_into_sections(self, temp_palace):
+        """Split mask content into sections by headers"""
+        content = """# Section 1
+Content 1
+
+## Subsection 1.1
+More content
+
+# Section 2
+Content 2"""
+
+        sections = temp_palace._split_mask_into_sections(content)
+        # Should split on ANY header (# or ##)
+        assert len(sections) >= 3
+        assert "Section 1" in sections[0]
+        # One of the sections should have Section 2
+        assert any("Section 2" in s for s in sections)

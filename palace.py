@@ -469,6 +469,98 @@ Parse this and return JSON."""
 
         return masks
 
+    def compose_masks(self, mask_names: List[str], strategy: str = "merge") -> Optional[str]:
+        """
+        Compose multiple masks together.
+
+        Strategies:
+        - "merge": Concatenate masks in order with separators
+        - "layer": Apply masks hierarchically (later masks override earlier)
+        - "blend": Interleave sections from each mask
+
+        Returns composed mask content or None if any mask not found.
+        """
+        if not mask_names:
+            return None
+
+        # Load all masks
+        mask_contents = []
+        for name in mask_names:
+            content = self.load_mask(name)
+            if not content:
+                return None  # Fail if any mask is missing
+            mask_contents.append((name, content))
+
+        if strategy == "merge":
+            # Simple concatenation with clear separators
+            parts = []
+            for name, content in mask_contents:
+                parts.append(f"# Mask: {name}")
+                parts.append(content)
+                parts.append("")  # Blank line separator
+            return "\n".join(parts)
+
+        elif strategy == "layer":
+            # Later masks override earlier ones
+            # Use frontmatter priority field if available
+            layered_parts = []
+            for name, content in mask_contents:
+                metadata = self.get_mask_metadata(name)
+                priority = int(metadata.get("priority", 0)) if metadata else 0
+                layered_parts.append((priority, name, content))
+
+            # Sort by priority (lower = higher precedence)
+            layered_parts.sort(key=lambda x: x[0])
+
+            # Build layered content
+            result = []
+            for _, name, content in layered_parts:
+                result.append(f"# Layer: {name}")
+                result.append(content)
+                result.append("")
+            return "\n".join(result)
+
+        elif strategy == "blend":
+            # Interleave sections from each mask
+            # Split each mask into sections (by headers)
+            sections = []
+            for name, content in mask_contents:
+                mask_sections = self._split_mask_into_sections(content)
+                sections.extend([(name, s) for s in mask_sections])
+
+            # Interleave sections
+            blended = []
+            for name, section in sections:
+                blended.append(f"<!-- From {name} -->")
+                blended.append(section)
+                blended.append("")
+            return "\n".join(blended)
+
+        return None
+
+    def _split_mask_into_sections(self, content: str) -> List[str]:
+        """
+        Split mask content into sections by markdown headers.
+
+        Returns list of section strings.
+        """
+        sections = []
+        current_section = []
+
+        for line in content.split("\n"):
+            if line.startswith("#") and current_section:
+                # Start new section
+                sections.append("\n".join(current_section))
+                current_section = [line]
+            else:
+                current_section.append(line)
+
+        # Add final section
+        if current_section:
+            sections.append("\n".join(current_section))
+
+        return sections
+
     def build_prompt_with_mask(self, task_prompt: str, mask_name: Optional[str] = None,
                                context: Dict[str, Any] = None) -> Optional[str]:
         """
@@ -492,6 +584,34 @@ Parse this and return JSON."""
             return f"{mask_content}\n\n{base_prompt}"
 
         return base_prompt
+
+    def build_prompt_with_masks(self, task_prompt: str, mask_names: List[str],
+                                strategy: str = "merge",
+                                context: Dict[str, Any] = None) -> Optional[str]:
+        """
+        Build prompt with multiple masks composed together.
+
+        Args:
+            task_prompt: The task description
+            mask_names: List of mask names to compose
+            strategy: Composition strategy ("merge", "layer", "blend")
+            context: Optional context dict
+
+        Returns composed prompt or None if any mask not found.
+        """
+        if not mask_names:
+            return self.build_prompt(task_prompt, context)
+
+        # Compose masks
+        composed_content = self.compose_masks(mask_names, strategy)
+        if not composed_content:
+            return None
+
+        # Build base prompt
+        base_prompt = self.build_prompt(task_prompt, context)
+
+        # Prepend composed mask content
+        return f"{composed_content}\n\n{base_prompt}"
 
     # ========================================================================
     # Error Recovery
