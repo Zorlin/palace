@@ -22,6 +22,18 @@ import time
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
+# Load credentials from ~/.palace/credentials.env
+def _load_credentials():
+    creds_file = Path.home() / ".palace" / "credentials.env"
+    if creds_file.exists():
+        for line in creds_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip())
+
+_load_credentials()
+
 VERSION = "0.1.0"
 
 def is_interactive() -> bool:
@@ -887,6 +899,792 @@ Take this into account as you continue the task.
         return steering_section + base_prompt
 
     # ========================================================================
+    # Multi-Provider System
+    # ========================================================================
+
+    def get_provider_config(self) -> Dict[str, Any]:
+        """
+        Load provider configuration from .palace/providers.json
+
+        Returns merged config with defaults.
+        """
+        defaults = {
+            "default_provider": "anthropic",
+            "providers": {
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "format": "anthropic",
+                    "api_key_env": "ANTHROPIC_API_KEY"
+                }
+            },
+            "model_aliases": {
+                "opus": {"provider": "anthropic", "model": "claude-opus-4-5-20250514"},
+                "sonnet": {"provider": "anthropic", "model": "claude-sonnet-4-5-20250929"},
+                "haiku": {"provider": "anthropic", "model": "claude-haiku-4-20250514"}
+            }
+        }
+
+        config_path = self.palace_dir / "providers.json"
+        if config_path.exists():
+            try:
+                with open(config_path) as f:
+                    user_config = json.load(f)
+                # Merge user config with defaults
+                for key in ["providers", "model_aliases"]:
+                    if key in user_config:
+                        defaults[key].update(user_config[key])
+                if "default_provider" in user_config:
+                    defaults["default_provider"] = user_config["default_provider"]
+            except (json.JSONDecodeError, IOError):
+                pass
+
+        return defaults
+
+    def resolve_model(self, model_or_alias: str) -> Tuple[str, str]:
+        """
+        Resolve model alias to (provider, model) tuple.
+
+        If alias not found, assumes Anthropic provider with model name as-is.
+        """
+        config = self.get_provider_config()
+        aliases = config.get("model_aliases", {})
+
+        if model_or_alias in aliases:
+            alias_config = aliases[model_or_alias]
+            return alias_config["provider"], alias_config["model"]
+
+        # Not an alias, assume Anthropic
+        return "anthropic", model_or_alias
+
+    def build_api_request(self, provider: str, model: str, messages: List[dict],
+                          system: str = None, **kwargs) -> Dict[str, Any]:
+        """Build API request in provider's native format"""
+        config = self.get_provider_config()
+        provider_config = config["providers"].get(provider, {})
+        fmt = provider_config.get("format", "anthropic")
+
+        if fmt == "anthropic":
+            request = {"model": model, "messages": messages}
+            if system:
+                request["system"] = system
+            request.update(kwargs)
+            return request
+        else:
+            # OpenAI format
+            return self._build_openai_request(model, messages, system, **kwargs)
+
+    def _build_openai_request(self, model: str, messages: List[dict],
+                               system: str = None, **kwargs) -> Dict[str, Any]:
+        """Build request in OpenAI/OpenRouter format"""
+        openai_messages = []
+        if system:
+            openai_messages.append({"role": "system", "content": system})
+        openai_messages.extend(messages)
+
+        request = {"model": model, "messages": openai_messages}
+        # Translate max_tokens to max_completion_tokens if needed
+        if "max_tokens" in kwargs:
+            request["max_completion_tokens"] = kwargs.pop("max_tokens")
+        request.update(kwargs)
+        return request
+
+    def translate_to_openai_format(self, messages: List[dict], system: str = None) -> List[dict]:
+        """Translate Anthropic messages to OpenAI format"""
+        openai_messages = []
+        if system:
+            openai_messages.append({"role": "system", "content": system})
+
+        for msg in messages:
+            openai_messages.append({
+                "role": msg["role"],
+                "content": msg.get("content", "")
+            })
+
+        return openai_messages
+
+    def translate_tool_use_to_openai(self, anthropic_content: List[dict]) -> Dict[str, Any]:
+        """Translate Anthropic tool_use blocks to OpenAI function_call format"""
+        text_parts = []
+        tool_calls = []
+
+        for block in anthropic_content:
+            if block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif block.get("type") == "tool_use":
+                tool_calls.append({
+                    "id": block.get("id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name", ""),
+                        "arguments": json.dumps(block.get("input", {}))
+                    }
+                })
+
+        result = {"role": "assistant", "content": " ".join(text_parts) if text_parts else None}
+        if tool_calls:
+            result["tool_calls"] = tool_calls
+        return result
+
+    def translate_openai_to_anthropic(self, openai_response: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate OpenAI response to Anthropic format"""
+        choice = openai_response.get("choices", [{}])[0]
+        message = choice.get("message", {})
+
+        content = []
+
+        # Text content
+        if message.get("content"):
+            content.append({"type": "text", "text": message["content"]})
+
+        # Tool calls
+        for tool_call in message.get("tool_calls", []):
+            func = tool_call.get("function", {})
+            try:
+                arguments = json.loads(func.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                arguments = {}
+
+            content.append({
+                "type": "tool_use",
+                "id": tool_call.get("id", ""),
+                "name": func.get("name", ""),
+                "input": arguments
+            })
+
+        return {"role": "assistant", "content": content}
+
+    def invoke_provider(self, provider: str, model: str, messages: List[dict],
+                        system: str = None, **kwargs) -> Dict[str, Any]:
+        """
+        Invoke any configured provider.
+
+        Handles format translation automatically based on provider config.
+        """
+        import requests
+
+        config = self.get_provider_config()
+        provider_config = config["providers"].get(provider)
+
+        if not provider_config:
+            raise ValueError(f"Unknown provider: {provider}")
+
+        fmt = provider_config.get("format", "anthropic")
+        base_url = provider_config.get("base_url", "")
+        api_key_env = provider_config.get("api_key_env", "")
+        api_key = os.environ.get(api_key_env, "")
+
+        if fmt == "anthropic":
+            # Use Anthropic SDK
+            import anthropic
+            client = anthropic.Anthropic(
+                api_key=api_key if api_key else None,
+                base_url=base_url if base_url and "anthropic.com" not in base_url else None
+            )
+            response = client.messages.create(
+                model=model,
+                messages=messages,
+                system=system or "",
+                max_tokens=kwargs.get("max_tokens", 4096)
+            )
+            return {"content": [{"type": "text", "text": c.text} for c in response.content if hasattr(c, 'text')]}
+
+        else:
+            # OpenAI-compatible API (OpenRouter, etc.)
+            openai_messages = self.translate_to_openai_format(messages, system)
+            request_body = {
+                "model": model,
+                "messages": openai_messages,
+                "max_tokens": kwargs.get("max_tokens", 4096)
+            }
+
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+
+            # OpenRouter-specific headers
+            if "openrouter" in provider.lower():
+                headers["HTTP-Referer"] = "https://github.com/anthropics/palace"
+                headers["X-Title"] = "Palace RHSI"
+
+            response = requests.post(
+                f"{base_url}/chat/completions",
+                headers=headers,
+                json=request_body
+            )
+            response.raise_for_status()
+            return self.translate_openai_to_anthropic(response.json())
+
+    # ========================================================================
+    # Benchmarking System
+    # ========================================================================
+
+    def get_benchmark_tasks(self) -> List[Dict[str, Any]]:
+        """Get standard benchmark tasks for model evaluation"""
+        return [
+            {
+                "name": "code_generation",
+                "prompt": "Write a Python function that calculates the nth Fibonacci number using memoization.",
+                "expected_capabilities": ["code_quality", "correctness", "efficiency"]
+            },
+            {
+                "name": "code_analysis",
+                "prompt": "Analyze this code and identify potential bugs:\n\ndef divide(a, b):\n    return a / b",
+                "expected_capabilities": ["bug_detection", "edge_cases"]
+            },
+            {
+                "name": "refactoring",
+                "prompt": "Refactor this code to be more readable:\n\ndef f(x):return[i for i in range(x)if i%2==0]",
+                "expected_capabilities": ["readability", "best_practices"]
+            },
+            {
+                "name": "natural_language",
+                "prompt": "Explain how a binary search tree works to a beginner programmer.",
+                "expected_capabilities": ["clarity", "accuracy", "pedagogy"]
+            }
+        ]
+
+    def run_benchmark(self, model_alias: str, task: Dict[str, Any]) -> Dict[str, Any]:
+        """Run a single benchmark task on a model"""
+        import time
+
+        provider, model = self.resolve_model(model_alias)
+
+        start_time = time.time()
+        try:
+            response = self.invoke_provider(
+                provider=provider,
+                model=model,
+                messages=[{"role": "user", "content": task["prompt"]}],
+                max_tokens=2048
+            )
+            latency_ms = (time.time() - start_time) * 1000
+
+            response_text = ""
+            for block in response.get("content", []):
+                if block.get("type") == "text":
+                    response_text += block.get("text", "")
+
+            return {
+                "model": model_alias,
+                "provider": provider,
+                "actual_model": model,
+                "task": task["name"],
+                "latency_ms": latency_ms,
+                "response": response_text,
+                "success": True
+            }
+
+        except Exception as e:
+            return {
+                "model": model_alias,
+                "task": task["name"],
+                "latency_ms": (time.time() - start_time) * 1000,
+                "response": None,
+                "success": False,
+                "error": str(e)
+            }
+
+    def judge_benchmark_result(self, task: Dict[str, Any], response: str) -> Dict[str, Any]:
+        """
+        Judge a benchmark result using Opus as the judge.
+
+        Returns score (0-10) and reasoning.
+        """
+        judge_prompt = f"""You are evaluating an AI model's response to a coding task.
+
+TASK: {task['prompt']}
+
+EXPECTED CAPABILITIES: {', '.join(task['expected_capabilities'])}
+
+MODEL RESPONSE:
+{response}
+
+Score this response from 0-10 based on:
+- Correctness and accuracy
+- Code quality (if applicable)
+- Clarity and helpfulness
+- Addressing all aspects of the task
+
+Respond with JSON only:
+{{"score": <0-10>, "reasoning": "<brief explanation>"}}"""
+
+        try:
+            result = self.invoke_provider(
+                provider="anthropic",
+                model="claude-opus-4-5-20250514",
+                messages=[{"role": "user", "content": judge_prompt}],
+                max_tokens=512
+            )
+
+            response_text = ""
+            for block in result.get("content", []):
+                if block.get("type") == "text":
+                    response_text += block.get("text", "")
+
+            # Parse JSON from response
+            if "{" in response_text:
+                json_start = response_text.find("{")
+                json_end = response_text.rfind("}") + 1
+                return json.loads(response_text[json_start:json_end])
+
+        except Exception as e:
+            pass
+
+        return {"score": 0, "reasoning": f"Judge failed: {str(e)}"}
+
+    def run_full_benchmark(self, model_aliases: List[str] = None) -> Dict[str, Any]:
+        """
+        Run full benchmark suite across multiple models.
+
+        Returns comparative results.
+        """
+        if model_aliases is None:
+            model_aliases = ["opus", "sonnet", "haiku"]
+
+        tasks = self.get_benchmark_tasks()
+        results = {"models": {}, "summary": {}}
+
+        for alias in model_aliases:
+            results["models"][alias] = {"tasks": [], "total_score": 0, "avg_latency_ms": 0}
+
+            total_latency = 0
+            for task in tasks:
+                print(f"  Benchmarking {alias} on {task['name']}...")
+                result = self.run_benchmark(alias, task)
+
+                if result["success"]:
+                    score = self.judge_benchmark_result(task, result["response"])
+                    result["score"] = score.get("score", 0)
+                    result["reasoning"] = score.get("reasoning", "")
+                    results["models"][alias]["total_score"] += result["score"]
+                else:
+                    result["score"] = 0
+
+                total_latency += result["latency_ms"]
+                results["models"][alias]["tasks"].append(result)
+
+            results["models"][alias]["avg_latency_ms"] = total_latency / len(tasks)
+
+        # Summary ranking
+        rankings = sorted(
+            [(alias, data["total_score"], data["avg_latency_ms"])
+             for alias, data in results["models"].items()],
+            key=lambda x: (-x[1], x[2])  # Higher score, lower latency
+        )
+        results["summary"]["rankings"] = [
+            {"model": r[0], "total_score": r[1], "avg_latency_ms": r[2]}
+            for r in rankings
+        ]
+
+        return results
+
+    # ========================================================================
+    # Turbo Mode (Swarm Execution)
+    # ========================================================================
+
+    def rank_tasks_by_model(self, tasks: List[dict]) -> Dict[str, Dict[str, Any]]:
+        """
+        Use Opus/GLM to rank tasks and assign optimal models.
+
+        Returns dict mapping task_num -> {model, reasoning, task}
+        """
+        task_descriptions = "\n".join([
+            f"{t.get('num')}. {t.get('label')}: {t.get('description', '')}"
+            for t in tasks
+        ])
+
+        ranking_prompt = f"""Analyze these tasks and assign the optimal model for each:
+
+TASKS:
+{task_descriptions}
+
+AVAILABLE MODELS:
+- opus: Complex reasoning, architecture, security-critical code
+- sonnet: Medium complexity, refactoring, feature implementation
+- haiku: Simple tasks, tests, documentation, quick fixes
+
+Assign each task to the most suitable model. Consider:
+- Task complexity
+- Need for deep reasoning vs speed
+- Risk level (security, data integrity)
+
+Return JSON only:
+{{
+  "assignments": [
+    {{"task_num": "1", "model": "haiku", "reasoning": "Simple test writing"}},
+    ...
+  ]
+}}"""
+
+        try:
+            # Use GLM via Z.ai for ranking
+            response = self.invoke_provider(
+                provider="z.ai",
+                model="glm-4.6",
+                messages=[{"role": "user", "content": ranking_prompt}],
+                max_tokens=1024
+            )
+
+            response_text = ""
+            for block in response.get("content", []):
+                if block.get("type") == "text":
+                    response_text += block.get("text", "")
+
+            # Parse JSON
+            if "{" in response_text:
+                json_start = response_text.find("{")
+                json_end = response_text.rfind("}") + 1
+                result = json.loads(response_text[json_start:json_end])
+
+                assignments = {}
+                for a in result.get("assignments", []):
+                    task_num = a.get("task_num")
+                    # Find original task
+                    original_task = next((t for t in tasks if t.get("num") == task_num), None)
+                    assignments[task_num] = {
+                        "model": a.get("model", "sonnet"),
+                        "reasoning": a.get("reasoning", ""),
+                        "task": original_task
+                    }
+                return assignments
+
+        except Exception as e:
+            print(f"⚠️  Ranking failed: {e}")
+
+        # Fallback: assign all to sonnet
+        return {
+            t.get("num"): {"model": "sonnet", "reasoning": "Default", "task": t}
+            for t in tasks
+        }
+
+    def init_swarm_history(self, session_id: str):
+        """Initialize shared swarm history file"""
+        swarm_dir = self.palace_dir / "swarm"
+        swarm_dir.mkdir(parents=True, exist_ok=True)
+
+        swarm_file = swarm_dir / f"{session_id}.jsonl"
+        if not swarm_file.exists():
+            swarm_file.touch()
+
+    def write_swarm_event(self, session_id: str, event: Dict[str, Any]):
+        """Write event to shared swarm history"""
+        swarm_file = self.palace_dir / "swarm" / f"{session_id}.jsonl"
+
+        event["timestamp"] = time.time()
+
+        with open(swarm_file, 'a') as f:
+            f.write(json.dumps(event) + '\n')
+
+    def read_swarm_events(self, session_id: str, since_offset: int = 0,
+                          return_offset: bool = False) -> List[Dict[str, Any]]:
+        """
+        Read events from shared swarm history.
+
+        Args:
+            session_id: Swarm session ID
+            since_offset: Only read events after this byte offset
+            return_offset: If True, return (events, new_offset) tuple
+        """
+        swarm_file = self.palace_dir / "swarm" / f"{session_id}.jsonl"
+
+        if not swarm_file.exists():
+            return ([], 0) if return_offset else []
+
+        events = []
+        with open(swarm_file, 'r') as f:
+            if since_offset:
+                f.seek(since_offset)
+
+            content = f.read()
+            new_offset = f.tell()
+
+        for line in content.strip().split('\n'):
+            if line:
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+        if return_offset:
+            return events, new_offset
+        return events
+
+    def build_swarm_context(self, session_id: str, current_agent: str) -> str:
+        """Build context showing other agents' activity"""
+        events = self.read_swarm_events(session_id)
+
+        # Filter out own events
+        other_events = [e for e in events if e.get("agent") != current_agent]
+
+        if not other_events:
+            return ""
+
+        lines = ["## 🐝 PARALLEL AGENTS STATUS", ""]
+        lines.append("Other agents are working simultaneously on related tasks:")
+        lines.append("")
+
+        # Group by agent
+        by_agent = {}
+        for e in other_events:
+            agent = e.get("agent", "unknown")
+            if agent not in by_agent:
+                by_agent[agent] = []
+            by_agent[agent].append(e)
+
+        for agent, agent_events in by_agent.items():
+            latest = agent_events[-1] if agent_events else {}
+            lines.append(f"**{agent}**: {latest.get('message', latest.get('action', 'working...'))}")
+
+        lines.append("")
+        lines.append("Coordinate with them - avoid duplicating work, build on their progress.")
+        lines.append("")
+
+        return "\n".join(lines)
+
+    def build_swarm_prompt(self, task: str, session_id: str, agent_id: str,
+                           base_context: str = "") -> str:
+        """Build prompt with swarm awareness"""
+        swarm_context = self.build_swarm_context(session_id, agent_id)
+        swarm_file = self.palace_dir / "swarm" / f"{session_id}.jsonl"
+
+        prompt_parts = [
+            f"# Task for Agent {agent_id}",
+            "",
+            f"**YOUR TASK:** {task}",
+            "",
+            "## CRITICAL: You must EXECUTE this task, not just discuss it!",
+            "",
+            "Use your tools to:",
+            "- Read files to understand the codebase",
+            "- Write/Edit files to implement changes",
+            "- Run commands via Bash to test and verify",
+            "- Create any necessary files or directories",
+            "",
+            "Do NOT just output a plan or explanation. Actually DO the work.",
+            "",
+        ]
+
+        if swarm_context:
+            prompt_parts.extend([swarm_context, ""])
+
+        if base_context:
+            prompt_parts.extend(["## Project Context", base_context, ""])
+
+        prompt_parts.extend([
+            "## Swarm Coordination",
+            f"You are agent {agent_id} in a parallel swarm.",
+            "Other agents are working on related tasks simultaneously.",
+            "",
+            f"**Shared history file:** {swarm_file}",
+            "- Read this file periodically to see what other agents are doing",
+            "- Write your progress to this file so others can coordinate",
+            "",
+            "To log your progress, append JSON lines like:",
+            f'echo \'{{"agent": "{agent_id}", "type": "progress", "message": "your status"}}\' >> {swarm_file}',
+            "",
+            "Coordinate with other agents - avoid duplicating work, build on their progress.",
+            "",
+            "Now execute your task. Use tools. Make changes. Get it done.",
+            ""
+        ])
+
+        return "\n".join(prompt_parts)
+
+    def spawn_swarm(self, assignments: Dict[str, Dict[str, Any]],
+                    base_prompt: str) -> Dict[str, Any]:
+        """
+        Spawn parallel Claude CLI processes for swarm execution.
+
+        Each process gets:
+        - Its assigned model
+        - Its task
+        - Access to shared swarm history
+        """
+        session_id = self._generate_session_id()
+        self.init_swarm_history(session_id)
+
+        processes = {}
+        config = self.get_provider_config()
+
+        for task_num, assignment in assignments.items():
+            model_alias = assignment.get("model", "sonnet")
+            task = assignment.get("task", {})
+            task_label = task.get("label", f"Task {task_num}")
+
+            # Resolve model to provider
+            provider, model = self.resolve_model(model_alias)
+            provider_config = config["providers"].get(provider, {})
+
+            agent_id = f"{model_alias}-{task_num}"
+
+            # Build swarm-aware prompt
+            prompt = self.build_swarm_prompt(
+                task=f"{task_label}: {task.get('description', '')}",
+                session_id=session_id,
+                agent_id=agent_id,
+                base_context=base_prompt
+            )
+
+            # Prepare environment with provider credentials
+            env = os.environ.copy()
+            api_key_env = provider_config.get("api_key_env", "ANTHROPIC_API_KEY")
+            base_url = provider_config.get("base_url", "")
+
+            if base_url and "anthropic.com" not in base_url:
+                env["ANTHROPIC_BASE_URL"] = base_url
+
+            # Build CLI command
+            cmd = [
+                "claude",
+                "-p", prompt,
+                "--model", model,
+                "--output-format", "stream-json",
+            ]
+
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    env=env,
+                    cwd=self.project_root,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True
+                )
+
+                processes[task_num] = {
+                    "process": process,
+                    "agent_id": agent_id,
+                    "model": model_alias,
+                    "task": task_label,
+                    "session_id": session_id
+                }
+
+                # Log swarm start
+                self.write_swarm_event(session_id, {
+                    "agent": agent_id,
+                    "type": "start",
+                    "message": f"Starting: {task_label}"
+                })
+
+            except Exception as e:
+                print(f"❌ Failed to spawn {agent_id}: {e}")
+
+        return processes
+
+    def monitor_swarm(self, processes: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Monitor swarm processes and interleave their output.
+
+        Returns results when all processes complete.
+        """
+        import select
+        import threading
+
+        results = {}
+        active = dict(processes)
+        session_id = next(iter(processes.values()))["session_id"] if processes else None
+
+        print(f"\n🐝 Swarm active: {len(active)} agents")
+        print("─" * 50)
+
+        # Track output buffers
+        buffers = {num: "" for num in active}
+
+        while active:
+            for task_num, info in list(active.items()):
+                process = info["process"]
+                agent_id = info["agent_id"]
+
+                # Check if process finished
+                if process.poll() is not None:
+                    # Read remaining output
+                    remaining = process.stdout.read()
+                    buffers[task_num] += remaining
+
+                    # Log completion
+                    self.write_swarm_event(session_id, {
+                        "agent": agent_id,
+                        "type": "complete",
+                        "message": f"Completed: {info['task']}"
+                    })
+
+                    results[task_num] = {
+                        "agent": agent_id,
+                        "exit_code": process.returncode,
+                        "output": buffers[task_num]
+                    }
+
+                    print(f"✅ {agent_id} finished")
+                    del active[task_num]
+                    continue
+
+                # Read available output (non-blocking)
+                try:
+                    # Use select for non-blocking read
+                    readable, _, _ = select.select([process.stdout], [], [], 0.1)
+                    if readable:
+                        line = process.stdout.readline()
+                        if line:
+                            buffers[task_num] += line
+
+                            # Parse and log progress
+                            try:
+                                msg = json.loads(line)
+                                if msg.get("type") == "assistant":
+                                    # Extract tool use or text for swarm awareness
+                                    content = msg.get("message", {}).get("content", [])
+                                    for block in content:
+                                        if block.get("type") == "tool_use":
+                                            self.write_swarm_event(session_id, {
+                                                "agent": agent_id,
+                                                "type": "tool_use",
+                                                "message": f"Using {block.get('name')}"
+                                            })
+                            except json.JSONDecodeError:
+                                pass
+
+                except Exception:
+                    pass
+
+            time.sleep(0.05)
+
+        print("─" * 50)
+        print(f"🐝 Swarm complete: {len(results)} tasks finished")
+
+        return results
+
+    def run_turbo_mode(self, tasks: List[dict], base_context: str = "") -> Dict[str, Any]:
+        """
+        Run turbo mode: rank tasks, spawn swarm, monitor.
+
+        Returns results from all swarm agents.
+        """
+        print("\n🚀 TURBO MODE ACTIVATED")
+        print("─" * 50)
+
+        # Step 1: Rank tasks by model
+        print("📊 Ranking tasks by optimal model...")
+        assignments = self.rank_tasks_by_model(tasks)
+
+        for num, a in assignments.items():
+            print(f"   {num}. {a['task'].get('label', 'Task')} → {a['model']} ({a['reasoning']})")
+
+        print()
+
+        # Step 2: Spawn swarm
+        print("🐝 Spawning parallel agents...")
+        processes = self.spawn_swarm(assignments, base_context)
+
+        # Step 3: Monitor and interleave
+        results = self.monitor_swarm(processes)
+
+        return {
+            "assignments": assignments,
+            "results": results
+        }
+
+    # ========================================================================
     # Error Recovery
     # ========================================================================
 
@@ -1564,6 +2362,7 @@ The "ACTIONS:" header is required (exact spelling with colon) - it triggers the 
         # Check for resume mode
         resume_id = getattr(args, 'resume', None)
         selection = getattr(args, 'select', None)
+        turbo_mode = getattr(args, 'turbo', False)
 
         session_id = None
         iteration = 0
@@ -1655,6 +2454,29 @@ Be concrete and actionable. The user will select which action(s) to execute."""
 
             if not selected_actions:
                 print("\n👋 Exiting RHSI loop.")
+                break
+
+            # Turbo mode: parallel swarm execution
+            if turbo_mode:
+                # Convert selected actions to task format for turbo mode
+                tasks = []
+                for i, action in enumerate(selected_actions):
+                    tasks.append({
+                        "num": str(i + 1),
+                        "label": action.get("label", f"Task {i + 1}"),
+                        "description": action.get("description", "")
+                    })
+
+                # Run turbo mode with all selected actions in parallel
+                result = self.run_turbo_mode(tasks, json.dumps(context))
+
+                self.log_action("turbo_complete", {
+                    "session_id": session_id,
+                    "tasks": len(tasks),
+                    "results": {k: v.get("exit_code", -1) for k, v in result.get("results", {}).items()}
+                })
+
+                print("\n✅ Turbo mode complete!")
                 break
 
             # Build prompt for next iteration based on selected actions
@@ -2282,6 +3104,8 @@ def main():
                              help='Resume a paused session')
     parser_next.add_argument('--select', '-s', metavar='SELECTION',
                              help='Select actions: "1,2,3" or "do 1 but skip tests"')
+    parser_next.add_argument('--turbo', '-t', action='store_true',
+                             help='Turbo mode: parallel swarm execution with model-task ranking')
 
     parser_new = subparsers.add_parser('new', help='Ask Claude to create a new project')
     parser_new.add_argument('name', nargs='?', help='Project name')
