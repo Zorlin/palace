@@ -537,16 +537,9 @@ Use numbered items, with optional indented descriptions."""
                                 continue
                             seen_tools.add(tool_id)
 
-                            # If mid-line, clear and reprint complete text
+                            # If mid-line, just move to new line (don't reprint - text is already visible)
                             if current_line_len > 0:
-                                # Move to start of line, clear it
-                                print(f"\r\033[K", end="")
-                                # Reprint the last line of text
-                                for mid, txt in text_by_msg.items():
-                                    last_line = txt.split("\n")[-1]
-                                    if last_line:
-                                        print(last_line)
-                                        break
+                                print()  # New line
                                 current_line_len = 0
 
                             tool_name = block.get("name", "unknown")
