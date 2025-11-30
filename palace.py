@@ -176,10 +176,9 @@ class Palace:
 
     def _process_stream_output(self, stream):
         """Process streaming JSON output and display succinct progress"""
-        # Track text per message ID to handle interleaving
-        text_by_msg = {}
+        text_by_msg = {}  # Track text per message ID
         seen_tools = set()
-        last_was_text = False
+        current_line_len = 0  # Track chars on current line for clearing
 
         for line in stream:
             line = line.strip()
@@ -208,38 +207,51 @@ class Palace:
                                 new_text = text[len(prev_text):]
                                 print(new_text, end="", flush=True)
                                 text_by_msg[msg_id] = text
-                                last_was_text = True
+                                # Track if we're mid-line
+                                if "\n" in new_text:
+                                    current_line_len = len(new_text.split("\n")[-1])
+                                else:
+                                    current_line_len += len(new_text)
 
                         elif block.get("type") == "tool_use":
-                            tool_name = block.get("name", "unknown")
                             tool_id = block.get("id", "")
+                            if tool_id in seen_tools:
+                                continue
+                            seen_tools.add(tool_id)
 
-                            if tool_id not in seen_tools:
-                                seen_tools.add(tool_id)
-                                # Newline if we were printing text
-                                if last_was_text:
-                                    print()
-                                    last_was_text = False
+                            # If mid-line, clear and reprint complete text
+                            if current_line_len > 0:
+                                # Move to start of line, clear it
+                                print(f"\r\033[K", end="")
+                                # Reprint the last line of text
+                                for mid, txt in text_by_msg.items():
+                                    last_line = txt.split("\n")[-1]
+                                    if last_line:
+                                        print(last_line)
+                                        break
+                                current_line_len = 0
 
-                                tool_input = block.get("input", {})
-                                if tool_name == "Read":
-                                    path = tool_input.get("file_path", "?").split("/")[-1]
-                                    print(f"📖 Reading: {path}")
-                                elif tool_name == "Edit":
-                                    path = tool_input.get("file_path", "?").split("/")[-1]
-                                    print(f"✏️  Editing: {path}")
-                                elif tool_name == "Write":
-                                    path = tool_input.get("file_path", "?").split("/")[-1]
-                                    print(f"📝 Writing: {path}")
-                                elif tool_name == "Bash":
-                                    cmd = tool_input.get("command", "")[:50]
-                                    print(f"💻 Running: {cmd}...")
-                                elif tool_name == "Glob":
-                                    print(f"🔍 Finding: {tool_input.get('pattern', '')}")
-                                elif tool_name == "Grep":
-                                    print(f"🔎 Searching: {tool_input.get('pattern', '')}")
-                                else:
-                                    print(f"🔧 {tool_name}")
+                            tool_name = block.get("name", "unknown")
+                            tool_input = block.get("input", {})
+
+                            if tool_name == "Read":
+                                path = tool_input.get("file_path", "?").split("/")[-1]
+                                print(f"📖 Reading: {path}")
+                            elif tool_name == "Edit":
+                                path = tool_input.get("file_path", "?").split("/")[-1]
+                                print(f"✏️  Editing: {path}")
+                            elif tool_name == "Write":
+                                path = tool_input.get("file_path", "?").split("/")[-1]
+                                print(f"📝 Writing: {path}")
+                            elif tool_name == "Bash":
+                                cmd = tool_input.get("command", "")[:50]
+                                print(f"💻 Running: {cmd}...")
+                            elif tool_name == "Glob":
+                                print(f"🔍 Finding: {tool_input.get('pattern', '')}")
+                            elif tool_name == "Grep":
+                                print(f"🔎 Searching: {tool_input.get('pattern', '')}")
+                            else:
+                                print(f"🔧 {tool_name}")
 
                 elif msg_type == "result":
                     print("\n✅ Done")
