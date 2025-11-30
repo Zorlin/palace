@@ -1814,7 +1814,9 @@ This tells Palace to stop that agent."""
                         status = "✅" if was_done else "⏱️"
                         print(f"{status} {agent_id} finished (exit 0, {'completed task' if was_done else 'no result msg'})")
 
-                    del active[task_num]
+                    # Only delete if still in active (may have been removed by peer verification)
+                    if task_num in active:
+                        del active[task_num]
                     continue
 
                 # Skip processing if agent already marked done
@@ -1909,7 +1911,9 @@ This tells Palace to stop that agent."""
                                                                 "completed": True,
                                                                 "verified_by": agent_id
                                                             }
-                                                            del active[other_num]
+                                                            # Only delete if still in active
+                                                            if other_num in active:
+                                                                del active[other_num]
 
                                 elif msg_type == "result":
                                     ts = confidence_timestamp(task_num)
@@ -1929,7 +1933,9 @@ This tells Palace to stop that agent."""
                                         "output": buffers[task_num],
                                         "completed": True
                                     }
-                                    del active[task_num]
+                                    # Only delete if still in active (may have been removed by peer verification)
+                                    if task_num in active:
+                                        del active[task_num]
                                     break  # Stop processing this agent
 
                                 # Forward to active (non-done) agents - convert output format to input format
