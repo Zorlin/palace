@@ -17,6 +17,8 @@ import json
 import subprocess
 import re
 import shutil
+import uuid
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -107,7 +109,6 @@ class Palace:
         self.ensure_palace_dir()
         history_file = self.palace_dir / "history.jsonl"
 
-        import time
         entry = {
             "timestamp": time.time(),
             "action": action,
@@ -116,6 +117,131 @@ class Palace:
 
         with open(history_file, 'a') as f:
             f.write(json.dumps(entry) + '\n')
+
+    # ========================================================================
+    # Session Management
+    # ========================================================================
+
+    def _generate_session_id(self) -> str:
+        """Generate a short, memorable session ID"""
+        # Use short UUID prefix + timestamp suffix for uniqueness
+        return f"pal-{uuid.uuid4().hex[:6]}"
+
+    def _get_sessions_dir(self) -> Path:
+        """Get the sessions directory"""
+        sessions_dir = self.palace_dir / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        return sessions_dir
+
+    def save_session(self, session_id: str, state: Dict[str, Any]):
+        """Save session state for later resumption"""
+        sessions_dir = self._get_sessions_dir()
+        session_file = sessions_dir / f"{session_id}.json"
+
+        state["session_id"] = session_id
+        state["updated_at"] = time.time()
+
+        with open(session_file, 'w') as f:
+            json.dump(state, f, indent=2)
+
+        return session_file
+
+    def load_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Load a saved session state"""
+        sessions_dir = self._get_sessions_dir()
+        session_file = sessions_dir / f"{session_id}.json"
+
+        if not session_file.exists():
+            return None
+
+        with open(session_file, 'r') as f:
+            return json.load(f)
+
+    def list_sessions(self) -> List[Dict[str, Any]]:
+        """List all saved sessions"""
+        sessions_dir = self._get_sessions_dir()
+        sessions = []
+
+        for session_file in sessions_dir.glob("*.json"):
+            try:
+                with open(session_file, 'r') as f:
+                    state = json.load(f)
+                    sessions.append({
+                        "session_id": state.get("session_id", session_file.stem),
+                        "updated_at": state.get("updated_at"),
+                        "iteration": state.get("iteration", 0),
+                        "pending_actions": len(state.get("pending_actions", []))
+                    })
+            except:
+                pass
+
+        return sorted(sessions, key=lambda s: s.get("updated_at", 0), reverse=True)
+
+    def parse_action_selection(self, selection: str, actions: List[dict]) -> List[dict]:
+        """
+        Parse action selection string into list of actions.
+
+        Supports:
+        - Numeric: "0,1,2,3,5,10" or "1-5" or "1,3-5,7"
+        - Natural language: "do 5 but skip the tests" (parsed by Claude)
+
+        Returns list of selected actions, potentially modified by natural language instructions.
+        """
+        selected = []
+        modifiers = []
+
+        # Check if it's purely numeric selection
+        numeric_pattern = r'^[\d,\s\-]+$'
+        if re.match(numeric_pattern, selection.strip()):
+            # Parse numeric selection
+            parts = selection.replace(" ", "").split(",")
+            for part in parts:
+                if "-" in part:
+                    # Range: "1-5"
+                    try:
+                        start, end = part.split("-")
+                        for i in range(int(start), int(end) + 1):
+                            for a in actions:
+                                if a.get("num") == str(i):
+                                    selected.append(a)
+                                    break
+                    except:
+                        pass
+                else:
+                    # Single number
+                    for a in actions:
+                        if a.get("num") == part:
+                            selected.append(a)
+                            break
+        else:
+            # Natural language selection - extract numbers and modifiers
+            # Pattern: "do 1,2,3 but don't do X" or "5 but with Y"
+            numbers = re.findall(r'\b(\d+)\b', selection)
+            for num in numbers:
+                for a in actions:
+                    if a.get("num") == num:
+                        selected.append(a)
+                        break
+
+            # Extract modifiers (text after "but", "except", "with", etc.)
+            modifier_patterns = [
+                r'\bbut\s+(.+)',
+                r'\bexcept\s+(.+)',
+                r'\bwith\s+(.+)',
+                r'\bwithout\s+(.+)',
+                r'\bskip\s+(.+)',
+            ]
+            for pattern in modifier_patterns:
+                match = re.search(pattern, selection, re.IGNORECASE)
+                if match:
+                    modifiers.append(match.group(1).strip())
+
+            # Store modifiers in each selected action
+            if modifiers:
+                for a in selected:
+                    a["_modifiers"] = modifiers
+
+        return selected
 
     def build_prompt(self, task_prompt: str, context: Dict[str, Any] = None) -> str:
         """Build a complete prompt with context for Claude"""
@@ -134,11 +260,13 @@ class Palace:
 
         return "".join(prompt_parts)
 
-    def invoke_claude_cli(self, prompt: str) -> int:
+    def invoke_claude_cli(self, prompt: str) -> Tuple[int, Optional[List[dict]]]:
         """
         Invoke Claude Code CLI directly (interactive mode)
 
-        Returns the exit code from Claude
+        Returns tuple of (exit_code, selected_actions)
+        - exit_code: 0 on success, non-zero on error
+        - selected_actions: list of action dicts if user selected any, None otherwise
         """
         # Menu format instructions for action selection
         menu_prompt = """When presenting choices or suggesting next actions, format as:
@@ -177,17 +305,17 @@ Use numbered items, with optional indented descriptions."""
                 text=True
             )
 
-            self._process_stream_output(process.stdout)
+            selected_action = self._process_stream_output(process.stdout)
             process.wait()
-            return process.returncode
+            return process.returncode, selected_action
 
         except FileNotFoundError:
             print("❌ Claude Code CLI not found. Make sure 'claude' is in your PATH.")
             print("   Install from: https://code.claude.com/")
-            return 1
+            return 1, None
         except Exception as e:
             print(f"❌ Error invoking Claude: {e}")
-            return 1
+            return 1, None
 
     def _parse_actions_menu(self, text: str) -> List[dict]:
         """Parse ACTIONS: menu from text, return list of action dicts"""
@@ -239,48 +367,128 @@ Use numbered items, with optional indented descriptions."""
 
         return actions
 
-    def _show_action_menu(self, actions: List[dict]) -> Optional[str]:
-        """Show interactive menu and return selected action"""
+    def _format_action_choice(self, action: dict, width: int = 100) -> str:
+        """Format action for display with truncated description"""
+        num = action.get("num", "?")
+        label = action.get("label", "")
+        desc = action.get("description", "")
+
+        # Build the display string
+        prefix = f"{num}. {label}"
+        if desc:
+            # Truncate description to fit width
+            remaining = width - len(prefix) - 3  # " - " separator
+            if remaining > 20:
+                truncated = desc[:remaining] if len(desc) <= remaining else desc[:remaining-1] + "…"
+                return f"{prefix} - {truncated}"
+        return prefix
+
+    def _show_action_menu(self, actions: List[dict]) -> Optional[List[dict]]:
+        """Show rich interactive menu with multi-select, return selected actions or None to exit"""
         try:
             import questionary
+            from questionary import Style
         except ImportError:
             # Fallback to simple numbered input
-            print("\nSelect an action:")
-            for a in actions:
-                print(f"  {a['num']}. {a['label']}")
-            choice = input("\nEnter number: ").strip()
-            for a in actions:
-                if a["num"] == choice:
-                    return a["label"]
-            return None
+            return self._show_simple_menu(actions)
 
+        # Get terminal width for formatting
+        try:
+            import shutil
+            term_width = shutil.get_terminal_size().columns - 10
+        except:
+            term_width = 90
+
+        # Custom style for the menu
+        custom_style = Style([
+            ('qmark', 'fg:yellow bold'),
+            ('question', 'fg:cyan bold'),
+            ('pointer', 'fg:cyan bold'),
+            ('highlighted', 'fg:cyan bold'),
+            ('selected', 'fg:green'),
+            ('separator', 'fg:gray'),
+            ('instruction', 'fg:gray italic'),
+        ])
+
+        # Build choices for checkbox menu
         choices = []
         for a in actions:
-            label = f"{a['num']}. {a['label']}"
-            if a["description"]:
-                label += f"\n   {a['description'][:100]}..."
-            choices.append(questionary.Choice(label, value=a))
+            display = self._format_action_choice(a, term_width)
+            choices.append(questionary.Choice(display, value=a))
 
-        selected = questionary.select(
-            "Select action:",
-            choices=choices,
-            use_indicator=True,
-            use_shortcuts=True
-        ).ask()
+        print()
+        print("💡 Select next action(s):")
+        print("   KB: ↑/↓ navigate | Space select | Enter run | Esc/q cancel")
+        print()
 
-        if selected and selected.get("subactions"):
-            # Show submenu
-            sub_choices = [
-                questionary.Choice(f"{s['letter']}. {s['label']}", value=s)
-                for s in selected["subactions"]
-            ]
-            sub = questionary.select(
-                f"Sub-action for: {selected['label'][:50]}...",
-                choices=sub_choices
+        try:
+            selected = questionary.checkbox(
+                "",
+                choices=choices,
+                style=custom_style,
+                instruction="",
             ).ask()
-            return sub["label"] if sub else selected["label"]
+        except KeyboardInterrupt:
+            return None
 
-        return selected["label"] if selected else None
+        if selected is None or len(selected) == 0:
+            return None
+
+        return selected
+
+    def _show_simple_menu(self, actions: List[dict]) -> Optional[List[dict]]:
+        """Simple fallback menu without questionary"""
+        print("\n💡 Select action(s) (comma-separated, 0 to exit, or type custom task):")
+        for a in actions:
+            print(f"  {a['num']}. {a['label']}")
+        print("  0. Exit loop")
+
+        choice = input("\nEnter number(s) or custom task: ").strip()
+
+        if choice == "0" or choice.lower() in ("q", "quit", "exit"):
+            return None
+
+        # Check if it's a custom task (not a number)
+        if choice and not choice.replace(",", "").replace(" ", "").isdigit():
+            return [{"num": "c", "label": choice, "description": "Custom task", "_custom": True}]
+
+        # Parse comma-separated numbers
+        selected = []
+        for num in choice.split(","):
+            num = num.strip()
+            for a in actions:
+                if a["num"] == num:
+                    selected.append(a)
+                    break
+
+        return selected if selected else None
+
+    def _prompt_custom_task(self) -> Optional[str]:
+        """Prompt user for custom task when no actions available"""
+        try:
+            import questionary
+            from questionary import Style
+
+            custom_style = Style([
+                ('qmark', 'fg:yellow bold'),
+                ('question', 'fg:cyan bold'),
+            ])
+
+            print()
+            task = questionary.text(
+                "💬 No actions detected. Enter your next task (or 'q' to quit):",
+                style=custom_style,
+            ).ask()
+
+            if task and task.lower() not in ("q", "quit", "exit"):
+                return task
+            return None
+
+        except (ImportError, KeyboardInterrupt):
+            task = input("\n💬 No actions detected. Enter your next task (or 'q' to quit): ").strip()
+            if task and task.lower() not in ("q", "quit", "exit"):
+                return task
+            return None
 
     def _process_stream_output(self, stream):
         """Process streaming JSON output and display succinct progress"""
@@ -374,20 +582,32 @@ Use numbered items, with optional indented descriptions."""
         # Check for action menu and show selector
         actions = self._parse_actions_menu(full_text)
         if actions:
-            print()
             selected = self._show_action_menu(actions)
-            if selected:
-                print(f"\n🎯 Selected: {selected}")
+            if selected and len(selected) > 0:
+                # Show what was selected
+                if len(selected) == 1:
+                    label = selected[0].get("label", "")
+                    print(f"\n🎯 Selected: {label}")
+                else:
+                    print(f"\n🎯 Selected {len(selected)} actions:")
+                    for s in selected:
+                        print(f"   • {s.get('label', '')}")
                 return selected
+            return None  # User cancelled
+
+        # No actions detected - prompt for custom task
+        custom_task = self._prompt_custom_task()
+        if custom_task:
+            return [{"num": "c", "label": custom_task, "description": "Custom task", "_custom": True}]
         return None
 
-    def invoke_claude(self, prompt: str, context: Dict[str, Any] = None):
+    def invoke_claude(self, prompt: str, context: Dict[str, Any] = None) -> Tuple[Any, Optional[List[dict]]]:
         """
         Invoke Claude with a prompt and context.
 
         Behavior depends on mode:
-        - Interactive: Calls Claude Code CLI directly
-        - Non-interactive: Saves prompt file and outputs instructions
+        - Interactive: Calls Claude Code CLI directly, returns (exit_code, selected_actions)
+        - Non-interactive: Saves prompt file, returns (prompt_file, None)
         """
         full_prompt = self.build_prompt(prompt, context)
         full_context = context or self.gather_context()
@@ -404,7 +624,7 @@ Use numbered items, with optional indented descriptions."""
             return self.invoke_claude_cli(full_prompt)
         else:
             # Non-interactive mode: output context for Claude to read
-            return prompt_file
+            return prompt_file, None
 
     def cmd_next(self, args):
         """
@@ -413,10 +633,56 @@ Use numbered items, with optional indented descriptions."""
         This is the KEY to RHSI - Claude analyzes the project state and suggests
         the next action. Over time, these suggestions become smarter as Palace
         learns from history.
-        """
-        context = self.gather_context()
 
-        prompt = """Analyze this project and suggest what to do next.
+        Supports:
+        - Interactive mode: continuous loop with action selection
+        - Non-interactive mode: saves session for later resumption
+        - --resume SESSION_ID: resume a paused session
+        - --select "1,2,3" or "do 1 but skip tests": select actions
+        """
+        # Check for resume mode
+        resume_id = getattr(args, 'resume', None)
+        selection = getattr(args, 'select', None)
+
+        session_id = None
+        iteration = 0
+        pending_actions = []
+
+        if resume_id:
+            # Resume existing session
+            session = self.load_session(resume_id)
+            if not session:
+                print(f"❌ Session '{resume_id}' not found")
+                print("\nAvailable sessions:")
+                for s in self.list_sessions()[:5]:
+                    print(f"  • {s['session_id']} (iteration {s['iteration']}, {s['pending_actions']} pending)")
+                return
+
+            session_id = resume_id
+            iteration = session.get("iteration", 0)
+            pending_actions = session.get("pending_actions", [])
+            print(f"🔄 Resuming session: {session_id}")
+            print(f"   Iteration: {iteration}, Pending actions: {len(pending_actions)}")
+
+            if selection and pending_actions:
+                # Apply selection to pending actions
+                selected = self.parse_action_selection(selection, pending_actions)
+                if selected:
+                    pending_actions = selected
+                    print(f"   Selected: {len(selected)} action(s)")
+                    for a in selected:
+                        label = a.get("label", "")
+                        mods = a.get("_modifiers", [])
+                        if mods:
+                            print(f"   • {label} (modifiers: {', '.join(mods)})")
+                        else:
+                            print(f"   • {label}")
+        else:
+            # New session
+            session_id = self._generate_session_id()
+
+        # Initial prompt for first iteration
+        initial_prompt = """Analyze this project and suggest what to do next.
 
 Consider:
 1. What exists already (check the files context)
@@ -432,41 +698,130 @@ Provide:
 Be concrete and actionable. This is part of a Recursive Hierarchical Self Improvement loop,
 so your suggestion will be used to actually advance the project."""
 
-        result = self.invoke_claude(prompt, context)
+        current_prompt = initial_prompt
 
-        if not is_interactive():
-            # Non-interactive mode: output context for Claude
-            print("🏛️  Palace - Invoking Claude for next step analysis...")
-            print()
-            print(f"📝 Context prepared at: {result}")
-            print()
-            print("Now invoking Claude to analyze and suggest next steps...")
-            print()
-            print("─" * 60)
+        # If resuming with selected actions, build prompt from them
+        if pending_actions and (resume_id or selection):
+            current_prompt = self._build_action_prompt(pending_actions)
+
+        while True:
+            iteration += 1
+            context = self.gather_context()
+
+            if not is_interactive():
+                # Non-interactive mode: invoke Claude, save session, output for continuation
+                result, _ = self.invoke_claude(current_prompt, context)
+
+                # Parse any actions from the response for session state
+                # (The actions will be in the prompt file)
+                self._show_non_interactive_output(result, context, session_id, iteration)
+
+                self.log_action("next", {
+                    "session_id": session_id,
+                    "iteration": iteration,
+                    "context_file": str(result)
+                })
+                return
+
+            # Interactive mode: continuous loop
+            print(f"\n{'═' * 60}")
+            print(f"🔄 RHSI Loop - Session: {session_id} | Iteration {iteration}")
+            print(f"{'═' * 60}\n")
+
+            exit_code, selected_actions = self.invoke_claude(current_prompt, context)
+
+            self.log_action("next", {
+                "session_id": session_id,
+                "iteration": iteration,
+                "exit_code": exit_code,
+                "selected_actions": [a.get("label") for a in (selected_actions or [])]
+            })
+
+            if exit_code != 0:
+                print(f"\n⚠️  Claude exited with code {exit_code}")
+
+            if not selected_actions:
+                print("\n👋 Exiting RHSI loop.")
+                break
+
+            # Build prompt for next iteration based on selected actions
+            current_prompt = self._build_action_prompt(selected_actions)
             print()
 
-            # Show the context to user
-            print("PROJECT STATE:")
-            if context["files"]:
-                print("\nExisting files:")
-                for filename, info in context["files"].items():
-                    print(f"  ✓ {filename}")
+    def _build_action_prompt(self, actions: List[dict]) -> str:
+        """Build a prompt from selected actions"""
+        if len(actions) == 1:
+            action = actions[0]
+            if action.get("_custom"):
+                task_desc = action.get("label", "")
+                return f"""Execute this task: {task_desc}
 
-            if context.get("git_status"):
-                print("\nGit status:")
-                for line in context["git_status"].strip().split('\n')[:5]:
-                    print(f"  {line}")
+After completing, suggest what to do next. Include an ACTIONS: section with your recommendations."""
+            else:
+                task_desc = action.get("label", "")
+                task_detail = action.get("description", "")
+                modifiers = action.get("_modifiers", [])
+                mod_text = f"\nModifications: {', '.join(modifiers)}" if modifiers else ""
+                return f"""Execute this action: {task_desc}
+{f"Details: {task_detail}" if task_detail else ""}{mod_text}
 
-            if context.get("recent_history"):
-                print(f"\nRecent actions: {len(context['recent_history'])} logged")
+After completing, suggest what to do next. Include an ACTIONS: section with your recommendations."""
+        else:
+            tasks = []
+            for a in actions:
+                task = f"- {a.get('label', '')}"
+                mods = a.get("_modifiers", [])
+                if mods:
+                    task += f" (modifications: {', '.join(mods)})"
+                tasks.append(task)
+            return f"""Execute these actions in order:
+{chr(10).join(tasks)}
 
-            print()
-            print("─" * 60)
-            print()
-            print("🤖 CLAUDE: Please read the prompt file above and provide your analysis.")
-            print()
+After completing all, suggest what to do next. Include an ACTIONS: section with your recommendations."""
 
-        self.log_action("next", {"context_file": str(result) if not is_interactive() else "claude_cli"})
+    def _show_non_interactive_output(self, result, context: Dict[str, Any], session_id: str = None, iteration: int = 1):
+        """Show output for non-interactive mode and save session state"""
+        print("🏛️  Palace - Invoking Claude for next step analysis...")
+        print()
+        if session_id:
+            print(f"📋 Session ID: {session_id}")
+        print(f"📝 Context prepared at: {result}")
+        print()
+        print("─" * 60)
+        print()
+
+        print("PROJECT STATE:")
+        if context["files"]:
+            print("\nExisting files:")
+            for filename, info in context["files"].items():
+                print(f"  ✓ {filename}")
+
+        if context.get("git_status"):
+            print("\nGit status:")
+            for line in context["git_status"].strip().split('\n')[:5]:
+                print(f"  {line}")
+
+        if context.get("recent_history"):
+            print(f"\nRecent actions: {len(context['recent_history'])} logged")
+
+        print()
+        print("─" * 60)
+        print()
+        print("🤖 CLAUDE: Please analyze the project and suggest next actions.")
+        print()
+        print("After Claude responds with ACTIONS:, you can resume with:")
+        print(f"   python3 palace.py next --resume {session_id} --select \"1,2,3\"")
+        print(f"   python3 palace.py next --resume {session_id} --select \"do 1 but skip tests\"")
+        print()
+
+        # Save initial session state (pending_actions will be populated when Claude responds)
+        if session_id:
+            self.save_session(session_id, {
+                "iteration": iteration,
+                "pending_actions": [],  # Will be populated from Claude's response
+                "context": context,
+                "prompt_file": str(result)
+            })
 
     def cmd_new(self, args):
         """Ask Claude to create a new project"""
@@ -669,6 +1024,40 @@ After running this, read the generated prompt and run the tests.
         print("  1. Run 'python3 palace.py next' to see what to do next")
         print("  2. Or run 'python3 palace.py install' to add Palace to Claude Code")
 
+    def cmd_sessions(self, args):
+        """List saved sessions"""
+        sessions = self.list_sessions()
+
+        if not sessions:
+            print("📋 No saved sessions found")
+            print()
+            print("Sessions are created when running 'palace next' in non-interactive mode.")
+            return
+
+        print("📋 Saved Sessions:")
+        print()
+        for s in sessions:
+            session_id = s.get("session_id", "?")
+            iteration = s.get("iteration", 0)
+            pending = s.get("pending_actions", 0)
+            updated = s.get("updated_at")
+
+            # Format timestamp
+            if updated:
+                from datetime import datetime
+                dt = datetime.fromtimestamp(updated)
+                time_str = dt.strftime("%Y-%m-%d %H:%M")
+            else:
+                time_str = "unknown"
+
+            print(f"  • {session_id}")
+            print(f"    Iteration: {iteration} | Pending: {pending} actions | Updated: {time_str}")
+            print()
+
+        print("Resume with:")
+        print('  python3 palace.py next --resume SESSION_ID --select "1,2,3"')
+        print()
+
     def cmd_permissions(self, args):
         """
         Handle permission prompts from Claude Code
@@ -712,7 +1101,11 @@ def main():
     subparsers = parser.add_subparsers(dest='command', help='Commands')
 
     # Commands that invoke Claude
-    subparsers.add_parser('next', help='Ask Claude what to do next (RHSI core)')
+    parser_next = subparsers.add_parser('next', help='Ask Claude what to do next (RHSI core)')
+    parser_next.add_argument('--resume', '-r', metavar='SESSION_ID',
+                             help='Resume a paused session')
+    parser_next.add_argument('--select', '-s', metavar='SELECTION',
+                             help='Select actions: "1,2,3" or "do 1 but skip tests"')
 
     parser_new = subparsers.add_parser('new', help='Ask Claude to create a new project')
     parser_new.add_argument('name', nargs='?', help='Project name')
@@ -723,6 +1116,7 @@ def main():
     # Utility commands
     subparsers.add_parser('install', help='Install Palace commands to Claude Code')
     subparsers.add_parser('init', help='Initialize Palace in current directory')
+    subparsers.add_parser('sessions', help='List saved sessions')
     subparsers.add_parser('permissions', help='Handle Claude Code permission requests (internal)')
 
     args = parser.parse_args()
@@ -740,6 +1134,7 @@ def main():
         'test': palace.cmd_test,
         'install': palace.cmd_install,
         'init': palace.cmd_init,
+        'sessions': palace.cmd_sessions,
         'permissions': palace.cmd_permissions,
     }
 
