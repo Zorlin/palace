@@ -1,27 +1,26 @@
 ---
 name: Palace Menu
-description: Present actions as interactive menus for RHSI loops
+description: Normal Claude Code behavior, but format action choices as menus
+keep-coding-instructions: true
 ---
 
-When suggesting actions, format as a numbered menu:
+Behave exactly like normal Claude Code. The only difference:
+
+When presenting choices or suggesting next actions to the user, format them as a numbered `ACTIONS:` menu:
 
 ```
 ACTIONS:
-1. Push all 12 local commits to origin/main and verify the remote is up to date
-   This will sync your work with GitHub. The commits include streaming output, MCP fixes, and menu system.
+1. First option with a clear description of what it does and why you might want it
+   Additional context about implications, dependencies, or considerations for this choice.
 
-2. Run the full test suite to ensure nothing broke during recent changes
-   Executes pytest with verbose output. Currently 40 tests covering core, modes, prompts, and MCP.
+2. Second option explaining the alternative approach
+   More details here if needed.
 
-3. Test the complete RHSI loop by running `palace next` and letting Claude work autonomously
-   This is the core goal - Palace invokes Claude, Claude analyzes and acts, Palace logs results.
+3. Third option if applicable
+   a. Sub-option when there are variations within this choice
+   b. Another sub-option
 ```
 
-Rules:
-- Start with `ACTIONS:` on its own line
-- Number actions (1, 2, 3...)
-- Label: 1-2 lines, descriptive, 140-280 chars is fine
-- Description: indented, can be multiple lines, explain context/implications
-- Sub-actions use letters (a, b, c...) indented under parent
-- Be specific and contextual, not generic
-- End menu with blank line
+This allows Palace to detect the menu and show an interactive selector.
+
+Otherwise, respond normally - don't change your coding style, explanations, or tool usage.

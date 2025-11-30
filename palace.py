@@ -16,6 +16,7 @@ import os
 import json
 import subprocess
 import re
+import shutil
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -541,24 +542,32 @@ for this project type."""
         self.log_action("test")
 
     def cmd_install(self, args):
-        """Install Palace commands into Claude Code"""
+        """Install Palace commands and output style into Claude Code"""
 
         print("🏛️  Palace - Installing to Claude Code")
         print()
 
-        claude_code_dir = Path.home() / ".claude-code" / "commands"
+        # Find Claude Code config directory
+        claude_dir = Path.home() / ".claude"
+        if not claude_dir.exists():
+            claude_dir = Path.home() / ".config" / "claude"
 
-        if not claude_code_dir.exists():
-            claude_code_dir = Path.home() / ".config" / "claude-code" / "commands"
+        commands_dir = claude_dir / "commands"
+        styles_dir = claude_dir / "output-styles"
 
-        if not claude_code_dir.exists():
-            print("❌ Could not find Claude Code commands directory")
-            return
+        commands_dir.mkdir(parents=True, exist_ok=True)
+        styles_dir.mkdir(parents=True, exist_ok=True)
 
-        claude_code_dir.mkdir(parents=True, exist_ok=True)
-
-        # Get absolute path to palace.py
+        # Get absolute path to palace.py and output style
         palace_path = Path(__file__).resolve()
+        palace_dir = palace_path.parent
+
+        # Install output style
+        style_src = palace_dir / ".claude" / "output-styles" / "palace-menu.md"
+        style_dst = styles_dir / "palace-menu.md"
+        if style_src.exists():
+            shutil.copy(style_src, style_dst)
+            print(f"✅ Installed output style: palace-menu")
 
         commands = {
             "pal-next.md": f"""# Palace Next
@@ -607,21 +616,19 @@ After running this, read the generated prompt and run the tests.
 
         installed = []
         for filename, content in commands.items():
-            filepath = claude_code_dir / filename
+            filepath = commands_dir / filename
             with open(filepath, 'w') as f:
                 f.write(content)
             installed.append(filename.replace('.md', ''))
 
-        print("✅ Installed Palace commands to Claude Code:")
+        print("✅ Installed Palace commands:")
         for cmd in installed:
             print(f"   • /{cmd}")
 
         print()
         print("🎉 Palace is now integrated with Claude Code!")
         print()
-        print("These commands invoke Palace, which prepares context and prompts")
-        print("for YOU (Claude) to analyze and execute using your full capabilities.")
-        print()
+        print("Output style 'palace-menu' enables action menus.")
         print("Try: /pal-next")
 
     def cmd_init(self, args):
