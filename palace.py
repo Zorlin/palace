@@ -269,7 +269,7 @@ class Palace:
         - selected_actions: list of action dicts if user selected any, None otherwise
         """
         # Menu format instructions for action selection
-        menu_prompt = """When presenting choices or suggesting next actions, format as:
+        menu_prompt = """IMPORTANT: End your response with suggested next actions using this EXACT format:
 
 ACTIONS:
 1. First option with description
@@ -278,7 +278,7 @@ ACTIONS:
 2. Second option
    More details here.
 
-Use numbered items, with optional indented descriptions."""
+The "ACTIONS:" header is required (exact spelling with colon) - it triggers the interactive menu system."""
 
         cmd = [
             "claude",
@@ -318,12 +318,41 @@ Use numbered items, with optional indented descriptions."""
             return 1, None
 
     def _parse_actions_menu(self, text: str) -> List[dict]:
-        """Parse ACTIONS: menu from text, return list of action dicts"""
-        if "ACTIONS:" not in text:
+        """Parse actions from text - supports multiple formats"""
+        actions = []
+
+        # Try multiple action header patterns
+        action_section = None
+        patterns = [
+            ("ACTIONS:", 1),
+            ("## Next Action:", 0),  # Single action format
+            ("**Next Action:**", 0),
+            ("Next steps:", 1),
+            ("Suggested actions:", 1),
+        ]
+
+        for pattern, _ in patterns:
+            if pattern in text:
+                action_section = text.split(pattern, 1)[1].strip()
+                break
+
+        # Also detect numbered lists anywhere in the text
+        if not action_section:
+            # Look for numbered list patterns like "1. Do something"
+            import re
+            numbered = re.findall(r'^\s*(\d+)\.\s+\*?\*?([^\n*]+)', text, re.MULTILINE)
+            if numbered:
+                for num, label in numbered[:7]:  # Max 7 actions
+                    actions.append({
+                        "num": num,
+                        "label": label.strip(),
+                        "description": "",
+                        "subactions": []
+                    })
+                return actions
             return []
 
-        actions = []
-        lines = text.split("ACTIONS:", 1)[1].strip().split("\n")
+        lines = action_section.split("\n")
         current_action = None
 
         for line in lines:
@@ -574,25 +603,99 @@ Use numbered items, with optional indented descriptions."""
 
         # Check for action menu and show selector
         actions = self._parse_actions_menu(full_text)
-        if actions:
-            selected = self._show_action_menu(actions)
-            if selected and len(selected) > 0:
-                # Show what was selected
-                if len(selected) == 1:
-                    label = selected[0].get("label", "")
-                    print(f"\n🎯 Selected: {label}")
-                else:
-                    print(f"\n🎯 Selected {len(selected)} actions:")
-                    for s in selected:
-                        print(f"   • {s.get('label', '')}")
-                return selected
-            return None  # User cancelled
 
-        # No actions detected - prompt for custom task
-        custom_task = self._prompt_custom_task()
-        if custom_task:
-            return [{"num": "c", "label": custom_task, "description": "Custom task", "_custom": True}]
-        return None
+        # Always show the steering prompt
+        return self._show_steering_prompt(actions)
+
+    def _show_steering_prompt(self, actions: List[dict]) -> Optional[List[dict]]:
+        """Show persistent steering prompt - works with or without detected actions"""
+        try:
+            import questionary
+            from questionary import Style
+
+            custom_style = Style([
+                ('qmark', 'fg:yellow bold'),
+                ('question', 'fg:cyan bold'),
+                ('pointer', 'fg:cyan bold'),
+                ('highlighted', 'fg:cyan bold'),
+                ('selected', 'fg:green'),
+            ])
+
+            if actions:
+                # Show action menu with text input option
+                print()
+                print("💡 Select action(s) or type custom task:")
+                print("   KB: ↑/↓ navigate | Space select | Enter run | Tab for text input")
+                print()
+
+                # Get terminal width
+                try:
+                    import shutil
+                    term_width = shutil.get_terminal_size().columns - 10
+                except:
+                    term_width = 90
+
+                choices = []
+                for a in actions:
+                    display = self._format_action_choice(a, term_width)
+                    choices.append(questionary.Choice(display, value=a))
+
+                # Add custom input option
+                choices.append(questionary.Choice("📝 Type custom task...", value={"_text_input": True}))
+
+                selected = questionary.checkbox(
+                    "",
+                    choices=choices,
+                    style=custom_style,
+                    instruction="",
+                ).ask()
+
+                if selected is None:
+                    return None
+
+                # Check if user wants text input
+                if any(s.get("_text_input") for s in selected):
+                    custom = questionary.text(
+                        ">",
+                        style=custom_style,
+                    ).ask()
+                    if custom and custom.strip():
+                        return [{"num": "c", "label": custom.strip(), "description": "Custom task", "_custom": True}]
+                    return None
+
+                if len(selected) > 0:
+                    if len(selected) == 1:
+                        print(f"\n🎯 Selected: {selected[0].get('label', '')}")
+                    else:
+                        print(f"\n🎯 Selected {len(selected)} actions:")
+                        for s in selected:
+                            print(f"   • {s.get('label', '')}")
+                    return selected
+                return None
+
+            else:
+                # No actions - just show text prompt
+                print()
+                custom = questionary.text(
+                    "> ",
+                    style=custom_style,
+                ).ask()
+
+                if custom and custom.strip() and custom.lower() not in ("q", "quit", "exit"):
+                    print(f"\n🎯 Task: {custom.strip()}")
+                    return [{"num": "c", "label": custom.strip(), "description": "Custom task", "_custom": True}]
+                return None
+
+        except (ImportError, KeyboardInterrupt):
+            # Fallback without questionary
+            if actions:
+                return self._show_simple_menu(actions)
+            else:
+                print()
+                custom = input("> ").strip()
+                if custom and custom.lower() not in ("q", "quit", "exit"):
+                    return [{"num": "c", "label": custom, "description": "Custom task", "_custom": True}]
+                return None
 
     def invoke_claude(self, prompt: str, context: Dict[str, Any] = None) -> Tuple[Any, Optional[List[dict]]]:
         """
