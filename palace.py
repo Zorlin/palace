@@ -176,8 +176,10 @@ class Palace:
 
     def _process_stream_output(self, stream):
         """Process streaming JSON output and display succinct progress"""
-        current_text = ""
+        # Track text per message ID to handle interleaving
+        text_by_msg = {}
         seen_tools = set()
+        last_was_text = False
 
         for line in stream:
             line = line.strip()
@@ -189,25 +191,24 @@ class Palace:
                 msg_type = msg.get("type", "")
 
                 if msg_type == "system" and msg.get("subtype") == "init":
-                    # Session started
                     model = msg.get("model", "unknown")
                     print(f"📡 Model: {model}")
                     print()
 
                 elif msg_type == "assistant":
-                    # Assistant message with content
                     message = msg.get("message", {})
+                    msg_id = message.get("id", "")
                     content = message.get("content", [])
 
                     for block in content:
                         if block.get("type") == "text":
                             text = block.get("text", "")
-                            if text and text != current_text:
-                                # Print new text (delta)
-                                new_text = text[len(current_text):]
-                                if new_text:
-                                    print(new_text, end="", flush=True)
-                                current_text = text
+                            prev_text = text_by_msg.get(msg_id, "")
+                            if text and len(text) > len(prev_text):
+                                new_text = text[len(prev_text):]
+                                print(new_text, end="", flush=True)
+                                text_by_msg[msg_id] = text
+                                last_was_text = True
 
                         elif block.get("type") == "tool_use":
                             tool_name = block.get("name", "unknown")
@@ -215,45 +216,38 @@ class Palace:
 
                             if tool_id not in seen_tools:
                                 seen_tools.add(tool_id)
-                                # Show tool use succinctly
+                                # Newline if we were printing text
+                                if last_was_text:
+                                    print()
+                                    last_was_text = False
+
                                 tool_input = block.get("input", {})
                                 if tool_name == "Read":
-                                    file_path = tool_input.get("file_path", "")
-                                    short_path = file_path.split("/")[-1] if file_path else "?"
-                                    print(f"\n📖 Reading: {short_path}")
+                                    path = tool_input.get("file_path", "?").split("/")[-1]
+                                    print(f"📖 Reading: {path}")
                                 elif tool_name == "Edit":
-                                    file_path = tool_input.get("file_path", "")
-                                    short_path = file_path.split("/")[-1] if file_path else "?"
-                                    print(f"\n✏️  Editing: {short_path}")
+                                    path = tool_input.get("file_path", "?").split("/")[-1]
+                                    print(f"✏️  Editing: {path}")
                                 elif tool_name == "Write":
-                                    file_path = tool_input.get("file_path", "")
-                                    short_path = file_path.split("/")[-1] if file_path else "?"
-                                    print(f"\n📝 Writing: {short_path}")
+                                    path = tool_input.get("file_path", "?").split("/")[-1]
+                                    print(f"📝 Writing: {path}")
                                 elif tool_name == "Bash":
                                     cmd = tool_input.get("command", "")[:50]
-                                    print(f"\n💻 Running: {cmd}...")
+                                    print(f"💻 Running: {cmd}...")
                                 elif tool_name == "Glob":
-                                    pattern = tool_input.get("pattern", "")
-                                    print(f"\n🔍 Finding: {pattern}")
+                                    print(f"🔍 Finding: {tool_input.get('pattern', '')}")
                                 elif tool_name == "Grep":
-                                    pattern = tool_input.get("pattern", "")
-                                    print(f"\n🔎 Searching: {pattern}")
+                                    print(f"🔎 Searching: {tool_input.get('pattern', '')}")
                                 else:
-                                    print(f"\n🔧 {tool_name}")
+                                    print(f"🔧 {tool_name}")
 
                 elif msg_type == "result":
-                    # Final result
-                    print("\n")
-                    print("✅ Done")
+                    print("\n✅ Done")
 
-            except json.JSONDecodeError:
-                # Not valid JSON, might be partial
-                pass
-            except Exception as e:
-                # Silently skip parsing errors
+            except (json.JSONDecodeError, Exception):
                 pass
 
-        print()  # Final newline
+        print()
 
     def invoke_claude(self, prompt: str, context: Dict[str, Any] = None):
         """
