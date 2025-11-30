@@ -35,6 +35,23 @@ This principle is encoded into Palace's DNA and applies to:
 
 **The user is in control. Always.**
 
+## 🥉 Golden Rule #3: NEVER Skip Permissions
+
+**NEVER use `--dangerously-skip-permissions`. EVER.**
+
+- ALL Claude CLI invocations MUST use `--permission-prompt-tool "mcp__palace__handle_permission"`
+- The MCP permission handler is the ONLY acceptable way to handle permissions
+- No exceptions. No shortcuts. No "just for testing."
+- If you add `--dangerously-skip-permissions` anywhere, you are FIRED.
+
+This applies to:
+- `invoke_claude_cli`
+- `spawn_swarm`
+- Any future Claude CLI invocations
+- Tests (mock the permission handler, don't skip it)
+
+**The permission system exists for safety. Respect it.**
+
 ## MCP Server Integration
 
 Palace is both a CLI tool AND an MCP server, providing tools that Claude can call directly.

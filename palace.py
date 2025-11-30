@@ -1336,12 +1336,12 @@ Return JSON only:
 }}"""
 
         try:
-            # Use GLM via Z.ai for ranking
+            # Use GLM via Z.ai for ranking - need enough tokens for large task lists
             response = self.invoke_provider(
                 provider="z.ai",
                 model="glm-4.6",
                 messages=[{"role": "user", "content": ranking_prompt}],
-                max_tokens=1024
+                max_tokens=4096
             )
 
             response_text = ""
@@ -1349,11 +1349,27 @@ Return JSON only:
                 if block.get("type") == "text":
                     response_text += block.get("text", "")
 
+            # Extract JSON - handle markdown code blocks
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0]
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0]
+
             # Parse JSON
             if "{" in response_text:
                 json_start = response_text.find("{")
                 json_end = response_text.rfind("}") + 1
-                result = json.loads(response_text[json_start:json_end])
+                json_str = response_text[json_start:json_end]
+
+                # Try to fix common JSON issues
+                try:
+                    result = json.loads(json_str)
+                except json.JSONDecodeError:
+                    # Try fixing trailing commas
+                    import re
+                    json_str = re.sub(r',\s*}', '}', json_str)
+                    json_str = re.sub(r',\s*]', ']', json_str)
+                    result = json.loads(json_str)
 
                 assignments = {}
                 for a in result.get("assignments", []):
@@ -1376,136 +1392,18 @@ Return JSON only:
             for t in tasks
         }
 
-    def init_swarm_history(self, session_id: str):
-        """Initialize shared swarm history file"""
-        swarm_dir = self.palace_dir / "swarm"
-        swarm_dir.mkdir(parents=True, exist_ok=True)
-
-        swarm_file = swarm_dir / f"{session_id}.jsonl"
-        if not swarm_file.exists():
-            swarm_file.touch()
-
-    def write_swarm_event(self, session_id: str, event: Dict[str, Any]):
-        """Write event to shared swarm history"""
-        swarm_file = self.palace_dir / "swarm" / f"{session_id}.jsonl"
-
-        event["timestamp"] = time.time()
-
-        with open(swarm_file, 'a') as f:
-            f.write(json.dumps(event) + '\n')
-
-    def read_swarm_events(self, session_id: str, since_offset: int = 0,
-                          return_offset: bool = False) -> List[Dict[str, Any]]:
-        """
-        Read events from shared swarm history.
-
-        Args:
-            session_id: Swarm session ID
-            since_offset: Only read events after this byte offset
-            return_offset: If True, return (events, new_offset) tuple
-        """
-        swarm_file = self.palace_dir / "swarm" / f"{session_id}.jsonl"
-
-        if not swarm_file.exists():
-            return ([], 0) if return_offset else []
-
-        events = []
-        with open(swarm_file, 'r') as f:
-            if since_offset:
-                f.seek(since_offset)
-
-            content = f.read()
-            new_offset = f.tell()
-
-        for line in content.strip().split('\n'):
-            if line:
-                try:
-                    events.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
-
-        if return_offset:
-            return events, new_offset
-        return events
-
-    def build_swarm_context(self, session_id: str, current_agent: str) -> str:
-        """Build context showing other agents' activity"""
-        events = self.read_swarm_events(session_id)
-
-        # Filter out own events
-        other_events = [e for e in events if e.get("agent") != current_agent]
-
-        if not other_events:
-            return ""
-
-        lines = ["## 🐝 PARALLEL AGENTS STATUS", ""]
-        lines.append("Other agents are working simultaneously on related tasks:")
-        lines.append("")
-
-        # Group by agent
-        by_agent = {}
-        for e in other_events:
-            agent = e.get("agent", "unknown")
-            if agent not in by_agent:
-                by_agent[agent] = []
-            by_agent[agent].append(e)
-
-        for agent, agent_events in by_agent.items():
-            latest = agent_events[-1] if agent_events else {}
-            lines.append(f"**{agent}**: {latest.get('message', latest.get('action', 'working...'))}")
-
-        lines.append("")
-        lines.append("Coordinate with them - avoid duplicating work, build on their progress.")
-        lines.append("")
-
-        return "\n".join(lines)
-
-    def build_swarm_prompt(self, task: str, session_id: str, agent_id: str,
-                           base_context: str = "") -> str:
-        """Build prompt with swarm awareness"""
-        swarm_context = self.build_swarm_context(session_id, agent_id)
-        swarm_file = self.palace_dir / "swarm" / f"{session_id}.jsonl"
-
+    def build_swarm_prompt(self, task: str, agent_id: str, base_context: str = "") -> str:
+        """Build simple task prompt for swarm agent"""
         prompt_parts = [
-            f"# Task for Agent {agent_id}",
+            f"# Task: {task}",
             "",
-            f"**YOUR TASK:** {task}",
-            "",
-            "## CRITICAL: You must EXECUTE this task, not just discuss it!",
-            "",
-            "Use your tools to:",
-            "- Read files to understand the codebase",
-            "- Write/Edit files to implement changes",
-            "- Run commands via Bash to test and verify",
-            "- Create any necessary files or directories",
-            "",
-            "Do NOT just output a plan or explanation. Actually DO the work.",
+            "Execute this task fully. Use your tools to read, write, edit files and run commands.",
+            "Do NOT just plan - actually DO the work.",
             "",
         ]
 
-        if swarm_context:
-            prompt_parts.extend([swarm_context, ""])
-
         if base_context:
             prompt_parts.extend(["## Project Context", base_context, ""])
-
-        prompt_parts.extend([
-            "## Swarm Coordination",
-            f"You are agent {agent_id} in a parallel swarm.",
-            "Other agents are working on related tasks simultaneously.",
-            "",
-            f"**Shared history file:** {swarm_file}",
-            "- Read this file periodically to see what other agents are doing",
-            "- Write your progress to this file so others can coordinate",
-            "",
-            "To log your progress, append JSON lines like:",
-            f'echo \'{{"agent": "{agent_id}", "type": "progress", "message": "your status"}}\' >> {swarm_file}',
-            "",
-            "Coordinate with other agents - avoid duplicating work, build on their progress.",
-            "",
-            "Now execute your task. Use tools. Make changes. Get it done.",
-            ""
-        ])
 
         return "\n".join(prompt_parts)
 
@@ -1513,15 +1411,7 @@ Return JSON only:
                     base_prompt: str) -> Dict[str, Any]:
         """
         Spawn parallel Claude CLI processes for swarm execution.
-
-        Each process gets:
-        - Its assigned model
-        - Its task
-        - Access to shared swarm history
         """
-        session_id = self._generate_session_id()
-        self.init_swarm_history(session_id)
-
         processes = {}
         config = self.get_provider_config()
 
@@ -1536,10 +1426,9 @@ Return JSON only:
 
             agent_id = f"{model_alias}-{task_num}"
 
-            # Build swarm-aware prompt
+            # Build task prompt
             prompt = self.build_swarm_prompt(
                 task=f"{task_label}: {task.get('description', '')}",
-                session_id=session_id,
                 agent_id=agent_id,
                 base_context=base_prompt
             )
@@ -1558,15 +1447,12 @@ Other agents are working on related tasks simultaneously.
 Execute your assigned task fully - use tools to read, write, and modify files.
 Do NOT just plan or discuss - actually DO the work."""
 
-            # Build CLI command - same pattern as invoke_claude_cli
-            # Use -p with streaming JSON for bidirectional communication
+            # Build CLI command - bidirectional streaming JSON
             cmd = [
                 "claude",
-                "-p", prompt,
                 "--model", model,
                 "--append-system-prompt", swarm_system,
                 "--verbose",
-                "--include-partial-messages",
                 "--input-format", "stream-json",
                 "--output-format", "stream-json",
                 "--permission-prompt-tool", "mcp__palace__handle_permission",
@@ -1586,20 +1472,20 @@ Do NOT just plan or discuss - actually DO the work."""
                     text=True
                 )
 
+                # Send initial prompt via streaming JSON
+                initial_message = {
+                    "type": "user",
+                    "message": {"role": "user", "content": prompt}
+                }
+                process.stdin.write(json.dumps(initial_message) + "\n")
+                process.stdin.flush()
+
                 processes[task_num] = {
                     "process": process,
                     "agent_id": agent_id,
                     "model": model_alias,
                     "task": task_label,
-                    "session_id": session_id
                 }
-
-                # Log swarm start
-                self.write_swarm_event(session_id, {
-                    "agent": agent_id,
-                    "type": "start",
-                    "message": f"Starting: {task_label}"
-                })
 
             except Exception as e:
                 print(f"❌ Failed to spawn {agent_id}: {e}")
@@ -1614,17 +1500,57 @@ Do NOT just plan or discuss - actually DO the work."""
         """
         import select
         import threading
+        from datetime import datetime
 
         results = {}
         active = dict(processes)
-        session_id = next(iter(processes.values()))["session_id"] if processes else None
 
-        print(f"\n🐝 Swarm active: {len(active)} agents")
+        # Print date header
+        print(f"\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"🐝 Swarm active: {len(active)} agents")
         print("─" * 50)
 
         # Track output buffers and seen tool IDs (to avoid duplicates)
         buffers = {num: "" for num in active}
         seen_tools = set()
+
+        # Track agent confidence (based on activity patterns)
+        # confidence: 1.0 = highly confident, 0.0 = stuck
+        agent_confidence = {num: 1.0 for num in active}
+        agent_last_action = {num: time.time() for num in active}
+        agent_action_count = {num: 0 for num in active}
+
+        def confidence_timestamp(task_num: str) -> str:
+            """Return colored timestamp based on agent confidence"""
+            conf = agent_confidence.get(task_num, 0.5)
+            ts = datetime.now().strftime("%H:%M:%S")
+            # ANSI colors: bright green → green → yellow → orange → red
+            if conf >= 0.9:
+                return f"\033[92m[{ts}]\033[0m"  # Bright green - highly confident
+            elif conf >= 0.7:
+                return f"\033[32m[{ts}]\033[0m"  # Dark green - very confident
+            elif conf >= 0.5:
+                return f"\033[33m[{ts}]\033[0m"  # Yellow - confident
+            elif conf >= 0.3:
+                return f"\033[38;5;208m[{ts}]\033[0m"  # Orange - uncertain
+            else:
+                return f"\033[91m[{ts}]\033[0m"  # Red - stuck/worried
+
+        def update_confidence(task_num: str, action_type: str):
+            """Update confidence based on action patterns"""
+            now = time.time()
+            elapsed = now - agent_last_action[task_num]
+            agent_last_action[task_num] = now
+            agent_action_count[task_num] += 1
+
+            # Increase confidence on productive actions
+            if action_type in ("tool_use", "text"):
+                agent_confidence[task_num] = min(1.0, agent_confidence[task_num] + 0.1)
+            # Decrease if long gap between actions (stuck)
+            if elapsed > 10:
+                agent_confidence[task_num] = max(0.0, agent_confidence[task_num] - 0.2)
+            elif elapsed > 5:
+                agent_confidence[task_num] = max(0.0, agent_confidence[task_num] - 0.1)
 
         while active:
             # Debug: show we're still monitoring
@@ -1638,13 +1564,6 @@ Do NOT just plan or discuss - actually DO the work."""
                     # Read remaining output
                     remaining = process.stdout.read()
                     buffers[task_num] += remaining
-
-                    # Log completion
-                    self.write_swarm_event(session_id, {
-                        "agent": agent_id,
-                        "type": "complete",
-                        "message": f"Completed: {info['task']}"
-                    })
 
                     results[task_num] = {
                         "agent": agent_id,
@@ -1681,7 +1600,8 @@ Do NOT just plan or discuss - actually DO the work."""
 
                                 if msg_type == "system" and msg.get("subtype") == "init":
                                     model = msg.get("model", "unknown")
-                                    print(f"[{agent_id}] 📡 Model: {model}")
+                                    ts = confidence_timestamp(task_num)
+                                    print(f"{ts}[{agent_id}] 📡 Model: {model}")
 
                                 elif msg_type == "assistant":
                                     content = msg.get("message", {}).get("content", [])
@@ -1692,42 +1612,62 @@ Do NOT just plan or discuss - actually DO the work."""
                                                 continue
                                             seen_tools.add(tool_id)
 
+                                            update_confidence(task_num, "tool_use")
+                                            ts = confidence_timestamp(task_num)
                                             tool_name = block.get("name", "unknown")
                                             tool_input = block.get("input", {})
 
                                             # Same formatting as _process_stream_output
                                             if tool_name == "Read":
                                                 path = tool_input.get("file_path", "?").split("/")[-1]
-                                                print(f"[{agent_id}] 📖 Reading: {path}")
+                                                print(f"{ts}[{agent_id}] 📖 Reading: {path}")
                                             elif tool_name == "Edit":
                                                 path = tool_input.get("file_path", "?").split("/")[-1]
-                                                print(f"[{agent_id}] ✏️  Editing: {path}")
+                                                print(f"{ts}[{agent_id}] ✏️  Editing: {path}")
                                             elif tool_name == "Write":
                                                 path = tool_input.get("file_path", "?").split("/")[-1]
-                                                print(f"[{agent_id}] 📝 Writing: {path}")
+                                                print(f"{ts}[{agent_id}] 📝 Writing: {path}")
                                             elif tool_name == "Bash":
                                                 cmd = tool_input.get("command", "")[:50]
-                                                print(f"[{agent_id}] 💻 Running: {cmd}...")
+                                                print(f"{ts}[{agent_id}] 💻 Running: {cmd}...")
                                             elif tool_name == "Glob":
-                                                print(f"[{agent_id}] 🔍 Finding: {tool_input.get('pattern', '')}")
+                                                print(f"{ts}[{agent_id}] 🔍 Finding: {tool_input.get('pattern', '')}")
                                             elif tool_name == "Grep":
-                                                print(f"[{agent_id}] 🔎 Searching: {tool_input.get('pattern', '')}")
+                                                print(f"{ts}[{agent_id}] 🔎 Searching: {tool_input.get('pattern', '')}")
                                             else:
-                                                print(f"[{agent_id}] 🔧 {tool_name}")
-
-                                            self.write_swarm_event(session_id, {
-                                                "agent": agent_id,
-                                                "type": "tool_use",
-                                                "message": f"Using {tool_name}"
-                                            })
+                                                print(f"{ts}[{agent_id}] 🔧 {tool_name}")
 
                                         elif block.get("type") == "text":
                                             text = block.get("text", "")
                                             if text:
-                                                print(f"[{agent_id}] {text}", end="", flush=True)
+                                                update_confidence(task_num, "text")
+                                                ts = confidence_timestamp(task_num)
+                                                print(f"{ts}[{agent_id}] {text}", end="", flush=True)
 
                                 elif msg_type == "result":
-                                    print(f"[{agent_id}] ✅ Done")
+                                    ts = confidence_timestamp(task_num)
+                                    print(f"{ts}[{agent_id}] ✅ Done")
+
+                                # Forward to ALL agents - convert output format to input format
+                                # Output: {"type": "assistant", "message": {"content": [...]}}
+                                # Input:  {"type": "user", "message": {"role": "user", "content": "..."}}
+                                if msg_type == "assistant":
+                                    # Convert Anthropic content array to text for forwarding
+                                    content = msg.get("message", {}).get("content", [])
+                                    converted = self._convert_output_to_input(agent_id, content)
+                                    if converted:
+                                        context_msg = {
+                                            "type": "user",
+                                            "message": {"role": "user", "content": converted}
+                                        }
+                                        context_line = json.dumps(context_msg) + "\n"
+                                        for other_num, other_info in active.items():
+                                            if other_num != task_num:
+                                                try:
+                                                    other_info["process"].stdin.write(context_line)
+                                                    other_info["process"].stdin.flush()
+                                                except (BrokenPipeError, OSError):
+                                                    pass
 
                             except json.JSONDecodeError:
                                 pass
@@ -1741,6 +1681,34 @@ Do NOT just plan or discuss - actually DO the work."""
         print(f"🐝 Swarm complete: {len(results)} tasks finished")
 
         return results
+
+    def _convert_output_to_input(self, agent_id: str, content: List[dict]) -> Optional[str]:
+        """
+        Convert Anthropic output content to input format for interleaving.
+
+        Takes content array from assistant message and converts to string
+        that can be sent as user message content to other agents.
+        """
+        parts = []
+
+        for block in content:
+            block_type = block.get("type")
+            if block_type == "text":
+                text = block.get("text", "")
+                if text:
+                    parts.append(text)
+            elif block_type == "tool_use":
+                # Format tool use as JSON for other agents to parse
+                tool_info = {
+                    "tool": block.get("name"),
+                    "id": block.get("id"),
+                    "input": block.get("input", {})
+                }
+                parts.append(f"[TOOL_USE: {json.dumps(tool_info)}]")
+
+        if parts:
+            return f"[{agent_id}] " + " ".join(parts)
+        return None
 
     def run_turbo_mode(self, tasks: List[dict], base_context: str = "") -> Dict[str, Any]:
         """
@@ -1930,28 +1898,36 @@ The "ACTIONS:" header is required (exact spelling with colon) - it triggers the 
 
         cmd = [
             "claude",
-            "-p", prompt,
             "--model", "claude-sonnet-4-5",
             "--append-system-prompt", menu_prompt,
             "--verbose",
-            "--include-partial-messages",
             "--input-format", "stream-json",
             "--output-format", "stream-json",
-            "--dangerously-skip-permissions"  # Auto-approve for RHSI loops
+            "--permission-prompt-tool", "mcp__palace__handle_permission",
         ]
 
         print("🏛️  Palace - Invoking Claude...")
         print()
 
         try:
-            # Stream output and parse JSON for succinct display
+            # Bidirectional streaming JSON
             process = subprocess.Popen(
                 cmd,
                 cwd=self.project_root,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True
             )
+
+            # Send initial prompt via streaming JSON
+            initial_message = {
+                "type": "user",
+                "message": {"role": "user", "content": prompt}
+            }
+            process.stdin.write(json.dumps(initial_message) + "\n")
+            process.stdin.flush()
+            process.stdin.close()  # Signal end of input
 
             selected_action = self._process_stream_output(process.stdout, process)
             process.wait()
@@ -3351,24 +3327,26 @@ Based on the safety guidelines, should this operation be approved?"""
                 json_start = response_text.find("{")
                 json_end = response_text.rfind("}") + 1
                 result = json.loads(response_text[json_start:json_end])
-                return {
-                    "approved": result.get("approved", True),
-                    "reason": result.get("reason", "Assessed by Haiku")
-                }
+                approved = result.get("approved", True)
+                reason = result.get("reason", "Assessed by Haiku")
+                # Return Claude Code expected format
+                if approved:
+                    return {"behavior": "allow", "updatedInput": tool_input}
+                else:
+                    return {"behavior": "deny", "message": reason}
 
             # Fallback: approve if we can't parse
-            return {"approved": True, "reason": "Could not parse safety response"}
+            return {"behavior": "allow", "updatedInput": tool_input}
 
         except Exception as e:
             # On any error, approve but log the issue
-            return {"approved": True, "reason": f"Safety check error: {str(e)[:100]}"}
+            return {"behavior": "allow", "updatedInput": tool_input}
 
     @mcp.tool()
     def handle_permission(
         tool_name: str = "",
         input: dict = None,
-        tool_use_id: str = "",
-        **kwargs
+        tool_use_id: str = ""
     ) -> dict:
         """
         Handle permission requests from Claude during RHSI loops.
@@ -3377,28 +3355,28 @@ Based on the safety guidelines, should this operation be approved?"""
         Uses Haiku to assess safety based on the trainable command-safety skill.
 
         Returns:
-            dict with 'approved' (bool) and optional 'reason' (str)
+            dict with 'behavior' ("allow"/"deny") and 'updatedInput' or 'message'
         """
         # Initialize Palace instance to access logging
         palace = Palace()
+        tool_input = input or {}
 
         # Log the permission request
         request_data = {
             "tool_name": tool_name,
-            "input": input or {},
-            "tool_use_id": tool_use_id,
-            **kwargs
+            "input": tool_input,
+            "tool_use_id": tool_use_id
         }
         palace.log_action("permission_request", {"request": request_data})
 
         # Assess safety using Haiku and the command-safety skill
-        result = _assess_permission_safety(tool_name, input or {})
+        result = _assess_permission_safety(tool_name, tool_input)
 
         # Log the decision
         palace.log_action("permission_decision", {
             "tool_name": tool_name,
-            "approved": result.get("approved"),
-            "reason": result.get("reason")
+            "behavior": result.get("behavior"),
+            "message": result.get("message", "")
         })
 
         return result
