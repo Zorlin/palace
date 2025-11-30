@@ -21,6 +21,20 @@ This principle is encoded into Palace's DNA and applies to:
 
 **Test coverage is not optional - it's mandatory.**
 
+## 🥈 Golden Rule #2: Don't Be Prescriptive
+
+**OFFER OPTIONS, don't dictate solutions.**
+
+- Present MULTIPLE valid paths forward, not just one "best" answer
+- The user decides what to do - you suggest possibilities
+- Never say "you should do X" - say "options include X, Y, Z"
+- Don't restrict outputs artificially (number of items, word counts, etc.)
+- Don't add arbitrary rules or constraints the user didn't ask for
+- When suggesting actions, give MANY options across different categories
+- Let the user steer - you're a tool, not a boss
+
+**The user is in control. Always.**
+
 ## MCP Server Integration
 
 Palace is both a CLI tool AND an MCP server, providing tools that Claude can call directly.

@@ -780,20 +780,11 @@ The "ACTIONS:" header is required (exact spelling with colon) - it triggers the 
         # Initial prompt for first iteration
         initial_prompt = """Analyze this project and suggest possible next actions.
 
-Consider:
-1. What exists already (check the files context)
-2. What's in progress (check git status and recent history)
-3. What could come next in a logical development flow
-4. The project's SPEC.md and ROADMAP.md if they exist
+Consider what exists, what's in progress, and what could come next.
+Check SPEC.md and ROADMAP.md if they exist.
 
-Provide MULTIPLE options - there may be many valid paths forward. Include:
-- Quick wins and small improvements
-- Larger features or refactors
-- Testing, documentation, cleanup tasks
-- Any blockers or issues to address
-
-Be concrete and actionable. This is part of a Recursive Hierarchical Self Improvement loop.
-The user will select which action(s) to execute from your suggestions."""
+Provide as many options as you see fit - there may be many valid paths forward.
+Be concrete and actionable. The user will select which action(s) to execute."""
 
         current_prompt = initial_prompt
 
