@@ -146,7 +146,7 @@ class Palace:
             "--include-partial-messages",
             "--input-format", "stream-json",
             "--output-format", "stream-json",
-            "--permission-prompt-tool", "handle_permission"
+            "--permission-prompt-tool", "mcp__palace__handle_permission"
         ]
 
         print("🏛️  Palace - Invoking Claude Code CLI...")
@@ -530,8 +530,12 @@ if __name__ == "__main__":
 # ============================================================================
 # MCP Server Integration
 # ============================================================================
-# When Palace is installed as an MCP server (uv run mcp install palace.py),
-# this code provides tools that Claude can call directly.
+# Palace is an MCP server providing the handle_permission tool.
+#
+# Install globally with:
+#   claude mcp add palace --scope user \
+#     /path/to/palace/.venv/bin/python \
+#     /path/to/palace/palace.py
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -559,38 +563,6 @@ try:
         # For now, approve all requests
         # TODO: Add smart permission logic based on learning from history
         return {"approved": True}
-
-    @mcp.tool()
-    def get_project_context() -> dict:
-        """
-        Get lightweight context about the current project.
-
-        Returns project state including files, git status, and recent history.
-        Optimized for minimal token usage (~700-1300 tokens).
-        """
-        palace = Palace()
-        context = palace.gather_context()
-
-        # Log that context was requested
-        palace.log_action("context_requested", {"size": len(json.dumps(context))})
-
-        return context
-
-    @mcp.tool()
-    def log_palace_action(action: str, details: dict = None) -> str:
-        """
-        Log an action to Palace history for RHSI learning.
-
-        Args:
-            action: Name of the action being logged
-            details: Optional dictionary with additional details
-
-        Returns:
-            Confirmation message
-        """
-        palace = Palace()
-        palace.log_action(action, details or {})
-        return f"Logged action: {action}"
 
 except ImportError:
     # MCP not installed - server functionality unavailable

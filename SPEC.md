@@ -29,3 +29,5 @@ Creating a project:
 
 Which will be installable with `python3 palace.py install`
 Pay particularly close attention to "pal next" as a basic command (python3 palace.py next in our initial version) - looped correctly, this will unlock RHSI quickly."
+
+# Rules

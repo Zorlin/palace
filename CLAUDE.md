@@ -38,11 +38,19 @@ cd /path/to/palace
 uv run mcp install palace.py
 ```
 
-This registers Palace with Claude Desktop and makes the following tools available:
+This registers Palace with Claude Desktop.
 
-1. **`handle_permission`** - Handles permission requests during RHSI loops
-2. **`get_project_context`** - Returns lightweight project context (~700-1300 tokens)
-3. **`log_palace_action`** - Logs actions to Palace history for learning
+### For Claude Code CLI: Global MCP Registration
+
+To add Palace to Claude Code CLI globally (not just Claude Desktop):
+
+```bash
+claude mcp add palace --scope user \
+  /path/to/palace/.venv/bin/python \
+  /path/to/palace/palace.py
+```
+
+This registers Palace in `~/.claude.json` and makes the `handle_permission` tool available to Claude Code CLI when using `--permission-prompt-tool`.
 
 ### How It Works
 
@@ -61,10 +69,10 @@ When Palace runs `claude -p` in interactive mode, it passes:
 
 ```bash
 claude -p "prompt" \
-  --permission-prompt-tool "handle_permission"
+  --permission-prompt-tool "mcp__palace__handle_permission"
 ```
 
-This tells Claude to use Palace's `handle_permission` MCP tool for all permission requests.
+This tells Claude to use Palace's `mcp__palace__handle_permission` MCP tool for all permission requests.
 
 ### MCP Tools Available
 
@@ -72,18 +80,6 @@ This tells Claude to use Palace's `handle_permission` MCP tool for all permissio
 - **Purpose**: Handle permission requests from Claude
 - **Input**: Permission request dictionary
 - **Output**: `{"approved": bool, "reason": str (optional)}`
-- **Logs to**: `.palace/history.jsonl`
-
-#### `get_project_context() -> dict`
-- **Purpose**: Get lightweight project state
-- **Output**: Context dict with files, git status, history
-- **Token overhead**: ~700-1300 tokens
-- **Logs to**: `.palace/history.jsonl`
-
-#### `log_palace_action(action: str, details: dict) -> str`
-- **Purpose**: Log actions for RHSI learning
-- **Input**: Action name and optional details
-- **Output**: Confirmation message
 - **Logs to**: `.palace/history.jsonl`
 
 ### Learning from Permissions
