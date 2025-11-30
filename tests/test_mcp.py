@@ -223,17 +223,29 @@ Respond with JSON: {"approved": true, "reason": "test"}""")
 
         yield palace
 
-    def test_safety_assessment_without_skill(self, tmp_path):
-        """Without skill file, should approve with explanation"""
+    def test_safety_assessment_creates_default_skill(self, tmp_path):
+        """Without skill file, should create default and use it"""
         os.chdir(tmp_path)
         palace = Palace()
         palace.ensure_palace_dir()
 
         from palace import _assess_permission_safety
 
-        result = _assess_permission_safety("Read", {"file_path": "/test.py"})
+        skill_path = palace.palace_dir / "skills" / "command-safety.md"
+        assert not skill_path.exists()
+
+        # Mock anthropic to avoid real API call
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(text='{"approved": true, "reason": "Safe operation"}')]
+
+        with patch('anthropic.Anthropic') as mock_client:
+            mock_client.return_value.messages.create.return_value = mock_response
+            result = _assess_permission_safety("Read", {"file_path": "/test.py"})
+
+        # Skill file should now exist
+        assert skill_path.exists()
+        assert "THINK TWICE" in skill_path.read_text()
         assert result["approved"] is True
-        assert "No command-safety skill" in result["reason"]
 
     def test_safety_assessment_with_skill(self, temp_palace_with_skill):
         """With skill file, should call Haiku (mocked)"""

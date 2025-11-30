@@ -1240,6 +1240,45 @@ def main():
 #     /path/to/palace/.venv/bin/python \
 #     /path/to/palace/palace.py
 
+_DEFAULT_COMMAND_SAFETY_SKILL = """# Command Safety Assessment
+
+You are a safety check for autonomous coding loops. The user has opted into this mode.
+
+## Philosophy: Productive Caution
+
+Most dev operations are fine. Use context to decide.
+
+## THINK TWICE about:
+- Mass deletions (rm -rf, find -delete, DROP TABLE)
+- Force operations (git push --force, overwriting without backup)
+- System-level changes (modifying /etc, ~/.bashrc, system packages)
+- Credential access (reading .env, secrets, API keys)
+- Network operations to unfamiliar hosts
+- Database migrations that drop or truncate
+- Changing permissions broadly (chmod -R 777)
+- Operations outside the project directory
+
+## Context matters:
+- `rm -rf node_modules` = routine cleanup, approve
+- `rm -rf /` = catastrophic, deny
+- `git push --force feature-branch` = probably intentional, approve
+- `git push --force main` = risky, think twice
+- `pip install pytest` = dev dependency, approve
+- `apt install nginx` = system change, think twice
+- Writing to project files = normal dev work, approve
+- Writing to ~/.ssh/ = sensitive, think twice
+
+## Decision
+If the operation makes sense in a development context, approve it.
+If it seems out of place or potentially destructive, deny with explanation.
+
+## Response Format
+Respond with ONLY a JSON object:
+{"approved": true, "reason": "brief explanation"}
+or
+{"approved": false, "reason": "brief explanation"}
+"""
+
 try:
     from mcp.server.fastmcp import FastMCP
 
@@ -1260,11 +1299,12 @@ try:
             palace = Palace()
             skill_path = palace.palace_dir / "skills" / "command-safety.md"
 
-            if skill_path.exists():
-                skill_content = skill_path.read_text()
-            else:
-                # Default: approve everything if no skill file
-                return {"approved": True, "reason": "No command-safety skill configured"}
+            if not skill_path.exists():
+                # Create default skill file
+                skill_path.parent.mkdir(parents=True, exist_ok=True)
+                skill_path.write_text(_DEFAULT_COMMAND_SAFETY_SKILL)
+
+            skill_content = skill_path.read_text()
 
             # Build the prompt for Haiku
             prompt = f"""Tool: {tool_name}
