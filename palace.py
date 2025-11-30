@@ -141,6 +141,10 @@ class Palace:
         cmd = [
             "claude",
             "-p", prompt,
+            "--verbose",
+            "--system-prompt",
+            "--include-partial-messages",
+            "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--dangerously-skip-permissions"  # Auto-approve for RHSI loops
         ]
