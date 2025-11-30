@@ -351,3 +351,92 @@ class TestActionSelectionParsing:
         """Parse selection with spaces"""
         selected = temp_palace.parse_action_selection("1, 2, 3", sample_actions)
         assert len(selected) == 3
+
+    def test_parse_space_separated_numbers(self, temp_palace, sample_actions):
+        """Parse space-separated numbers (no commas)"""
+        selected = temp_palace.parse_action_selection("1 2 3", sample_actions)
+        assert len(selected) == 3
+        assert selected[0]["label"] == "Write tests"
+        assert selected[1]["label"] == "Run build"
+        assert selected[2]["label"] == "Deploy"
+
+    def test_parse_with_parenthetical_modifiers(self, temp_palace, sample_actions):
+        """Parse selection with parenthetical modifiers"""
+        selected = temp_palace.parse_action_selection("1 2 3 (use the palace-skills repo as base)", sample_actions)
+        assert len(selected) == 3
+        assert "_modifiers" in selected[0]
+        assert "use the palace-skills repo as base" in selected[0]["_modifiers"]
+        # Check all actions have the modifier
+        for action in selected:
+            assert "_modifiers" in action
+            assert "use the palace-skills repo as base" in action["_modifiers"]
+
+    def test_parse_with_follow_modifier(self, temp_palace, sample_actions):
+        """Parse 'follow' modifier pattern"""
+        selected = temp_palace.parse_action_selection("1 2 follow /path/to/guide", sample_actions)
+        assert len(selected) == 2
+        assert "_modifiers" in selected[0]
+        assert "/path/to/guide" in selected[0]["_modifiers"]
+
+    def test_parse_with_use_modifier(self, temp_palace, sample_actions):
+        """Parse 'use' modifier pattern"""
+        selected = temp_palace.parse_action_selection("3 use TypeScript", sample_actions)
+        assert len(selected) == 1
+        assert selected[0]["label"] == "Deploy"
+        assert "_modifiers" in selected[0]
+        assert "TypeScript" in selected[0]["_modifiers"]
+
+    def test_parse_with_without_modifier(self, temp_palace, sample_actions):
+        """Parse 'without' modifier pattern"""
+        selected = temp_palace.parse_action_selection("2 without breaking changes", sample_actions)
+        assert len(selected) == 1
+        assert "_modifiers" in selected[0]
+        assert "breaking changes" in selected[0]["_modifiers"]
+
+    def test_parse_range_with_spaces(self, temp_palace, sample_actions):
+        """Parse range with spaces around dash"""
+        selected = temp_palace.parse_action_selection("1 - 3", sample_actions)
+        assert len(selected) == 3
+        assert selected[0]["label"] == "Write tests"
+        assert selected[2]["label"] == "Deploy"
+
+    def test_parse_complex_mixed_format(self, temp_palace, sample_actions):
+        """Parse complex mixed format: ranges, numbers, and modifiers"""
+        selected = temp_palace.parse_action_selection("1-2, 4 5 (follow TDD)", sample_actions)
+        assert len(selected) == 4
+        assert selected[0]["label"] == "Write tests"
+        assert selected[1]["label"] == "Run build"
+        assert selected[2]["label"] == "Update docs"
+        assert selected[3]["label"] == "Commit changes"
+        # Check modifiers are attached
+        for action in selected:
+            assert "_modifiers" in action
+            assert "follow TDD" in action["_modifiers"]
+
+    def test_parse_custom_task(self, temp_palace, sample_actions):
+        """Parse custom task (pure text, no numbers)"""
+        selected = temp_palace.parse_action_selection("refactor the authentication system", sample_actions)
+        assert len(selected) == 1
+        assert selected[0]["label"] == "refactor the authentication system"
+        assert selected[0]["_custom"] is True
+
+    def test_parse_multiple_modifiers(self, temp_palace, sample_actions):
+        """Parse multiple modifier patterns"""
+        selected = temp_palace.parse_action_selection("1 2 (base: palace-skills) but skip tests", sample_actions)
+        assert len(selected) == 2
+        assert "_modifiers" in selected[0]
+        # Should have modifiers (may extract multiple from complex patterns)
+        assert len(selected[0]["_modifiers"]) >= 2
+        assert "base: palace-skills" in selected[0]["_modifiers"]
+        # Check that some form of "skip" modifier is captured
+        assert any("skip" in mod.lower() for mod in selected[0]["_modifiers"])
+
+    def test_parse_action_copies_dont_mutate_original(self, temp_palace, sample_actions):
+        """Ensure parsing creates copies and doesn't mutate original actions"""
+        original_count = len([a for a in sample_actions if "_modifiers" in a])
+        selected = temp_palace.parse_action_selection("1 2 (with modifier)", sample_actions)
+        # Original actions should not have modifiers
+        after_count = len([a for a in sample_actions if "_modifiers" in a])
+        assert original_count == after_count
+        # But selected should have modifiers
+        assert all("_modifiers" in a for a in selected)
