@@ -47,7 +47,7 @@ def is_interactive() -> bool:
 class Palace:
     """Palace orchestration layer - coordinates Claude invocations"""
 
-    def __init__(self, strict_mode: bool = True, force_claude: bool = False, force_glm: bool = False) -> None:
+    def __init__(self, strict_mode: bool = True, force_claude: bool = False, force_glm: bool = False, force_opus: bool = False) -> None:
         self.project_root = Path.cwd()
         self.palace_dir = self.project_root / ".palace"
         self.config_file = self.palace_dir / "config.json"
@@ -55,6 +55,7 @@ class Palace:
         self.modified_files = set()  # Track files modified during execution
         self.force_claude = force_claude  # Use Claude even in turbo mode
         self.force_glm = force_glm  # Use GLM even in normal mode
+        self.force_opus = force_opus  # Force Opus model for all tasks
 
     def ensure_palace_dir(self) -> None:
         """Ensure .palace directory exists"""
@@ -1618,8 +1619,13 @@ Reply with JSON only:
 
             # TURBO MODE: Default to GLM-4.6 via Z.ai for cheap parallel execution
             # Override with --claude flag to use Claude models for higher quality
+            # Override with --opus flag to force Opus for all tasks
             # The model_alias (haiku/sonnet/opus) indicates ranked effort level
-            if self.force_claude:
+            if self.force_opus:
+                # Force Opus for all tasks (maximum quality, maximum cost)
+                provider = "anthropic"
+                model = "claude-opus-4-5-20251101"
+            elif self.force_claude:
                 # Use Claude models via Anthropic (higher cost, higher quality)
                 provider = "anthropic"
                 model_map = {
@@ -2022,7 +2028,9 @@ This tells Palace to stop that agent."""
         Returns results from all swarm agents.
         """
         print("\n🚀 TURBO MODE ACTIVATED")
-        if self.force_claude:
+        if self.force_opus:
+            print("🔥 Using Claude Opus for ALL tasks (maximum quality, maximum cost)")
+        elif self.force_claude:
             print("💎 Using Claude models (high quality, higher cost)")
         else:
             print("💰 Using GLM-4.6 (cost-efficient, fast)")
@@ -2206,7 +2214,11 @@ ACTIONS:
 The "ACTIONS:" header is required (exact spelling with colon) - it triggers the interactive menu system."""
 
         # Determine which model to use
-        if self.force_glm:
+        if self.force_opus:
+            # Force Opus for all tasks (highest quality, highest cost)
+            model = "claude-opus-4-5-20251101"
+            env = None  # Use default environment
+        elif self.force_glm:
             # Use GLM for cost savings (requires Z.ai API key)
             model = "glm-4.6"
             # Set up environment for Z.ai
@@ -2233,7 +2245,9 @@ The "ACTIONS:" header is required (exact spelling with colon) - it triggers the 
         print("🏛️  Palace - Invoking Claude...")
         if not self.strict_mode:
             print("⚡ YOLO mode active - test validation disabled")
-        if self.force_glm:
+        if self.force_opus:
+            print("🔥 OPUS mode active - using Claude Opus for maximum quality")
+        elif self.force_glm:
             print("💰 GLM mode active - using GLM-4.6 for cost savings")
         print()
 
@@ -3700,6 +3714,8 @@ def main():
                         help='Use Claude models even in turbo mode (higher quality, higher cost)')
     parser.add_argument('--glm', action='store_true',
                         help='Use GLM model even in normal mode (lower cost, faster)')
+    parser.add_argument('--opus', action='store_true',
+                        help='Force Opus model for all tasks (maximum quality, maximum cost)')
 
     subparsers = parser.add_subparsers(dest='command', help='Commands')
 
@@ -3717,6 +3733,8 @@ def main():
                              help='Use Claude models even in turbo mode (higher quality, higher cost)')
     parser_next.add_argument('--glm', action='store_true',
                              help='Use GLM model even in normal mode (lower cost, faster)')
+    parser_next.add_argument('--opus', action='store_true',
+                             help='Force Opus model for all tasks (maximum quality, maximum cost)')
 
     parser_new = subparsers.add_parser('new', help='Ask Claude to create a new project')
     parser_new.add_argument('name', nargs='?', help='Project name')
@@ -3724,18 +3742,24 @@ def main():
                             help='Use Claude models (higher quality, higher cost)')
     parser_new.add_argument('--glm', action='store_true',
                             help='Use GLM model (lower cost, faster)')
+    parser_new.add_argument('--opus', action='store_true',
+                            help='Force Opus model (maximum quality, maximum cost)')
 
     parser_scaffold = subparsers.add_parser('scaffold', help='Ask Claude to scaffold the project')
     parser_scaffold.add_argument('--claude', action='store_true',
                                  help='Use Claude models (higher quality, higher cost)')
     parser_scaffold.add_argument('--glm', action='store_true',
                                  help='Use GLM model (lower cost, faster)')
+    parser_scaffold.add_argument('--opus', action='store_true',
+                                 help='Force Opus model (maximum quality, maximum cost)')
 
     parser_test = subparsers.add_parser('test', help='Ask Claude to run tests')
     parser_test.add_argument('--claude', action='store_true',
                              help='Use Claude models (higher quality, higher cost)')
     parser_test.add_argument('--glm', action='store_true',
                              help='Use GLM model (lower cost, faster)')
+    parser_test.add_argument('--opus', action='store_true',
+                             help='Force Opus model (maximum quality, maximum cost)')
 
     # Utility commands
     subparsers.add_parser('install', help='Install Palace commands to Claude Code')
@@ -3772,8 +3796,9 @@ def main():
     # Determine provider overrides
     force_claude = getattr(args, 'claude', False)
     force_glm = getattr(args, 'glm', False)
+    force_opus = getattr(args, 'opus', False)
 
-    palace = Palace(strict_mode=strict_mode, force_claude=force_claude, force_glm=force_glm)
+    palace = Palace(strict_mode=strict_mode, force_claude=force_claude, force_glm=force_glm, force_opus=force_opus)
 
     commands = {
         'next': palace.cmd_next,
