@@ -43,7 +43,7 @@ Each iteration builds on the last. Palace remembers what you've done and suggest
 
 ```bash
 # Clone and install
-git clone https://github.com/yourusername/palace.git
+git clone git@github.com:Zorlin/palace.git
 cd palace
 
 # Install dependencies (using uv recommended)
