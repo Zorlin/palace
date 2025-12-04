@@ -306,10 +306,33 @@ Total overhead: ~1-2KB of context, leaving 99%+ for Claude to work.
 
 ## MCP Integration
 
-Palace works as an MCP server, providing permission handling:
+Palace requires MCP server registration to handle permissions during RHSI loops. **This is required for `pal next` to work properly.**
+
+### Option 1: Manual Configuration (Recommended)
+
+Add Palace to your `~/.claude.json` under the `mcpServers` key:
+
+```json
+{
+  "mcpServers": {
+    "palace": {
+      "type": "stdio",
+      "command": "/path/to/palace/.venv/bin/python",
+      "args": [
+        "/path/to/palace/palace.py"
+      ],
+      "env": {}
+    }
+  }
+}
+```
+
+Replace `/path/to/palace` with your actual Palace installation path.
+
+### Option 2: CLI Registration
 
 ```bash
-# Install as MCP server
+# Install as MCP server (Claude Desktop)
 uv run mcp install palace.py
 
 # For Claude Code CLI
@@ -317,6 +340,16 @@ claude mcp add palace --scope user \
   $(pwd)/.venv/bin/python \
   $(pwd)/palace.py
 ```
+
+### Troubleshooting
+
+If `pal next` shows no output or immediately displays a prompt without any Claude response, the MCP server is likely not configured. Verify by checking:
+
+```bash
+jq '.mcpServers.palace' ~/.claude.json
+```
+
+If this returns `null`, Palace MCP is not registered.
 
 Palace's `handle_permission` tool uses Haiku to assess safety of commands during RHSI loops.
 

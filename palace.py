@@ -1370,10 +1370,13 @@ Return JSON only:
                 try:
                     result = json.loads(json_str)
                 except json.JSONDecodeError:
-                    # Try fixing trailing commas
                     import re
+                    # Fix trailing commas
                     json_str = re.sub(r',\s*}', '}', json_str)
                     json_str = re.sub(r',\s*]', ']', json_str)
+                    # Fix single quotes to double quotes (common LLM issue)
+                    json_str = re.sub(r"'([^']*)':", r'"\1":', json_str)
+                    json_str = re.sub(r":\s*'([^']*)'", r': "\1"', json_str)
                     result = json.loads(json_str)
 
                 assignments = {}
@@ -2202,16 +2205,40 @@ This tells Palace to stop that agent."""
         - selected_actions: list of action dicts if user selected any, None otherwise
         """
         # Menu format instructions for action selection
-        menu_prompt = """IMPORTANT: End your response with suggested next actions using this EXACT format:
+        menu_prompt = """IMPORTANT: End your response with an ACTIONS: menu. The format MUST be EXACTLY like this:
 
 ACTIONS:
-1. First option with description
-   Additional context if needed.
+1. Short action label here
+   Description line indented exactly 3 spaces. Keep it to one or two lines.
 
-2. Second option
-   More details here.
+2. Another action label
+   Description for this action.
 
-The "ACTIONS:" header is required (exact spelling with colon) - it triggers the interactive menu system."""
+3. Third option if needed
+   a. Sub-option when there are variations
+   b. Another sub-option
+
+CORRECT FORMAT RULES:
+- "ACTIONS:" header on its own line (triggers the menu parser)
+- Number followed by period and space: "1. "
+- Action label on same line as number
+- Description on NEXT line, indented EXACTLY 3 spaces
+- ONE blank line between actions
+- Sub-actions use lowercase letters: "   a. "
+
+WRONG (DO NOT DO THIS):
+---
+8. Action Name
+
+Description on separate line with blank above it.
+---
+
+This is WRONG because:
+- Uses "---" separators (breaks parser)
+- Blank line between label and description (breaks parser)
+- No indentation on description (breaks parser)
+
+The parser regex is: ^(\\d+)\\.\\s+(.+)$ for labels, then 3-space indent for descriptions."""
 
         # Determine which model to use
         if self.force_opus:
@@ -3158,7 +3185,7 @@ Ask questions if needed to clarify the project type or goals."""
 
         # If no specific tests found, run all tests (safer in strict mode)
         if not test_files and modified_files:
-            all_tests = list(tests_dir.glob("**test_*.py"))
+            all_tests = list(tests_dir.glob("**/test_*.py"))
             test_files = {str(t.relative_to(self.project_root)) for t in all_tests}
 
         return test_files
@@ -3877,7 +3904,11 @@ try:
 
     def _assess_permission_safety(tool_name: str, tool_input: dict) -> dict:
         """
-        Use Haiku to assess whether a permission request is safe.
+        Use GLM-4.6 via Z.ai to assess whether a permission request is safe.
+
+        Routes through Z.ai instead of Anthropic directly to avoid API conflicts
+        when Claude Code makes parallel tool calls. This works around the
+        "tool_use ids must be unique" error caused by concurrent Anthropic API calls.
 
         Loads the command-safety skill from .palace/skills/command-safety.md
         which users can customize to train the safety assessment.
@@ -3896,16 +3927,28 @@ try:
 
             skill_content = skill_path.read_text()
 
-            # Build the prompt for Haiku
+            # Build the prompt
             prompt = f"""Tool: {tool_name}
 Input: {json.dumps(tool_input, indent=2)}
 
 Based on the safety guidelines, should this operation be approved?"""
 
-            # Call Haiku for fast safety assessment
-            client = anthropic.Anthropic()
+            # Use GLM-4.6 via Z.ai to avoid Anthropic API conflicts
+            # This prevents "tool_use ids must be unique" errors from concurrent API calls
+            zai_key = os.environ.get("ZAI_API_KEY", "")
+            if zai_key:
+                client = anthropic.Anthropic(
+                    api_key=zai_key,
+                    base_url="https://api.z.ai/api/anthropic"
+                )
+                model = "glm-4.6"
+            else:
+                # Fallback to Anthropic if no Z.ai key (may still cause issues)
+                client = anthropic.Anthropic()
+                model = "claude-haiku-4-5"
+
             response = client.messages.create(
-                model="claude-haiku-4-5",
+                model=model,
                 max_tokens=256,
                 system=skill_content,
                 messages=[{"role": "user", "content": prompt}]
@@ -3920,7 +3963,7 @@ Based on the safety guidelines, should this operation be approved?"""
                 json_end = response_text.rfind("}") + 1
                 result = json.loads(response_text[json_start:json_end])
                 approved = result.get("approved", True)
-                reason = result.get("reason", "Assessed by Haiku")
+                reason = result.get("reason", "Assessed by safety check")
                 # Return Claude Code expected format
                 if approved:
                     return {"behavior": "allow", "updatedInput": tool_input}
