@@ -1,6 +1,9 @@
-//! Palace Context Cache
+//! Palace Daemon Library
 //!
-//! High-performance context management for Palace swarm consciousness.
+//! High-performance core for Palace:
+//! - API Translator (Anthropic ↔ OpenAI format)
+//! - Context Cache (swarm consciousness)
+//! - Agent Coordination
 //!
 //! Key design principles:
 //! - Active context IDs stay in L0 cache (just integers)
@@ -15,6 +18,12 @@
 //!
 //! This gets parsed and applied to the active set atomically.
 
+pub mod translator;
+pub mod delta;
+pub mod block;
+pub mod timeline;
+pub mod classifier;
+
 use dashmap::DashMap;
 use memmap2::Mmap;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -26,11 +35,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
-
-pub mod delta;
-pub mod block;
-pub mod timeline;
-pub mod classifier;
 
 /// A context block ID - just a u32 for L0 cache efficiency
 pub type BlockId = u32;
@@ -298,8 +302,6 @@ impl ContextCache {
     }
 
     /// Get active content filtered by channels
-    /// If channels is empty, returns all active context
-    /// If channels is non-empty, only returns blocks that have ANY of the specified channels
     pub fn get_active_context_filtered(&self, channels: &[&str]) -> String {
         let ids = self.get_active_ids();
         let mut context = String::new();
@@ -358,7 +360,6 @@ impl ContextCache {
     }
 
     /// Generate classifier input - just summaries with IDs
-    /// Format: [ID]* TYPE: summary [channel1,channel2]
     pub fn get_classifier_input(&self) -> String {
         let mut input = String::new();
 
@@ -420,7 +421,6 @@ impl std::error::Error for DeltaError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn test_register_and_activate() {

@@ -1,0 +1,61 @@
+[package]
+name = "palace-daemon"
+version = "0.2.0"
+edition = "2021"
+description = "High-performance Palace daemon: API translation, context cache, swarm coordination"
+license = "MIT"
+
+[dependencies]
+# Web framework
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client for backend APIs (Mistral, Anthropic, etc.)
+reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest-eventsource = "0.6"
+
+# Fast serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async streams
+futures = "0.3"
+async-stream = "0.3"
+tokio-stream = "0.1"
+
+# Filesystem watching (for context cache)
+notify = { version = "7", features = ["serde"] }
+
+# Memory-mapped files for content
+memmap2 = "0.9"
+
+# Fast concurrent hashmap
+dashmap = "6"
+
+# Faster mutexes
+parking_lot = "0.12"
+
+# Tracing/logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# UUID for request IDs
+uuid = { version = "1", features = ["v4"] }
+
+# Environment variables
+dotenvy = "0.15"
+
+# Platform paths
+dirs = "5"
+
+[[bin]]
+name = "palace-daemon"
+path = "src/bin/daemon.rs"
+
+[lib]
+name = "palace_daemon"
+path = "src/lib.rs"
