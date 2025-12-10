@@ -63,6 +63,7 @@ WATCHD_STATUS_DIR = _RUNTIME_DIR / "build-status"
 WATCHD_CREDS_FILE = Path.home() / ".palace" / "build-client.env"
 TRANSLATOR_PID_FILE = _RUNTIME_DIR / "translator.pid"
 TRANSLATOR_CONFIG_FILE = _RUNTIME_DIR / "translator.json"
+ROUTER_SETTINGS_FILE = Path("/etc/palace/router-settings.json")  # System-wide, persists across restarts
 
 
 class TranslatorHandler(BaseHTTPRequestHandler):
@@ -72,6 +73,8 @@ class TranslatorHandler(BaseHTTPRequestHandler):
     Accepts requests in Anthropic format at /v1/messages
     Forwards to configured backend (Mistral API or Ollama) in OpenAI format
     Translates response back to Anthropic format
+
+    Multi-Model Router: Parses @mentions to route to multiple backends.
     """
 
     # Class-level config set by daemon startup
@@ -82,12 +85,867 @@ class TranslatorHandler(BaseHTTPRequestHandler):
     # Tool call limit to prevent infinite loops
     MAX_TOOL_CALLS = 15
 
+    # Model-to-model mention chain limit (default 3)
+    mention_chain_limit = 3
+
+    # Streaming mode: "off", "on" (paragraph), "chunked" (model-controlled)
+    streaming_mode = "on"
+
+    # Routing strategy: "transparent", "private", "strategic"
+    routing_strategy = "transparent"
+
+    # Context cache manager (optional - gracefully degrades if daemon not running)
+    context_manager = None
+
+    # Agent daemon URL (for swarm coordination)
+    agent_daemon_url = "http://127.0.0.1:19850"
+    agent_daemon_available = False
+    current_agent_id = None  # This agent's ID in the swarm
+    parent_agent_id = None   # Parent agent (if this is a child)
+
+    @classmethod
+    def init_agent_daemon(cls):
+        """Initialize connection to agent daemon. Called once on startup."""
+        try:
+            response = requests.get(f"{cls.agent_daemon_url}/api/state", timeout=1)
+            if response.status_code == 200:
+                cls.agent_daemon_available = True
+                print("[Translator] Agent daemon connected!")
+            else:
+                print("[Translator] Agent daemon not responding")
+        except Exception:
+            print("[Translator] Agent daemon not available - swarm coordination disabled")
+            cls.agent_daemon_available = False
+
+    @classmethod
+    def register_as_agent(cls, task: str, model: str, parent_id: str = None):
+        """Register this Palace instance as an agent in the swarm."""
+        if not cls.agent_daemon_available:
+            return None
+        try:
+            response = requests.post(
+                f"{cls.agent_daemon_url}/api/spawn",
+                json={"model": model, "task": task, "parent": parent_id},
+                timeout=5
+            )
+            if response.status_code == 200:
+                agent = response.json()
+                cls.current_agent_id = agent["id"]
+                cls.parent_agent_id = parent_id
+                logging.info(f"[SWARM] Registered as agent {agent['id']}")
+                return agent["id"]
+        except Exception as e:
+            logging.warning(f"Failed to register as agent: {e}")
+        return None
+
+    @classmethod
+    def post_announcement(cls, announcement: dict):
+        """Post an announcement to the agent daemon for routing."""
+        if not cls.agent_daemon_available:
+            return False
+        try:
+            import time
+            import uuid
+            ann_data = {
+                "id": str(uuid.uuid4()),
+                "source": cls.current_agent_id or "unknown",
+                "direction": {"up": "Up", "down": "Down", "both": "Both", "global": "Global"}.get(
+                    announcement.get("direction", "both"), "Both"
+                ),
+                "hops_remaining": announcement.get("hops", 1),
+                "emoji": announcement.get("emoji"),
+                "message": announcement.get("message", ""),
+                "channel": announcement.get("channel"),
+                "path": [],
+                "timestamp": int(time.time()),
+            }
+            response = requests.post(
+                f"{cls.agent_daemon_url}/api/announce",
+                json=ann_data,
+                timeout=5
+            )
+            return response.status_code == 200
+        except Exception as e:
+            logging.warning(f"Failed to post announcement: {e}")
+        return False
+
+    @classmethod
+    def spawn_child_agent(cls, child_id: str, model: str, task: str) -> dict:
+        """
+        Spawn a child agent. Returns spawn info or None.
+
+        The child agent will be a new Palace subprocess with:
+        - Tool-first prompting (can act immediately)
+        - Channel-filtered context
+        - Connection to parent for announcements
+        """
+        if not cls.agent_daemon_available:
+            logging.warning("Cannot spawn child - agent daemon not available")
+            return None
+
+        try:
+            # Register child with daemon
+            response = requests.post(
+                f"{cls.agent_daemon_url}/api/spawn",
+                json={
+                    "model": model,
+                    "task": task,
+                    "parent": cls.current_agent_id,
+                },
+                timeout=5
+            )
+            if response.status_code == 200:
+                child_agent = response.json()
+                logging.info(f"[SWARM] Spawned child {child_id} ({model}): {task[:50]}...")
+                return child_agent
+        except Exception as e:
+            logging.warning(f"Failed to spawn child agent: {e}")
+        return None
+
+    @classmethod
+    def get_agent_context(cls, task: str, channels: list = None) -> str:
+        """Minimal context for spawned agents. They have tools - trust them to use them."""
+        ch = ",".join(channels) if channels else "general"
+        return f"Task: {task}\nChannels: {ch}\nSignals: ++===(done) @announce--/++(msg)"
+
+    @classmethod
+    def init_context_cache(cls):
+        """Initialize connection to Rust context cache daemon. Called once on startup."""
+        try:
+            from context_cache_client import ContextManager
+            cls.context_manager = ContextManager()
+            if cls.context_manager.available:
+                print("[Translator] Context cache daemon connected!")
+            else:
+                print("[Translator] Context cache daemon not available - context management disabled")
+                cls.context_manager = None
+        except ImportError:
+            print("[Translator] context_cache_client.py not found - context management disabled")
+            cls.context_manager = None
+        except Exception as e:
+            print(f"[Translator] Context cache init failed: {e}")
+            cls.context_manager = None
+
+    @classmethod
+    def load_router_settings(cls):
+        """Load persisted router settings from disk. Called once on daemon startup."""
+        if ROUTER_SETTINGS_FILE.exists():
+            try:
+                settings = json.loads(ROUTER_SETTINGS_FILE.read_text())
+                if "streaming_mode" in settings:
+                    cls.streaming_mode = settings["streaming_mode"]
+                if "mention_chain_limit" in settings:
+                    cls.mention_chain_limit = settings["mention_chain_limit"]
+                if "routing_strategy" in settings:
+                    cls.routing_strategy = settings["routing_strategy"]
+                print(f"[Router] Loaded settings: streaming={cls.streaming_mode}, mentions={cls.mention_chain_limit}, strategy={cls.routing_strategy}")
+            except (json.JSONDecodeError, IOError) as e:
+                print(f"[Router] Failed to load settings: {e}")
+
+    @classmethod
+    def save_router_settings(cls):
+        """Persist router settings to disk."""
+        settings = {
+            "streaming_mode": cls.streaming_mode,
+            "mention_chain_limit": cls.mention_chain_limit,
+            "routing_strategy": cls.routing_strategy,
+        }
+        try:
+            ROUTER_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            ROUTER_SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+        except IOError as e:
+            print(f"[Router] Failed to save settings: {e}")
+
     # Tool ID mapping: Mistral requires 9-char alphanumeric IDs
     # Anthropic uses toolu_XXXX format. We map bidirectionally.
     # Key: anthropic_id, Value: mistral_id (and reverse lookup via mistral_to_anthropic)
     anthropic_to_mistral = {}  # toolu_xxx -> abc123xyz
     mistral_to_anthropic = {}  # abc123xyz -> toolu_xxx
     _id_counter = 0
+
+    # ========================================================================
+    # Multi-Model Registry
+    # ========================================================================
+    # Each model has: provider, base_url, api_key_env, model_id, format, has_vision
+
+    # ANSI color codes for model output
+    COLORS = {
+        "reset": "\033[0m",
+        "bold": "\033[1m",
+        "blue": "\033[94m",      # Anthropic (Claude)
+        "green": "\033[92m",     # GLM/Z.ai
+        "orange": "\033[93m",    # Mistral
+        "cyan": "\033[96m",      # Aliases
+        "magenta": "\033[95m",   # Special
+        "red": "\033[91m",       # Errors
+    }
+
+    # Map model names to colors
+    MODEL_COLORS = {
+        # Anthropic = Blue
+        "claude": "blue", "sonnet": "blue", "opus": "blue", "haiku": "blue",
+        # GLM = Green
+        "glm": "green", "glmv": "green", "glm-fast": "green",
+        # Mistral = Orange
+        "mistral": "orange", "devstral": "orange", "liefstral": "orange", "mini": "orange",
+    }
+
+    MODEL_REGISTRY = {
+        # Anthropic models (native format)
+        "claude": {
+            "provider": "anthropic",
+            "base_url": "https://api.anthropic.com/v1",
+            "api_key_env": "ANTHROPIC_API_KEY",
+            "model_id": "claude-sonnet-4-5",
+            "format": "anthropic",
+            "has_vision": True,
+        },
+        "opus": {
+            "provider": "anthropic",
+            "base_url": "https://api.anthropic.com/v1",
+            "api_key_env": "ANTHROPIC_API_KEY",
+            "model_id": "claude-opus-4-5-20251101",
+            "format": "anthropic",
+            "has_vision": True,
+        },
+        "sonnet": {
+            "provider": "anthropic",
+            "base_url": "https://api.anthropic.com/v1",
+            "api_key_env": "ANTHROPIC_API_KEY",
+            "model_id": "claude-sonnet-4-5",
+            "format": "anthropic",
+            "has_vision": True,
+        },
+        "haiku": {
+            "provider": "anthropic",
+            "base_url": "https://api.anthropic.com/v1",
+            "api_key_env": "ANTHROPIC_API_KEY",
+            "model_id": "claude-haiku-4-5",
+            "format": "anthropic",
+            "has_vision": True,
+        },
+        # Mistral models (OpenAI format)
+        "devstral": {
+            "provider": "mistral",
+            "base_url": "https://api.mistral.ai/v1",
+            "api_key_env": "MISTRAL_API_KEY",
+            "model_id": "devstral-2512",
+            "format": "openai",
+            "has_vision": False,
+            "vision_fallback": "mini",  # Use ministral for vision
+        },
+        "mistral": {  # Alias for devstral
+            "provider": "mistral",
+            "base_url": "https://api.mistral.ai/v1",
+            "api_key_env": "MISTRAL_API_KEY",
+            "model_id": "devstral-2512",
+            "format": "openai",
+            "has_vision": False,
+        },
+        "liefstral": {
+            "provider": "mistral",
+            "base_url": "https://api.mistral.ai/v1",
+            "api_key_env": "MISTRAL_API_KEY",
+            "model_id": "devstral-2512",
+            "format": "openai",
+            "has_vision": False,
+            "skill": "high-lief",  # Inject high-lief skill
+        },
+        "smol": {
+            "provider": "mistral",
+            "base_url": "https://api.mistral.ai/v1",
+            "api_key_env": "MISTRAL_API_KEY",
+            "model_id": "labs-devstral-small-2512",
+            "format": "openai",
+            "has_vision": False,
+        },
+        # GLM models (OpenAI format via z.ai coding API)
+        "glm": {
+            "provider": "z.ai",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "api_key_env": "ZAI_API_KEY",
+            "model_id": "glm-4.6",
+            "format": "openai",
+            "has_vision": False,
+        },
+        "glmv": {
+            "provider": "z.ai",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "api_key_env": "ZAI_API_KEY",
+            "model_id": "glm-4.6",
+            "format": "openai",
+            "has_vision": True,
+        },
+    }
+
+    # Vision tier models for delegation
+    VISION_TIERS = {
+        "large": {"model_id": "mistral-large-latest", "provider": "mistral"},
+        "medium": {"model_id": "mistral-medium-latest", "provider": "mistral"},
+        "small": {"model_id": "mistral-small-latest", "provider": "mistral"},
+        "mini": {"model_id": "pixtral-12b-2409", "provider": "mistral"},
+    }
+
+    @classmethod
+    def parse_mentions_and_settings(cls, text: str) -> dict:
+        """
+        Parse @mentions and @setting=value from text.
+
+        Escaping:
+        - Double @@ is escaped (@@claude becomes @claude in output, not routed)
+        - Backticks protect mentions (`@claude` passes through as-is, not routed)
+
+        Returns dict with:
+        - models: list of mentioned model names
+        - settings: dict of setting_name -> value
+        - clean_text: text with @mentions removed, @@ unescaped
+        - strategy: detected strategy (transparent/private/strategic) or None
+        """
+        import re
+
+        result = {
+            "models": [],
+            "settings": {},
+            "clean_text": text,
+            "strategy": None,
+        }
+
+        # Valid model names (lowercase)
+        valid_models = set(cls.MODEL_REGISTRY.keys())
+
+        # First, protect escaped @@ by replacing with placeholder
+        placeholder = "\x00ESCAPED_AT\x00"
+        working_text = text.replace("@@", placeholder)
+
+        # Protect content inside backticks (both inline `...` and code blocks ```...```)
+        backtick_placeholder = "\x00BACKTICK\x00"
+        backtick_sections = []
+        def save_backtick(match):
+            backtick_sections.append(match.group(0))
+            return backtick_placeholder
+        # Match ```...``` first (greedy), then `...`
+        working_text = re.sub(r'```[\s\S]*?```', save_backtick, working_text)
+        working_text = re.sub(r'`[^`]+`', save_backtick, working_text)
+
+        # Find all @word patterns (on the text without escaped @@ and without backticked content)
+        pattern = r'@(\w+)(?:=(\S+))?'
+        matches = re.findall(pattern, working_text)
+
+        for word, value in matches:
+            word_lower = word.lower()
+
+            if value:
+                # This is a setting: @streaming=on, @mentions=3, @vision=large
+                result["settings"][word_lower] = value
+            elif word_lower in valid_models:
+                # This is a model mention
+                if word_lower not in result["models"]:
+                    result["models"].append(word_lower)
+            elif word_lower in ("transparent", "private", "strategic"):
+                # Strategy directive
+                result["strategy"] = word_lower
+            elif word_lower == "help":
+                # Help request
+                result["help"] = True
+            # Else: ignore unknown @mentions (could be usernames, etc.)
+
+        # Clean text: remove @model mentions but keep @settings visible
+        def replace_mention(match):
+            word = match.group(1).lower()
+            value = match.group(2)
+            if value:
+                return match.group(0)  # Keep settings
+            if word in valid_models or word in ("transparent", "private", "strategic", "help"):
+                return ""  # Remove model/strategy/help mentions
+            return match.group(0)  # Keep unknown @mentions
+
+        # Work on working_text (with @@ and backticks protected), then restore
+        result["clean_text"] = re.sub(pattern, replace_mention, working_text).strip()
+        # Clean up multiple spaces
+        result["clean_text"] = re.sub(r'\s+', ' ', result["clean_text"]).strip()
+        # Restore backticks (unchanged - they pass through as-is)
+        for section in backtick_sections:
+            result["clean_text"] = result["clean_text"].replace(backtick_placeholder, section, 1)
+        # Unescape @@ back to @
+        result["clean_text"] = result["clean_text"].replace(placeholder, "@")
+
+        return result
+
+    @classmethod
+    def parse_consecutive_mentions(cls, text: str) -> tuple:
+        """
+        Check if @mentions are consecutive at the start of the message.
+
+        Input: "@claude @glm @mistral hello world"
+        Output: (["claude", "glm", "mistral"], "hello world", True)
+
+        Input: "@claude please ask @glm how it's doing"
+        Output: (["claude"], "@claude please ask @glm how it's doing", False)
+
+        Returns: (models_list, clean_text, is_multi_model)
+        - If consecutive @mentions at start: multi-model mode, return all models + cleaned text
+        - If not consecutive: single-model mode, return first model + original text (keep @mentions)
+        """
+        import re
+
+        valid_models = set(cls.MODEL_REGISTRY.keys())
+
+        # Match consecutive @mentions at the very start
+        # Pattern: start, then one or more @model (with optional whitespace between)
+        consecutive_pattern = r'^((?:@(\w+)\s*)+)'
+        match = re.match(consecutive_pattern, text.strip())
+
+        if not match:
+            return ([], text, False)
+
+        # Extract all @mentions from the consecutive block
+        mention_block = match.group(1)
+        remaining_text = text.strip()[len(mention_block):].strip()
+
+        # Find all @words in the consecutive block
+        mentions_in_block = re.findall(r'@(\w+)', mention_block)
+
+        # Filter to valid models only
+        models = []
+        for m in mentions_in_block:
+            m_lower = m.lower()
+            if m_lower in valid_models and m_lower not in models:
+                models.append(m_lower)
+
+        if len(models) == 0:
+            return ([], text, False)
+        elif len(models) == 1:
+            # Single model - keep original text (preserve any @mentions in body for model-to-model)
+            return (models, text, False)
+        else:
+            # Multiple consecutive models - multi-model mode with cleaned text
+            return (models, remaining_text, True)
+
+    def parse_segmented_mentions(self, text: str) -> list:
+        """
+        Parse text for segmented @mentions routing.
+
+        Two modes:
+        1. BROADCAST: "@claude @mistral @glm hello!" - all mentions at start, all get "hello!"
+        2. SEGMENTED: "@glm hi @claude hello @mistral hey" - each model gets its segment
+
+        Escaping:
+        - Backticks protect mentions (`@claude` is not routed)
+        - @@ escapes (@@claude becomes @claude, not routed)
+
+        Returns: list of (models_list, segment_text) tuples
+        """
+        import re
+        valid_models = set(self.MODEL_REGISTRY.keys())
+
+        # Create a working copy that masks escaped/backticked content
+        working_text = text.replace("@@", "\x00\x00")  # Mask @@ escapes
+        # Mask backticked content
+        working_text = re.sub(r'```[\s\S]*?```', lambda m: '\x00' * len(m.group(0)), working_text)
+        working_text = re.sub(r'`[^`]+`', lambda m: '\x00' * len(m.group(0)), working_text)
+
+        # Find all @mentions with positions (on masked text, but positions map to original)
+        pattern = r'@(\w+)'
+        mentions = [(m.group(1).lower(), m.start(), m.end()) for m in re.finditer(pattern, working_text)]
+        model_mentions = [(name, start, end) for name, start, end in mentions if name in valid_models]
+
+        if not model_mentions:
+            return [([], text)]
+
+        # Check if all mentions are consecutive at the start (broadcast mode)
+        # Allow only whitespace between consecutive mentions at the start
+        first_non_mention_pos = 0
+        for name, start, end in model_mentions:
+            # Check if there's non-whitespace between expected position and actual position
+            between = text[first_non_mention_pos:start].strip()
+            if between:
+                # Found text between mentions - this is segmented mode
+                break
+            first_non_mention_pos = end
+        else:
+            # All mentions are consecutive at start - BROADCAST mode
+            remaining_text = text[first_non_mention_pos:].strip()
+            models = [name for name, _, _ in model_mentions]
+            return [(models, remaining_text)]
+
+        # SEGMENTED mode - split text by @mentions
+        segments = []
+        for i, (model_name, start, end) in enumerate(model_mentions):
+            # Find the end of this segment (start of next @mention or end of text)
+            if i + 1 < len(model_mentions):
+                next_start = model_mentions[i + 1][1]
+                segment_text = text[end:next_start].strip()
+            else:
+                segment_text = text[end:].strip()
+
+            if segment_text:  # Only add if there's actual text for this model
+                segments.append(([model_name], segment_text))
+
+        return segments if segments else [([], text)]
+
+    @classmethod
+    def parse_model_output_mentions(cls, response_text: str) -> list:
+        """
+        Parse @mentions from model output (for model-to-model tagging).
+        Only returns model names, NOT settings (models can't change settings).
+
+        Escaping:
+        - Backticks protect mentions (`@claude` doesn't trigger chain)
+
+        Returns dict with:
+        - mentions: list of (model_name, mention_type) tuples
+          - mention_type: "mention" (chain), "delegate" (full handoff), "ask" (single-turn)
+        """
+        import re
+
+        valid_models = set(cls.MODEL_REGISTRY.keys())
+
+        # Mask backticked content so mentions inside don't trigger
+        working_text = re.sub(r'```[\s\S]*?```', '', response_text)
+        working_text = re.sub(r'`[^`]+`', '', working_text)
+
+        result = []
+        seen = set()
+
+        # Pattern for @delegate:model and @ask:model
+        delegation_pattern = r'@(delegate|ask):(\w+)'
+        for match in re.finditer(delegation_pattern, working_text):
+            action = match.group(1).lower()
+            model = match.group(2).lower()
+            if model in valid_models and model not in seen:
+                result.append((model, action))
+                seen.add(model)
+
+        # Pattern for plain @model mentions
+        plain_pattern = r'@(\w+)'
+        for match in re.finditer(plain_pattern, working_text):
+            word = match.group(1).lower()
+            # Skip if it's part of @delegate: or @ask:
+            if word in ("delegate", "ask"):
+                continue
+            if word in valid_models and word not in seen:
+                result.append((word, "mention"))
+                seen.add(word)
+
+        return result
+
+    @classmethod
+    def parse_announcements(cls, response_text: str, source_model: str = "unknown") -> list:
+        """
+        Parse @announce commands from model output.
+
+        Syntax:
+        - @announce="message"                    # Basic, to parent + children
+        - @announce=🎉,"message"                 # With emoji
+        - @announce--="message"                  # Up to all parents (toward human)
+        - @announce++="message"                  # Down to all children
+        - @announce-2="message"                  # Up 2 hops
+        - @announce+3="message"                  # Down 3 hops
+        - @announce=global,"message"             # Entire swarm
+        - @announce=global,🎉,"message"          # Global with emoji
+        - @announce++=channel=coding,"message"   # Channel-targeted
+
+        Returns list of Announcement dicts:
+        {
+            "source": str,           # Model that announced
+            "direction": str,        # "up", "down", "both", "global"
+            "hops": int,             # -1 for unlimited, N for specific
+            "emoji": str or None,    # Optional emoji prefix
+            "message": str,          # The announcement content
+            "channel": str or None,  # Optional channel filter
+        }
+        """
+        import re
+
+        # Mask backticked content
+        working_text = re.sub(r'```[\s\S]*?```', '', response_text)
+        working_text = re.sub(r'`[^`]+`', '', working_text)
+
+        announcements = []
+
+        # Complex pattern to match all @announce variants
+        # @announce[direction][=options],"message" or @announce[direction]="message"
+        pattern = r'@announce(--|[+][+]|-\d+|[+]\d+)?(?:=([^,"\s]+))?(?:,([^,"\s]+))?[,=]"([^"]+)"'
+
+        for match in re.finditer(pattern, working_text):
+            direction_raw = match.group(1) or ""
+            opt1 = match.group(2) or ""
+            opt2 = match.group(3) or ""
+            message = match.group(4)
+
+            # Parse direction and hops
+            direction = "both"  # default
+            hops = 1  # default: immediate neighbors
+
+            if direction_raw == "--":
+                direction = "up"
+                hops = -1  # unlimited
+            elif direction_raw == "++":
+                direction = "down"
+                hops = -1  # unlimited
+            elif direction_raw.startswith("-") and direction_raw[1:].isdigit():
+                direction = "up"
+                hops = int(direction_raw[1:])
+            elif direction_raw.startswith("+") and direction_raw[1:].isdigit():
+                direction = "down"
+                hops = int(direction_raw[1:])
+
+            # Parse options (emoji, global, channel)
+            emoji = None
+            channel = None
+
+            for opt in [opt1, opt2]:
+                if opt == "global":
+                    direction = "global"
+                    hops = -1
+                elif opt.startswith("channel="):
+                    channel = opt[8:]
+                elif len(opt) <= 4 and opt:  # Likely an emoji (1-4 chars including multi-byte)
+                    emoji = opt
+
+            announcements.append({
+                "source": source_model,
+                "direction": direction,
+                "hops": hops,
+                "emoji": emoji,
+                "message": message,
+                "channel": channel,
+            })
+
+        return announcements
+
+    @classmethod
+    def parse_spawn_decisions(cls, response_text: str) -> dict:
+        """
+        Parse agent spawn DSL from model output.
+
+        Syntax:
+        - +1=opus,2=sonnet,3=haiku    # Spawn 3 children with specified models
+        - +1=opus,2=sonnet-3          # Spawn 2, explicitly don't spawn 3
+        - +N=model                    # Child N uses model
+        - -N                          # Don't spawn child N
+        - ==                          # End of spawn decisions
+
+        Returns dict:
+        {
+            "spawns": [(child_id, model_name), ...],  # Children to spawn
+            "cancels": [child_id, ...],                # Children NOT to spawn
+            "complete": bool,                          # True if == found
+        }
+        """
+        import re
+
+        # Mask code blocks
+        working_text = re.sub(r'```[\s\S]*?```', '', response_text)
+        working_text = re.sub(r'`[^`]+`', '', working_text)
+
+        spawns = []
+        cancels = []
+        complete = "==" in working_text
+
+        # Pattern for spawn decisions: +N=model or -N
+        # Can be comma-separated: +1=opus,2=sonnet,3=haiku-4
+        spawn_pattern = r'[+](\d+)=(\w+)'
+        cancel_pattern = r'-(\d+)(?!=)'  # -N but not -N= (which could be negative)
+
+        for match in re.finditer(spawn_pattern, working_text):
+            child_id = int(match.group(1))
+            model = match.group(2).lower()
+            spawns.append((child_id, model))
+
+        for match in re.finditer(cancel_pattern, working_text):
+            child_id = int(match.group(1))
+            cancels.append(child_id)
+
+        return {
+            "spawns": spawns,
+            "cancels": cancels,
+            "complete": complete,
+        }
+
+    @classmethod
+    def format_announcement_display(cls, announcement: dict, path: list = None) -> str:
+        """Format an announcement for display in streaming output."""
+        emoji = announcement.get("emoji") or "📢"
+        source = announcement.get("source", "unknown")
+        message = announcement.get("message", "")
+        channel = announcement.get("channel")
+
+        # Build path string if we have routing info
+        path_str = ""
+        if path and len(path) > 1:
+            path_str = f" (via {' → '.join(path[:-1])})"
+
+        # Build channel tag
+        channel_str = f" [#{channel}]" if channel else ""
+
+        return f"\n┌{'─' * 60}┐\n│ {emoji} ANNOUNCEMENT from @{source}{path_str}{channel_str}\n│ \"{message}\"\n└{'─' * 60}┘\n"
+
+    def process_agent_mentions(self, responses: list, messages: list, system: str,
+                               max_tokens: int, temperature: float, tools: list) -> list:
+        """
+        Process @mentions in agent/model responses. SEPARATE from user mention parsing.
+
+        Takes list of (model_name, response) tuples.
+        Scans all response text for @mentions to other models.
+        Calls those models with conversation context.
+        Returns extended list with new responses appended.
+        """
+        if TranslatorHandler.mention_chain_limit <= 0:
+            return responses
+
+        # Track what we've already called
+        called = {m for m, _ in responses}
+        result = list(responses)
+        iterations = 0
+
+        while iterations < TranslatorHandler.mention_chain_limit:
+            iterations += 1
+
+            # Collect all @mentions from all responses we haven't processed yet
+            new_mentions = []
+            last_responder = None
+            for model_name, resp in result:
+                if "content" not in resp:
+                    continue
+                for block in resp["content"]:
+                    if block.get("type") == "text":
+                        text = block.get("text", "")
+                        mentions = self.parse_model_output_mentions(text)
+                        for m in mentions:
+                            if m not in called and m not in new_mentions:
+                                new_mentions.append(m)
+                                last_responder = model_name
+
+            if not new_mentions:
+                break  # No new mentions, we're done
+
+            print(f"[Agent] @mentions found: {new_mentions} (iteration {iterations})")
+
+            # Build context from all responses so far
+            context = "\n\n".join(
+                f"[@{m}]: {b.get('text', '')}"
+                for m, r in result
+                if "content" in r
+                for b in r["content"]
+                if b.get("type") == "text"
+            )
+
+            # Call each mentioned model
+            for model_name in new_mentions:
+                if len(called) >= TranslatorHandler.mention_chain_limit + len(responses):
+                    print(f"[Agent] Chain limit reached")
+                    break
+
+                # Build message with context
+                agent_messages = messages[:-1].copy() if messages else []
+                orig_user = messages[-1].get("content", "") if messages else ""
+                agent_messages.append({
+                    "role": "user",
+                    "content": (
+                        f"{orig_user}\n\n"
+                        f"[CONVERSATION - @{last_responder} tagged you:]\n{context}\n\n"
+                        f"[You are @{model_name}. Respond to @{last_responder}.]"
+                    )
+                })
+
+                print(f"[Agent] Invoking @{model_name}")
+                resp = self.call_model_backend(model_name, agent_messages, system, max_tokens, temperature, tools)
+                result.append((model_name, resp))
+                called.add(model_name)
+
+        return result
+
+    @classmethod
+    def generate_help_text(cls) -> str:
+        """Generate help text explaining available models and settings."""
+        lines = [
+            "# Palace Multi-Model Router",
+            "",
+            "Route messages to different AI models using @mentions.",
+            "",
+            "## Available Models",
+            "",
+            "| Tag | Provider | Model | Vision |",
+            "|-----|----------|-------|--------|",
+        ]
+
+        for name, config in sorted(cls.MODEL_REGISTRY.items()):
+            provider = config.get("provider", "unknown")
+            model_id = config.get("model_id", "unknown")
+            has_vision = "✅" if config.get("has_vision") else "❌"
+            skill = config.get("skill")
+            model_desc = model_id
+            if skill:
+                model_desc += f" + {skill}"
+            lines.append(f"| `@{name}` | {provider} | {model_desc} | {has_vision} |")
+
+        lines.extend([
+            "",
+            "## Routing Strategies",
+            "",
+            "| Tag | Description |",
+            "|-----|-------------|",
+            "| `@transparent` | Models respond sequentially, each seeing previous responses (default) |",
+            "| `@private` | Each model gets isolated context, no cross-visibility |",
+            "| `@strategic` | Two-round deliberation: independent first, then with visibility |",
+            "",
+            "## Settings",
+            "",
+            "Use `@setting=value` syntax:",
+            "",
+            "| Setting | Values | Description |",
+            "|---------|--------|-------------|",
+            "| `@streaming` | `off`, `on`, `chunked` | `off`=buffer all, `on`=flush on \\n\\n (default), `chunked`=model-controlled |",
+            "| `@mentions` | `0`, `3`, `unlimited` | Model-to-model chain limit (default: 3) |",
+            "| `@vision` | `large`, `medium`, `small`, `mini` | Vision fallback tier for non-vision models |",
+            "",
+            "## Model-to-Model Delegation",
+            "",
+            "Models can tag other models in their responses:",
+            "",
+            "| Syntax | Description |",
+            "|--------|-------------|",
+            "| `@model` | Chain mention - conversation continues with all models |",
+            "| `@delegate:model` | Full handoff - delegate takes over completely |",
+            "| `@ask:model` | Consultation - single response, then original continues |",
+            "",
+            "## Examples",
+            "",
+            "```",
+            "@claude help me debug this         # Single model",
+            "@claude @glm compare approaches    # Multi-model broadcast",
+            "@glm hi @claude hello              # Segmented (each gets its message)",
+            "@private @claude @devstral review  # Private mode (isolated)",
+            "@strategic @claude @glm decide     # Two-round deliberation",
+            "@streaming=off @claude explain     # Disable paragraph streaming",
+            "@@username                         # Escape: outputs @username literally",
+            "```",
+            "",
+            "### Delegation Examples (in model output)",
+            "",
+            "```",
+            "@delegate:mistral                  # Model hands off entirely",
+            "@ask:claude what do you think?     # Quick consultation",
+            "@devstral can you help?            # Regular chain mention",
+            "```",
+            "",
+            "## Current Settings",
+            "",
+            f"- Streaming: `{cls.streaming_mode}`",
+            f"- Mention chain limit: `{cls.mention_chain_limit}`",
+            f"- Default strategy: `{cls.routing_strategy}`",
+        ])
+
+        return "\n".join(lines)
+
+    @classmethod
+    def get_api_key(cls, model_name: str) -> str:
+        """Get API key for a model from environment."""
+        if model_name not in cls.MODEL_REGISTRY:
+            return ""
+        env_var = cls.MODEL_REGISTRY[model_name].get("api_key_env", "")
+        return os.environ.get(env_var, "")
 
     @classmethod
     def get_mistral_id(cls, anthropic_id: str) -> str:
@@ -107,6 +965,530 @@ class TranslatorHandler(BaseHTTPRequestHandler):
     def get_anthropic_id(cls, mistral_id: str) -> str:
         """Convert Mistral tool ID back to original Anthropic ID."""
         return cls.mistral_to_anthropic.get(mistral_id, mistral_id)
+
+    def call_model_backend(self, model_name: str, messages: list, system: str,
+                           max_tokens: int, temperature: float = None,
+                           tools: list = None, stream: bool = False) -> dict:
+        """
+        Call a specific model backend and return the response.
+
+        Handles both Anthropic and OpenAI format APIs.
+        Returns response in Anthropic format for consistency.
+        """
+        import requests
+
+        if model_name not in self.MODEL_REGISTRY:
+            return {"error": f"Unknown model: {model_name}"}
+
+        model_config = self.MODEL_REGISTRY[model_name]
+        api_key = self.get_api_key(model_name)
+
+        if not api_key:
+            return {"error": f"No API key for {model_name} (set {model_config['api_key_env']})"}
+
+        base_url = model_config["base_url"]
+        model_id = model_config["model_id"]
+        api_format = model_config["format"]
+
+        print(f"[Router] Calling {model_name} ({model_id}) via {base_url}")
+
+        if api_format == "anthropic":
+            # Native Anthropic API call
+            return self._call_anthropic_api(
+                base_url, api_key, model_id, messages, system,
+                max_tokens, temperature, tools, stream
+            )
+        else:
+            # OpenAI format (Mistral, GLM, etc.)
+            return self._call_openai_api(
+                base_url, api_key, model_id, messages, system,
+                max_tokens, temperature, tools, stream
+            )
+
+    def _call_anthropic_api(self, base_url: str, api_key: str, model_id: str,
+                            messages: list, system: str, max_tokens: int,
+                            temperature: float = None, tools: list = None,
+                            stream: bool = False) -> dict:
+        """Call Anthropic API directly (no translation needed)."""
+        import requests
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        }
+
+        request_body = {
+            "model": model_id,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        if system:
+            request_body["system"] = system
+        if temperature is not None:
+            request_body["temperature"] = temperature
+        if tools:
+            request_body["tools"] = tools
+
+        print(f"[Debug] Anthropic request - model: {model_id}, base_url: {base_url}, messages: {len(messages)}", flush=True)
+        if messages:
+            print(f"[Debug]   First message role: {messages[0].get('role')}, content type: {type(messages[0].get('content'))}", flush=True)
+
+        try:
+            response = requests.post(
+                f"{base_url}/messages",
+                headers=headers,
+                json=request_body,
+                timeout=120
+            )
+            print(f"[Debug] Anthropic response status: {response.status_code}", flush=True)
+            if response.status_code != 200:
+                print(f"[Debug] Anthropic response body: {response.text[:500]}", flush=True)
+            response.raise_for_status()
+            result = response.json()
+            print(f"[Debug] Anthropic response has content: {bool(result.get('content'))}", flush=True)
+            print(f"[Debug] Anthropic full response: {json.dumps(result)[:500]}", flush=True)
+            return result
+        except requests.exceptions.HTTPError as e:
+            # Try to get detailed error from response body
+            try:
+                error_body = e.response.json()
+                error_msg = error_body.get("error", {}).get("message", str(e))
+            except:
+                error_msg = str(e)
+            return {"error": error_msg}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _call_openai_api(self, base_url: str, api_key: str, model_id: str,
+                         messages: list, system: str, max_tokens: int,
+                         temperature: float = None, tools: list = None,
+                         stream: bool = False) -> dict:
+        """Call OpenAI-format API and translate response to Anthropic format."""
+        import requests
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+
+        # Convert messages to OpenAI format
+        openai_messages = []
+        if system:
+            openai_messages.append({"role": "system", "content": system})
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            # Handle content blocks
+            if isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text":
+                            text_parts.append(block.get("text", ""))
+                        elif block.get("type") == "tool_result":
+                            # Tool result goes as separate message
+                            tool_id = block.get("tool_use_id", "")
+                            tool_content = block.get("content", "")
+                            if isinstance(tool_content, list):
+                                tool_content = "\n".join(
+                                    b.get("text", str(b)) if isinstance(b, dict) else str(b)
+                                    for b in tool_content
+                                )
+                            openai_messages.append({
+                                "role": "tool",
+                                "tool_call_id": self.get_mistral_id(tool_id),
+                                "content": str(tool_content),
+                            })
+                            continue
+                        elif block.get("type") == "tool_use":
+                            # Assistant's tool calls
+                            pass  # Handled below
+                    else:
+                        text_parts.append(str(block))
+
+                if text_parts:
+                    openai_messages.append({"role": role, "content": "\n".join(text_parts)})
+            else:
+                openai_messages.append({"role": role, "content": content})
+
+        request_body = {
+            "model": model_id,
+            "messages": openai_messages,
+            "max_tokens": max_tokens,
+        }
+        if temperature is not None:
+            request_body["temperature"] = temperature
+        if tools:
+            # Convert Anthropic tools to OpenAI format
+            openai_tools = []
+            for tool in tools:
+                openai_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name", ""),
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("input_schema", {}),
+                    }
+                })
+            request_body["tools"] = openai_tools
+            request_body["tool_choice"] = "auto"
+
+        try:
+            response = requests.post(
+                f"{base_url}/chat/completions",
+                headers=headers,
+                json=request_body,
+                timeout=120
+            )
+            response.raise_for_status()
+            openai_response = response.json()
+
+            # Convert to Anthropic format
+            return self._openai_to_anthropic_response(openai_response)
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _openai_to_anthropic_response(self, openai_response: dict) -> dict:
+        """Convert OpenAI response to Anthropic format."""
+        choice = openai_response.get("choices", [{}])[0]
+        message = choice.get("message", {})
+
+        content_blocks = []
+
+        # Add text content
+        text = message.get("content", "")
+        if text:
+            content_blocks.append({"type": "text", "text": text})
+
+        # Add tool calls (handle null/None from some APIs)
+        tool_calls = message.get("tool_calls") or []
+        for tc in tool_calls:
+            func = tc.get("function", {})
+            try:
+                args = json.loads(func.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                args = {}
+            content_blocks.append({
+                "type": "tool_use",
+                "id": self.get_anthropic_id(tc.get("id", "")),
+                "name": func.get("name", ""),
+                "input": args,
+            })
+
+        # Determine stop reason
+        finish_reason = choice.get("finish_reason", "stop")
+        if finish_reason == "tool_calls":
+            stop_reason = "tool_use"
+        elif finish_reason == "length":
+            stop_reason = "max_tokens"
+        else:
+            stop_reason = "end_turn"
+
+        return {
+            "id": f"msg_{uuid.uuid4().hex[:24]}",
+            "type": "message",
+            "role": "assistant",
+            "content": content_blocks,
+            "model": openai_response.get("model", ""),
+            "stop_reason": stop_reason,
+            "usage": {
+                "input_tokens": openai_response.get("usage", {}).get("prompt_tokens", 0),
+                "output_tokens": openai_response.get("usage", {}).get("completion_tokens", 0),
+            }
+        }
+
+    def route_to_models(self, models: list, messages: list, system: str,
+                        max_tokens: int, temperature: float = None,
+                        tools: list = None, strategy: str = "transparent") -> list:
+        """
+        Route request to multiple models based on strategy.
+
+        Returns list of (model_name, response_dict) tuples.
+        """
+        if strategy == "private":
+            return self._route_private(models, messages, system, max_tokens, temperature, tools)
+        elif strategy == "strategic":
+            return self._route_strategic(models, messages, system, max_tokens, temperature, tools)
+        else:  # transparent (default)
+            return self._route_transparent(models, messages, system, max_tokens, temperature, tools)
+
+    def _route_transparent(self, models: list, messages: list, system: str,
+                          max_tokens: int, temperature: float, tools: list) -> list:
+        """
+        Transparent routing: each model sees previous models' responses.
+        Sequential execution with accumulating context.
+        Agent @mentions are processed AFTER all user-requested models respond.
+        """
+        responses = []
+        context_additions = []
+
+        for model_name in models:
+            # Build messages with previous responses as context
+            augmented_messages = messages.copy()
+            if context_additions:
+                # Add previous model responses as assistant context
+                context_text = "\n\n".join(context_additions)
+                # Insert context before the last user message
+                for i in range(len(augmented_messages) - 1, -1, -1):
+                    if augmented_messages[i].get("role") == "user":
+                        # Modify the user message to include context
+                        orig_content = augmented_messages[i].get("content", "")
+                        if isinstance(orig_content, str):
+                            augmented_messages[i] = {
+                                "role": "user",
+                                "content": f"{orig_content}\n\n[Previous model responses in this conversation:]\n{context_text}"
+                            }
+                        break
+
+            response = self.call_model_backend(
+                model_name, augmented_messages, system,
+                max_tokens, temperature, tools
+            )
+            responses.append((model_name, response))
+
+            # Extract text for context for next model
+            if "content" in response:
+                for block in response["content"]:
+                    if block.get("type") == "text":
+                        context_additions.append(f"[@{model_name}]: {block.get('text', '')}")
+
+        # Process agent @mentions AFTER all user-requested models respond
+        responses = self.process_agent_mentions(
+            responses, messages, system, max_tokens, temperature, tools
+        )
+
+        return responses
+
+    def _route_private(self, models: list, messages: list, system: str,
+                      max_tokens: int, temperature: float, tools: list) -> list:
+        """
+        Private routing: each model gets isolated context.
+        No cross-visibility between models.
+        Agent @mentions are processed AFTER all user-requested models respond.
+        """
+        responses = []
+        for model_name in models:
+            response = self.call_model_backend(
+                model_name, messages, system,
+                max_tokens, temperature, tools
+            )
+            responses.append((model_name, response))
+
+        # Process agent @mentions AFTER all user-requested models respond
+        responses = self.process_agent_mentions(
+            responses, messages, system, max_tokens, temperature, tools
+        )
+
+        return responses
+
+    def _route_strategic(self, models: list, messages: list, system: str,
+                        max_tokens: int, temperature: float, tools: list) -> list:
+        """
+        Strategic routing: two-round deliberation.
+        Round 1: Independent responses
+        Round 2: Each model sees all Round 1 responses and refines
+        """
+        # Round 1: Independent
+        round1_responses = []
+        for model_name in models:
+            response = self.call_model_backend(
+                model_name, messages, system,
+                max_tokens, temperature, tools
+            )
+            round1_responses.append((model_name, response))
+
+        # Build Round 1 context
+        round1_context = []
+        for model_name, response in round1_responses:
+            if "content" in response:
+                for block in response["content"]:
+                    if block.get("type") == "text":
+                        round1_context.append(f"[@{model_name}]: {block.get('text', '')}")
+
+        round1_text = "\n\n".join(round1_context)
+
+        # Round 2: With visibility
+        round2_prompt = f"\n\n[Round 1 responses from all models:]\n{round1_text}\n\n[Now provide your refined analysis considering all perspectives:]"
+
+        round2_responses = []
+        for model_name in models:
+            # Augment messages with Round 1 context
+            augmented_messages = messages.copy()
+            for i in range(len(augmented_messages) - 1, -1, -1):
+                if augmented_messages[i].get("role") == "user":
+                    orig_content = augmented_messages[i].get("content", "")
+                    if isinstance(orig_content, str):
+                        augmented_messages[i] = {
+                            "role": "user",
+                            "content": orig_content + round2_prompt
+                        }
+                    break
+
+            response = self.call_model_backend(
+                model_name, augmented_messages, system,
+                max_tokens, temperature, tools
+            )
+            round2_responses.append((model_name, response))
+
+        # Return combined: round1 + round2
+        return [("round1", round1_responses), ("round2", round2_responses)]
+
+    def route_segmented(self, text: str, messages: list, system: str,
+                       max_tokens: int, temperature: float, tools: list) -> list:
+        """
+        Route different segments of a message to different models.
+        Then process agent @mentions in responses.
+
+        Input: "@claude What's 2+2? @glm What's 3+3? @mistral What's 4+4?"
+        Output: List of (segment_text, models, responses) for Q&A formatting
+        """
+        segments = self.parse_segmented_mentions(text)
+        results = []
+
+        for models, segment_text in segments:
+            segment_responses = []
+
+            # Build messages with the segment text as the user message
+            segment_messages = messages[:-1].copy() if messages else []
+            segment_messages.append({"role": "user", "content": segment_text})
+
+            # Call each model for this segment
+            for model_name in models:
+                response = self.call_model_backend(
+                    model_name, segment_messages, system,
+                    max_tokens, temperature, tools
+                )
+                segment_responses.append((model_name, response))
+
+            # Process agent @mentions in responses
+            segment_responses = self.process_agent_mentions(
+                segment_responses, segment_messages, system,
+                max_tokens, temperature, tools
+            )
+
+            results.append((segment_text, models, segment_responses))
+
+        return results
+
+    def format_segmented_response(self, segmented_results: list) -> dict:
+        """
+        Format segmented results as Q&A pairs with colored model labels.
+
+        Shows each question followed by model answers with colored @model: prefix.
+        """
+        combined_text = ""
+
+        for i, (question, models, responses) in enumerate(segmented_results, 1):
+            # Only show question header if multiple segments
+            if len(segmented_results) > 1:
+                combined_text += f"[Q{i}: {question}]\n\n"
+
+            for model_name, response in responses:
+                if "error" in response:
+                    combined_text += self.colorize_model(model_name, is_error=True)
+                    combined_text += f"Error: {response['error']}\n\n"
+                else:
+                    combined_text += self.colorize_model(model_name)
+                    if "content" in response:
+                        for block in response["content"]:
+                            if block.get("type") == "text":
+                                combined_text += f"{block.get('text', '')}\n\n"
+
+            if len(segmented_results) > 1:
+                combined_text += "\n"
+
+        return {
+            "id": f"msg-segmented-{id(segmented_results)}",
+            "type": "message",
+            "role": "assistant",
+            "model": "multi-model-segmented",
+            "content": [{"type": "text", "text": combined_text.strip()}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": sum(
+                    r.get("usage", {}).get("input_tokens", 0)
+                    for _, _, responses in segmented_results
+                    for _, r in responses
+                ),
+                "output_tokens": sum(
+                    r.get("usage", {}).get("output_tokens", 0)
+                    for _, _, responses in segmented_results
+                    for _, r in responses
+                ),
+            }
+        }
+
+    def colorize_model(self, model_name: str, is_error: bool = False) -> str:
+        """Return colored @model: prefix using ANSI codes."""
+        if is_error:
+            color = self.COLORS["red"]
+        else:
+            color_name = self.MODEL_COLORS.get(model_name, "cyan")
+            color = self.COLORS.get(color_name, self.COLORS["cyan"])
+        reset = self.COLORS["reset"]
+        bold = self.COLORS["bold"]
+        return f"{bold}{color}@{model_name}:{reset} "
+
+    def format_multi_model_response(self, model_responses: list, strategy: str) -> dict:
+        """
+        Format multiple model responses into a single Anthropic response.
+        Each model's response becomes a SEPARATE content block for progressive rendering.
+        """
+        content_blocks = []
+
+        if strategy == "strategic" and model_responses and model_responses[0][0] == "round1":
+            # Strategic mode: format two rounds
+            round1 = model_responses[0][1]
+            round2 = model_responses[1][1] if len(model_responses) > 1 else []
+
+            content_blocks.append({"type": "text", "text": "[Round 1]\n"})
+
+            for model_name, response in round1:
+                block_text = self.colorize_model(model_name, is_error="error" in response)
+                if "error" in response:
+                    block_text += f"Error: {response['error']}"
+                elif "content" in response:
+                    for block in response["content"]:
+                        if block.get("type") == "text":
+                            block_text += block.get("text", "")
+                content_blocks.append({"type": "text", "text": block_text + "\n"})
+
+            content_blocks.append({"type": "text", "text": "\n[Round 2]\n"})
+
+            for model_name, response in round2:
+                block_text = self.colorize_model(model_name, is_error="error" in response)
+                if "error" in response:
+                    block_text += f"Error: {response['error']}"
+                elif "content" in response:
+                    for block in response["content"]:
+                        if block.get("type") == "text":
+                            block_text += block.get("text", "")
+                content_blocks.append({"type": "text", "text": block_text + "\n"})
+        else:
+            # Transparent/Private: each model gets its own content block
+            for model_name, response in model_responses:
+                block_text = self.colorize_model(model_name, is_error="error" in response)
+                if "error" in response:
+                    block_text += f"Error: {response['error']}"
+                elif "content" in response:
+                    for block in response["content"]:
+                        if block.get("type") == "text":
+                            block_text += block.get("text", "")
+                content_blocks.append({"type": "text", "text": block_text + "\n"})
+
+        return {
+            "id": f"msg_{uuid.uuid4().hex[:24]}",
+            "type": "message",
+            "role": "assistant",
+            "content": content_blocks,
+            "model": "multi-model-router",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 0, "output_tokens": 0}
+        }
 
     def log_message(self, format, *args):
         """Log requests for debugging"""
@@ -210,6 +1592,168 @@ CRITICAL: TOOL COMPLETION RULES
 
             if anthropic_tools:
                 system_text = system_text + tool_guidance if system_text else tool_guidance.strip()
+
+            # Multi-model conversation rule (token-efficient)
+            multi_model_rule = "\nDo not simulate other participants. Personas/skills are fine."
+            system_text = system_text + multi_model_rule if system_text else multi_model_rule.strip()
+
+            # ================================================================
+            # Multi-Model Router: Check for @mentions in last user message
+            # ================================================================
+            last_user_text = ""
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        last_user_text = content
+                    elif isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                last_user_text = block.get("text", "")
+                                break
+                    break
+
+            # Parse @mentions and settings
+            parsed = self.parse_mentions_and_settings(last_user_text)
+            mentioned_models = parsed["models"]
+            settings = parsed["settings"]
+            strategy = parsed["strategy"] or self.routing_strategy
+
+            # Apply settings (use class var so it persists across requests)
+            if "mentions" in settings:
+                val = settings["mentions"]
+                if val == "unlimited":
+                    TranslatorHandler.mention_chain_limit = 9999
+                elif val == "off":
+                    TranslatorHandler.mention_chain_limit = 0
+                else:
+                    try:
+                        TranslatorHandler.mention_chain_limit = int(val)
+                    except ValueError:
+                        pass
+
+            if "streaming" in settings:
+                if settings["streaming"] in ("on", "off", "chunked"):
+                    TranslatorHandler.streaming_mode = settings["streaming"]
+
+            # Persist settings if any were changed
+            if "mentions" in settings or "streaming" in settings:
+                self.save_router_settings()
+                print(f"[Router] Settings updated: streaming={TranslatorHandler.streaming_mode}, mentions={TranslatorHandler.mention_chain_limit}")
+
+            # Inject chunked streaming instruction into system prompt
+            if TranslatorHandler.streaming_mode == "chunked":
+                chunked_instruction = (
+                    "\n\n[STREAMING MODE: Chunked]\n"
+                    "You are in chunked streaming mode. When generating long responses, "
+                    "insert a line containing ONLY '---' (three dashes alone on a line) "
+                    "to indicate natural break points where your response should flush to the user. "
+                    "Use this for: section breaks, after completing a thought, between logical segments, "
+                    "or after paragraphs. The '---' marker itself won't appear in the final output - "
+                    "it signals where to progressively display your response."
+                )
+                if system_text:
+                    system_text = system_text + chunked_instruction
+                else:
+                    system_text = chunked_instruction.strip()
+                print(f"[Router] Chunked mode active - injected streaming instruction into system prompt")
+
+            # ================================================================
+            # Context Cache: Inject active context and record user message
+            # ================================================================
+            if TranslatorHandler.context_manager:
+                try:
+                    # Record user message in timeline
+                    TranslatorHandler.context_manager.record_user_message(last_user_text)
+
+                    # Get active context from Rust cache
+                    active_context = TranslatorHandler.context_manager.get_active_context()
+                    if active_context:
+                        context_block = (
+                            "\n\n[ACTIVE CONTEXT - Managed by 1b classifier]\n"
+                            f"{active_context}\n"
+                            "[END ACTIVE CONTEXT]"
+                        )
+                        system_text = system_text + context_block if system_text else context_block.strip()
+                        print(f"[Router] Injected {len(active_context)} chars of active context")
+                except Exception as e:
+                    print(f"[Router] Context injection failed (non-fatal): {e}")
+
+            # Handle @help request - return help text immediately
+            if parsed.get("help"):
+                help_text = self.generate_help_text()
+                help_response = {
+                    "id": f"msg_{uuid.uuid4().hex[:24]}",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": help_text}],
+                    "model": "palace-router",
+                    "stop_reason": "end_turn",
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                }
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(help_response).encode())
+                return
+
+            # If @mentions found, use multi-model routing
+            if mentioned_models:
+                # Check if this is segmented (different questions for different models)
+                segments = self.parse_segmented_mentions(last_user_text)
+
+                if len(segments) > 1:
+                    # Segmented mode: different questions for different models
+                    # For now, flatten to a single multi-model stream
+                    # (each segment's models get streamed sequentially)
+                    print(f"[Router] Segmented STREAMING request: {len(segments)} segments")
+                    all_models = []
+                    for seg_models, seg_text in segments:
+                        print(f"  - {seg_models}: {seg_text[:50]}...")
+                        all_models.extend(seg_models)
+
+                    # Stream all models (segments handled by context)
+                    self._handle_multi_model_streaming(
+                        all_models, messages, system_text,
+                        max_tokens, temperature, anthropic_tools, strategy
+                    )
+                    return
+
+                # Whole-message mode: all @mentions apply to same question
+                print(f"[Router] Multi-model STREAMING request: {mentioned_models} (strategy: {strategy})")
+
+                # Clean the user message (remove @mentions)
+                clean_messages = messages.copy()
+                for i in range(len(clean_messages) - 1, -1, -1):
+                    if clean_messages[i].get("role") == "user":
+                        content = clean_messages[i].get("content", "")
+                        if isinstance(content, str):
+                            clean_messages[i] = {
+                                "role": "user",
+                                "content": parsed["clean_text"]
+                            }
+                        elif isinstance(content, list):
+                            # Find and update text blocks
+                            new_content = []
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    new_content.append({"type": "text", "text": parsed["clean_text"]})
+                                else:
+                                    new_content.append(block)
+                            clean_messages[i] = {"role": "user", "content": new_content}
+                        break
+
+                # Stream multi-model responses in real-time
+                self._handle_multi_model_streaming(
+                    mentioned_models, clean_messages, system_text,
+                    max_tokens, temperature, anthropic_tools, strategy
+                )
+                return
+
+            # ================================================================
+            # Single Model Path (no @mentions - use default backend)
+            # ================================================================
 
             # Translate to OpenAI format
             openai_messages = []
@@ -337,8 +1881,14 @@ CRITICAL: TOOL COMPLETION RULES
                 headers["Authorization"] = f"Bearer {self.backend_api_key}"
 
             if stream:
-                # Streaming response
-                self._handle_streaming(openai_request, headers)
+                # Streaming response - use multi-model handler for @mention support
+                # Even single-model requests go through here so agent @mentions work
+                # show_labels=False because no model was explicitly mentioned by user
+                self._handle_multi_model_streaming(
+                    [self.backend_model], messages, system_text,
+                    max_tokens, temperature, anthropic_tools, "transparent",
+                    show_labels=False
+                )
             else:
                 # Non-streaming response
                 print(f"[Translator] Sending to backend: {json.dumps(openai_request)[:500]}")
@@ -364,7 +1914,23 @@ CRITICAL: TOOL COMPLETION RULES
                 # Translate back to Anthropic format
                 anthropic_response = self._translate_response(openai_response)
 
-                # Send response
+                # Process agent @mentions in the response
+                initial_responses = [(self.backend_model, anthropic_response)]
+                all_responses = self.process_agent_mentions(
+                    initial_responses, messages, system_text,
+                    max_tokens, temperature, anthropic_tools
+                )
+
+                # If we got additional responses, format them together
+                if len(all_responses) > 1:
+                    combined_response = self.format_multi_model_response(all_responses, "transparent")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(combined_response).encode())
+                    return
+
+                # Send response (single model, no chain)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -427,7 +1993,7 @@ CRITICAL: TOOL COMPLETION RULES
             # Buffer for paragraph-based content blocks
             text_buffer = ""
 
-            def flush_content_block(text, is_final=False):
+            def flush_content_block(text, is_final=False, is_chunk_boundary=False):
                 """Flush buffered text as a complete content block."""
                 nonlocal text_block_started, current_block_index, text_buffer
                 if not text:
@@ -450,8 +2016,9 @@ CRITICAL: TOOL COMPLETION RULES
                 self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n".encode())
                 self.wfile.flush()
 
-                # Close block on paragraph boundaries (forces Claude Code to render)
-                if not is_final and text.endswith("\n\n"):
+                # Close block on paragraph boundaries or chunk boundaries (forces Claude Code to render)
+                should_close = (not is_final) and (text.endswith("\n\n") or is_chunk_boundary)
+                if should_close:
                     block_stop = {"type": "content_block_stop", "index": current_block_index}
                     self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
                     self.wfile.flush()
@@ -474,14 +2041,22 @@ CRITICAL: TOOL COMPLETION RULES
                         if chunk_finish:
                             finish_reason = chunk_finish
 
-                        # Handle text content - buffer and flush on paragraph boundaries
+                        # Handle text content - buffer and flush based on streaming_mode
                         content = delta.get("content", "")
                         if content:
                             text_buffer += content
-                            # Flush complete paragraphs as separate content blocks
-                            while "\n\n" in text_buffer:
-                                para, text_buffer = text_buffer.split("\n\n", 1)
-                                flush_content_block(para + "\n\n")
+
+                            if self.streaming_mode == "on":
+                                # Flush complete paragraphs as separate content blocks
+                                while "\n\n" in text_buffer:
+                                    para, text_buffer = text_buffer.split("\n\n", 1)
+                                    flush_content_block(para + "\n\n")
+                            elif self.streaming_mode == "chunked":
+                                # Flush on model-controlled "---" markers
+                                while "\n---\n" in text_buffer:
+                                    before, text_buffer = text_buffer.split("\n---\n", 1)
+                                    flush_content_block(before, is_chunk_boundary=True)
+                            # streaming_mode == "off": just accumulate, flush at end
 
                         # Handle tool calls
                         tool_calls = delta.get("tool_calls") or []
@@ -579,6 +2154,541 @@ CRITICAL: TOOL COMPLETION RULES
             self.wfile.write(f"event: error\ndata: {json.dumps(error_event)}\n\n".encode())
             self.wfile.flush()
 
+    def _handle_multi_model_streaming(self, models: list, messages: list, system: str,
+                                       max_tokens: int, temperature: float, tools: list,
+                                       strategy: str = "transparent", show_labels: bool = True):
+        """
+        Stream multi-model responses in real-time.
+        Each model's response streams as it arrives - no waiting for all models.
+        After each model, check for @mentions and stream those too.
+
+        show_labels: If True, prefix each model's response with @model: label.
+                     If False, skip labels (for single-model default routing).
+        """
+        import requests
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+
+            # Send message_start
+            msg_start = {
+                "type": "message_start",
+                "message": {
+                    "id": f"msg_{uuid.uuid4().hex[:24]}",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": "multi-model",
+                    "stop_reason": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                }
+            }
+            self.wfile.write(f"event: message_start\ndata: {json.dumps(msg_start)}\n\n".encode())
+            self.wfile.flush()
+
+            current_block_index = -1
+            all_responses = []  # Track (model_name, response_text) for @mention processing
+            called_models = set()
+            context_additions = []
+            in_chain = False  # Set to True after first model - chain calls always show labels
+
+            def stream_model_response(model_name: str, msgs: list, force_label: bool = False):
+                """Stream a single model's response, return full text.
+
+                force_label: If True, show label even if show_labels is False (for chain calls)
+                """
+                nonlocal current_block_index
+
+                # Get backend config for this model
+                # Try direct lookup first, then search by model_id
+                config = self.MODEL_REGISTRY.get(model_name)
+                registry_name = model_name
+                if not config:
+                    # Search by model_id (e.g. "devstral-2512" -> "devstral" entry)
+                    for name, cfg in self.MODEL_REGISTRY.items():
+                        if cfg.get("model_id") == model_name:
+                            config = cfg
+                            registry_name = name
+                            break
+                if not config:
+                    print(f"[Streaming] Unknown model: {model_name}")
+                    return ""
+
+                api_format = config.get("format", "openai")
+                backend_url = config.get("base_url", self.backend_url)
+                api_key_env = config.get("api_key_env", "MISTRAL_API_KEY")
+                api_key = os.environ.get(api_key_env, "")
+
+                # Start content block
+                current_block_index += 1
+                block_start = {
+                    "type": "content_block_start",
+                    "index": current_block_index,
+                    "content_block": {"type": "text", "text": ""}
+                }
+                self.wfile.write(f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode())
+                self.wfile.flush()
+
+                # Send model label only if requested
+                if show_labels or force_label:
+                    label = self.colorize_model(registry_name)
+                    delta_event = {
+                        "type": "content_block_delta",
+                        "index": current_block_index,
+                        "delta": {"type": "text_delta", "text": label}
+                    }
+                    self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n".encode())
+                    self.wfile.flush()
+
+                full_text = ""
+                try:
+                    if api_format == "anthropic":
+                        # Anthropic native streaming
+                        anthropic_request = {
+                            "model": config.get("model_id", model_name),
+                            "max_tokens": max_tokens,
+                            "stream": True,
+                            "messages": msgs,
+                        }
+                        if system:
+                            anthropic_request["system"] = system
+                        if temperature is not None:
+                            anthropic_request["temperature"] = temperature
+                        if tools:
+                            anthropic_request["tools"] = tools
+
+                        headers = {
+                            "x-api-key": api_key,
+                            "anthropic-version": "2023-06-01",
+                            "Content-Type": "application/json",
+                        }
+
+                        response = requests.post(
+                            f"{backend_url}/messages",
+                            headers=headers,
+                            json=anthropic_request,
+                            stream=True,
+                            timeout=300
+                        )
+                        response.raise_for_status()
+
+                        tool_blocks_anth = {}  # Track tool_use blocks for Anthropic
+                        for line in response.iter_lines():
+                            if not line:
+                                continue
+                            line = line.decode('utf-8')
+                            if line.startswith("data: "):
+                                data = line[6:]
+                                try:
+                                    chunk = json.loads(data)
+                                    chunk_type = chunk.get("type")
+
+                                    # Handle content_block_start - may be text or tool_use
+                                    if chunk_type == "content_block_start":
+                                        block = chunk.get("content_block", {})
+                                        if block.get("type") == "tool_use":
+                                            # Close text block if open
+                                            block_stop = {"type": "content_block_stop", "index": current_block_index}
+                                            self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
+                                            self.wfile.flush()
+
+                                            # Start tool_use block
+                                            current_block_index += 1
+                                            tool_idx = chunk.get("index", current_block_index)
+                                            tool_blocks_anth[tool_idx] = {"block_index": current_block_index, "id": block.get("id", "")}
+                                            block_start = {
+                                                "type": "content_block_start",
+                                                "index": current_block_index,
+                                                "content_block": {
+                                                    "type": "tool_use",
+                                                    "id": block.get("id", ""),
+                                                    "name": block.get("name", ""),
+                                                    "input": {}
+                                                }
+                                            }
+                                            self.wfile.write(f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode())
+                                            self.wfile.flush()
+
+                                    # Handle content_block_delta
+                                    elif chunk_type == "content_block_delta":
+                                        delta = chunk.get("delta", {})
+                                        delta_type = delta.get("type")
+                                        chunk_idx = chunk.get("index", 0)
+
+                                        if delta_type == "text_delta":
+                                            content = delta.get("text", "")
+                                            if content:
+                                                full_text += content
+                                                delta_event = {
+                                                    "type": "content_block_delta",
+                                                    "index": current_block_index,
+                                                    "delta": {"type": "text_delta", "text": content}
+                                                }
+                                                self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n".encode())
+                                                self.wfile.flush()
+                                        elif delta_type == "input_json_delta":
+                                            # Tool input streaming
+                                            if chunk_idx in tool_blocks_anth:
+                                                delta_event = {
+                                                    "type": "content_block_delta",
+                                                    "index": tool_blocks_anth[chunk_idx]["block_index"],
+                                                    "delta": {"type": "input_json_delta", "partial_json": delta.get("partial_json", "")}
+                                                }
+                                                self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n".encode())
+                                                self.wfile.flush()
+
+                                    # Handle content_block_stop
+                                    elif chunk_type == "content_block_stop":
+                                        chunk_idx = chunk.get("index", 0)
+                                        if chunk_idx in tool_blocks_anth:
+                                            block_stop = {"type": "content_block_stop", "index": tool_blocks_anth[chunk_idx]["block_index"]}
+                                            self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
+                                            self.wfile.flush()
+
+                                except json.JSONDecodeError:
+                                    pass
+                    else:
+                        # OpenAI-format streaming (Mistral, etc.)
+                        openai_messages = []
+                        if system:
+                            openai_messages.append({"role": "system", "content": system})
+                        for msg in msgs:
+                            content = msg.get("content", "")
+                            role = msg.get("role", "user")
+                            if isinstance(content, list):
+                                text_parts = [b.get("text", "") for b in content if b.get("type") == "text"]
+                                content = "\n".join(text_parts)
+                            openai_messages.append({"role": role, "content": content})
+
+                        openai_request = {
+                            "model": config.get("model_id", model_name),
+                            "messages": openai_messages,
+                            "stream": True,
+                            "max_tokens": max_tokens,
+                        }
+                        if temperature is not None:
+                            openai_request["temperature"] = temperature
+
+                        # Translate Anthropic tools to OpenAI format and add to request
+                        if tools:
+                            openai_tools = []
+                            for tool in tools:
+                                openai_tool = {
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool.get("name", ""),
+                                        "description": tool.get("description", ""),
+                                        "parameters": tool.get("input_schema", {})
+                                    }
+                                }
+                                openai_tools.append(openai_tool)
+                            openai_request["tools"] = openai_tools
+                            openai_request["tool_choice"] = "auto"
+
+                        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+                        # Debug: log request with tools
+                        if openai_request.get("tools"):
+                            print(f"[Streaming] Sending {len(openai_request['tools'])} tools to {backend_url}", flush=True)
+                            print(f"[Streaming] First tool: {json.dumps(openai_request['tools'][0])[:200]}", flush=True)
+
+                        response = requests.post(
+                            f"{backend_url}/chat/completions",
+                            headers=headers,
+                            json=openai_request,
+                            stream=True,
+                            timeout=300
+                        )
+                        if response.status_code != 200:
+                            # Capture error body before raise_for_status
+                            error_body = response.text[:1000] if response.text else "no body"
+                            print(f"[Streaming] Backend error {response.status_code}: {error_body}", flush=True)
+                        response.raise_for_status()
+
+                        tool_blocks_oai = {}  # Track tool_use blocks for OpenAI format
+                        text_block_open = True  # We started with a text block
+                        for line in response.iter_lines():
+                            if not line:
+                                continue
+                            line = line.decode('utf-8')
+                            if line.startswith("data: "):
+                                data = line[6:]
+                                if data == "[DONE]":
+                                    break
+                                try:
+                                    chunk = json.loads(data)
+                                    choice = chunk.get("choices", [{}])[0]
+                                    delta = choice.get("delta", {})
+
+                                    # Handle text content
+                                    content = delta.get("content", "")
+                                    if content:
+                                        full_text += content
+                                        delta_event = {
+                                            "type": "content_block_delta",
+                                            "index": current_block_index,
+                                            "delta": {"type": "text_delta", "text": content}
+                                        }
+                                        self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n".encode())
+                                        self.wfile.flush()
+
+                                    # Handle tool calls (OpenAI -> Anthropic format)
+                                    tool_calls = delta.get("tool_calls") or []
+                                    for tc in tool_calls:
+                                        tc_index = tc.get("index", 0)
+                                        tc_id = tc.get("id")
+                                        func = tc.get("function", {})
+                                        func_name = func.get("name")
+                                        func_args = func.get("arguments", "")
+
+                                        if tc_index not in tool_blocks_oai:
+                                            # Close text block if open
+                                            if text_block_open:
+                                                block_stop = {"type": "content_block_stop", "index": current_block_index}
+                                                self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
+                                                self.wfile.flush()
+                                                text_block_open = False
+
+                                            # Start new tool_use block
+                                            current_block_index += 1
+                                            anthropic_id = f"toolu_{uuid.uuid4().hex[:24]}"
+                                            tool_blocks_oai[tc_index] = {
+                                                "block_index": current_block_index,
+                                                "id": anthropic_id,
+                                                "name": func_name or "",
+                                                "arguments": ""
+                                            }
+                                            block_start = {
+                                                "type": "content_block_start",
+                                                "index": current_block_index,
+                                                "content_block": {
+                                                    "type": "tool_use",
+                                                    "id": anthropic_id,
+                                                    "name": func_name or "",
+                                                    "input": {}
+                                                }
+                                            }
+                                            self.wfile.write(f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode())
+                                            self.wfile.flush()
+
+                                        # Accumulate function arguments
+                                        if func_args:
+                                            tool_blocks_oai[tc_index]["arguments"] += func_args
+                                            delta_event = {
+                                                "type": "content_block_delta",
+                                                "index": tool_blocks_oai[tc_index]["block_index"],
+                                                "delta": {"type": "input_json_delta", "partial_json": func_args}
+                                            }
+                                            self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n".encode())
+                                            self.wfile.flush()
+
+                                except json.JSONDecodeError:
+                                    pass
+
+                        # Close any open tool blocks
+                        for tc_idx, tb in tool_blocks_oai.items():
+                            block_stop = {"type": "content_block_stop", "index": tb["block_index"]}
+                            self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
+                            self.wfile.flush()
+
+                except Exception as e:
+                    error_text = f"\n[Error from {model_name}: {e}]\n"
+                    delta_event = {
+                        "type": "content_block_delta",
+                        "index": current_block_index,
+                        "delta": {"type": "text_delta", "text": error_text}
+                    }
+                    self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n".encode())
+                    self.wfile.flush()
+
+                # End content block
+                block_stop = {"type": "content_block_stop", "index": current_block_index}
+                self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
+                self.wfile.flush()
+
+                # Parse and emit any announcements from the response
+                try:
+                    announcements = TranslatorHandler.parse_announcements(full_text, model_name)
+                    for ann in announcements:
+                        # Emit announcement as a special event
+                        ann_event = {
+                            "type": "announcement",
+                            "source": ann.get("source", model_name),
+                            "direction": ann.get("direction", "both"),
+                            "hops": ann.get("hops", 1),
+                            "emoji": ann.get("emoji"),
+                            "message": ann.get("message", ""),
+                            "channel": ann.get("channel"),
+                        }
+                        self.wfile.write(f"event: announcement\ndata: {json.dumps(ann_event)}\n\n".encode())
+                        self.wfile.flush()
+
+                        # Log the announcement
+                        direction_symbol = {"up": "⬆️", "down": "⬇️", "both": "↕️", "global": "🌐"}.get(ann.get("direction", "both"), "📢")
+                        emoji = ann.get("emoji", "")
+                        if emoji:
+                            emoji = f" {emoji}"
+                        logging.info(f"[ANNOUNCE] {direction_symbol}{emoji} {model_name}: {ann.get('message', '')[:50]}...")
+
+                        # Route to agent daemon
+                        TranslatorHandler.post_announcement(ann)
+                except Exception as e:
+                    logging.warning(f"Error parsing announcements: {e}")
+
+                # Parse spawn decisions (+1=opus,2=sonnet-3==)
+                try:
+                    spawn_decisions = TranslatorHandler.parse_spawn_decisions(full_text)
+                    if spawn_decisions["spawns"] or spawn_decisions["cancels"] or spawn_decisions["complete"]:
+                        spawn_event = {
+                            "type": "spawn_decision",
+                            "source": model_name,
+                            "spawns": spawn_decisions["spawns"],
+                            "cancels": spawn_decisions["cancels"],
+                            "complete": spawn_decisions["complete"],
+                        }
+                        self.wfile.write(f"event: spawn_decision\ndata: {json.dumps(spawn_event)}\n\n".encode())
+                        self.wfile.flush()
+
+                        # Log spawn decisions
+                        if spawn_decisions["spawns"]:
+                            spawn_str = ", ".join([f"{cid}={model}" for cid, model in spawn_decisions["spawns"]])
+                            logging.info(f"[SPAWN] {model_name} spawning: {spawn_str}")
+                        if spawn_decisions["cancels"]:
+                            logging.info(f"[SPAWN] {model_name} cancelling children: {spawn_decisions['cancels']}")
+                        if spawn_decisions["complete"]:
+                            logging.info(f"[SPAWN] {model_name} marking work complete")
+                except Exception as e:
+                    logging.warning(f"Error parsing spawn decisions: {e}")
+
+                return full_text
+
+            # Stream each user-requested model
+            for model_name in models:
+                called_models.add(model_name)
+
+                # Build messages with context from previous models (transparent strategy)
+                current_messages = messages.copy()
+                if strategy == "transparent" and context_additions:
+                    context_text = "\n\n".join(context_additions)
+                    for i in range(len(current_messages) - 1, -1, -1):
+                        if current_messages[i].get("role") == "user":
+                            orig = current_messages[i].get("content", "")
+                            if isinstance(orig, str):
+                                current_messages[i] = {
+                                    "role": "user",
+                                    "content": f"{orig}\n\n[Previous model responses:]\n{context_text}"
+                                }
+                            break
+
+                response_text = stream_model_response(model_name, current_messages)
+                all_responses.append((model_name, response_text))
+                context_additions.append(f"[@{model_name}]: {response_text}")
+
+            # Process @mentions from all responses
+            # Now supports: @model (chain), @delegate:model (handoff), @ask:model (consult)
+            if TranslatorHandler.mention_chain_limit > 0:
+                iterations = 0
+                delegated_to = None  # Track if we've handed off control
+
+                while iterations < TranslatorHandler.mention_chain_limit:
+                    iterations += 1
+                    new_mentions = []  # List of (model, mention_type, source_model)
+                    last_responder = None
+
+                    for m_name, m_text in all_responses:
+                        mentions = self.parse_model_output_mentions(m_text)
+                        for model, mention_type in mentions:
+                            if model not in called_models:
+                                new_mentions.append((model, mention_type, m_name))
+                                last_responder = m_name
+
+                    if not new_mentions:
+                        break
+
+                    # Stream each mentioned model
+                    for model_name, mention_type, source_model in new_mentions:
+                        if len(called_models) >= TranslatorHandler.mention_chain_limit + len(models):
+                            break
+
+                        called_models.add(model_name)
+
+                        # Build context for mentioned model
+                        context = "\n\n".join(f"[@{m}]: {t}" for m, t in all_responses)
+                        orig_user = messages[-1].get("content", "") if messages else ""
+                        agent_messages = messages[:-1].copy() if messages else []
+
+                        # Different prompts based on mention type
+                        if mention_type == "delegate":
+                            # Full handoff - delegate takes over completely
+                            agent_messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"{orig_user}\n\n"
+                                    f"[HANDOFF from @{source_model}:]\n{context}\n\n"
+                                    f"[@{source_model} has delegated this task to you. "
+                                    f"You are now the primary agent. Continue the conversation.]"
+                                )
+                            })
+                            delegated_to = model_name
+                        elif mention_type == "ask":
+                            # Single-turn consultation
+                            agent_messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"{orig_user}\n\n"
+                                    f"[CONSULTATION from @{source_model}:]\n{context}\n\n"
+                                    f"[@{source_model} is asking for your input on a specific question. "
+                                    f"Provide a focused response, then @{source_model} will continue.]"
+                                )
+                            })
+                        else:
+                            # Regular mention - chain continues
+                            agent_messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"{orig_user}\n\n"
+                                    f"[CONVERSATION - @{source_model} tagged you:]\n{context}\n\n"
+                                    f"[You are @{model_name}. Respond to @{source_model}.]"
+                                )
+                            })
+
+                        # Chain calls always show labels since there are multiple models
+                        response_text = stream_model_response(model_name, agent_messages, force_label=True)
+                        all_responses.append((model_name, response_text))
+
+            # Send message_delta and message_stop
+            msg_delta = {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 0}}
+            self.wfile.write(f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n".encode())
+            self.wfile.flush()
+
+            self.wfile.write(f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n".encode())
+            self.wfile.flush()
+
+            # Record all model responses in context cache (for timeline and classifier)
+            if TranslatorHandler.context_manager and all_responses:
+                try:
+                    for model_name, response_text in all_responses:
+                        TranslatorHandler.context_manager.record_model_response(model_name, response_text)
+                except Exception as ctx_err:
+                    print(f"[Router] Context recording failed (non-fatal): {ctx_err}")
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            error_event = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
+            self.wfile.write(f"event: error\ndata: {json.dumps(error_event)}\n\n".encode())
+            self.wfile.flush()
+
+            # Record error in context cache
+            if TranslatorHandler.context_manager:
+                try:
+                    TranslatorHandler.context_manager.record_error(str(e))
+                except Exception:
+                    pass  # Don't fail on context recording
+
     def _translate_response(self, openai_response: dict) -> dict:
         """Translate OpenAI response to Anthropic format"""
         choice = openai_response.get("choices", [{}])[0]
@@ -655,6 +2765,12 @@ def translator_daemon_main(port: int, backend_url: str, backend_api_key: str, ba
 
     # Write PID file
     TRANSLATOR_PID_FILE.write_text(str(os.getpid()))
+
+    # Load persisted router settings
+    TranslatorHandler.load_router_settings()
+
+    # Initialize context cache (connects to Rust daemon if available)
+    TranslatorHandler.init_context_cache()
 
     # Start server
     server = HTTPServer(("127.0.0.1", port), TranslatorHandler)
