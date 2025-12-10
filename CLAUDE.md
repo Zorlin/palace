@@ -35,6 +35,30 @@ This principle is encoded into Palace's DNA and applies to:
 
 **The user is in control. Always.**
 
+## 🔥 Golden Rule #2.5: ALWAYS SELECT MULTIPLE TASKS
+
+When you see a Palace task selector menu like:
+```
+💡 Select action(s):
+  1.      Task one
+  2.      Task two
+  3.      Task three
+  0.      Exit loop
+
+>:
+```
+
+**NEVER SELECT JUST ONE TASK. Select multiple (or skip bad ones).**
+
+- Correct: `1,2,3,4,5` or `1 2 3 4 5` (select all)
+- Correct: `1,2,4,5` (skip task 3 if it's bad/redundant)
+- Correct: `1,3` (select 2 good ones, skip bad ones)
+- WRONG: `1` (NEVER just one!)
+
+The ENTIRE POINT of Palace swarms is **parallel execution**. Selecting a single task wastes massive time and defeats the purpose. You are running a SWARM, not a single agent.
+
+**It is OK to skip tasks that are bad/redundant. It is NOT OK to select only one.**
+
 ## 🥉 Golden Rule #3: NEVER Skip Permissions
 
 **NEVER use `--dangerously-skip-permissions`. EVER.**

@@ -19,6 +19,10 @@ import re
 import shutil
 import uuid
 import time
+import threading
+import socket
+import signal
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -36,6 +40,1499 @@ _load_credentials()
 
 VERSION = "0.1.0"
 
+# ============================================================================
+# Watch Daemon Architecture
+# ============================================================================
+# Single daemon manages all project watchers. `pal watch` is a client.
+# Daemon spawns automatically on first invocation if not running.
+
+WATCHD_DEFAULT_PORT = 19847
+
+# ============================================================================
+# Translator Daemon Architecture
+# ============================================================================
+# Translates Anthropic API format to OpenAI format for Mistral/Ollama.
+# Auto-starts when --devstral or --smol flags are used.
+# `pal translator` manages the daemon lifecycle.
+
+TRANSLATOR_DEFAULT_PORT = 19848
+# Use XDG_RUNTIME_DIR if available (usually /run/user/$UID), fallback to ~/.palace/run
+_RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", str(Path.home() / ".palace" / "run"))) / "palace"
+WATCHD_PID_FILE = _RUNTIME_DIR / "watchd.pid"
+WATCHD_STATUS_DIR = _RUNTIME_DIR / "build-status"
+WATCHD_CREDS_FILE = Path.home() / ".palace" / "build-client.env"
+TRANSLATOR_PID_FILE = _RUNTIME_DIR / "translator.pid"
+TRANSLATOR_CONFIG_FILE = _RUNTIME_DIR / "translator.json"
+
+
+class TranslatorHandler(BaseHTTPRequestHandler):
+    """
+    HTTP handler that translates Anthropic API requests to OpenAI format.
+
+    Accepts requests in Anthropic format at /v1/messages
+    Forwards to configured backend (Mistral API or Ollama) in OpenAI format
+    Translates response back to Anthropic format
+    """
+
+    # Class-level config set by daemon startup
+    backend_url = "https://api.mistral.ai/v1"
+    backend_api_key = ""
+    backend_model = "devstral-2512"
+
+    # Tool call limit to prevent infinite loops
+    MAX_TOOL_CALLS = 15
+
+    # Tool ID mapping: Mistral requires 9-char alphanumeric IDs
+    # Anthropic uses toolu_XXXX format. We map bidirectionally.
+    # Key: anthropic_id, Value: mistral_id (and reverse lookup via mistral_to_anthropic)
+    anthropic_to_mistral = {}  # toolu_xxx -> abc123xyz
+    mistral_to_anthropic = {}  # abc123xyz -> toolu_xxx
+    _id_counter = 0
+
+    @classmethod
+    def get_mistral_id(cls, anthropic_id: str) -> str:
+        """Convert Anthropic tool ID to Mistral-compatible 9-char ID."""
+        if anthropic_id in cls.anthropic_to_mistral:
+            return cls.anthropic_to_mistral[anthropic_id]
+        # Generate new 9-char alphanumeric ID
+        import string
+        import random
+        chars = string.ascii_letters + string.digits
+        mistral_id = ''.join(random.choice(chars) for _ in range(9))
+        cls.anthropic_to_mistral[anthropic_id] = mistral_id
+        cls.mistral_to_anthropic[mistral_id] = anthropic_id
+        return mistral_id
+
+    @classmethod
+    def get_anthropic_id(cls, mistral_id: str) -> str:
+        """Convert Mistral tool ID back to original Anthropic ID."""
+        return cls.mistral_to_anthropic.get(mistral_id, mistral_id)
+
+    def log_message(self, format, *args):
+        """Log requests for debugging"""
+        print(f"[Translator] {format % args}")
+
+    def do_POST(self):
+        """Handle POST requests - translate and forward"""
+        import requests
+
+        # Accept various Anthropic API paths (strip query strings)
+        path_without_query = self.path.split('?')[0]
+        valid_paths = ["/v1/messages", "/messages", "/v1/complete", "/complete"]
+        if path_without_query not in valid_paths:
+            print(f"[Translator] Unknown path: {self.path}")
+            self.send_error(404, f"Not Found: {self.path}")
+            return
+
+        try:
+            # Read request body
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            anthropic_request = json.loads(body)
+
+            # Debug: log the incoming request
+            print(f"[Translator] Incoming request keys: {list(anthropic_request.keys())}")
+            # Log message roles and types to debug tool flow
+            messages = anthropic_request.get("messages", [])
+            for i, msg in enumerate(messages):
+                role = msg.get("role", "?")
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    types = [b.get("type", "?") if isinstance(b, dict) else "str" for b in content]
+                    print(f"[Translator] Message {i}: role={role}, content_types={types}")
+                else:
+                    print(f"[Translator] Message {i}: role={role}, content_len={len(content) if content else 0}")
+
+            # Extract Anthropic format fields
+            messages = anthropic_request.get("messages", [])
+            system_raw = anthropic_request.get("system", "")
+            max_tokens = anthropic_request.get("max_tokens", 4096)
+            model = anthropic_request.get("model", self.backend_model)
+            stream = anthropic_request.get("stream", False)
+            temperature = anthropic_request.get("temperature")
+            anthropic_tools = anthropic_request.get("tools", [])
+            # Note: 'thinking', 'metadata' are ignored - not supported by Mistral
+
+            # Count tool_use messages to detect infinite loops
+            tool_use_count = 0
+            for msg in messages:
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            tool_use_count += 1
+
+            # If too many tool calls, return a forced text completion
+            if tool_use_count >= self.MAX_TOOL_CALLS:
+                print(f"[Translator] Tool limit hit ({tool_use_count} >= {self.MAX_TOOL_CALLS}) - forcing text response")
+                forced_response = {
+                    "id": f"msg_{uuid.uuid4().hex[:24]}",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "text",
+                        "text": f"[Tool limit reached after {tool_use_count} calls. Based on the information gathered so far, I need to provide a summary rather than continue calling tools. Please review the tool results above and ask a follow-up question if you need more specific information.]"
+                    }],
+                    "model": self.backend_model,
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 0, "output_tokens": 50}
+                }
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(forced_response).encode())
+                return
+
+            # Handle system prompt - can be string or array of content blocks
+            system_text = ""
+            if isinstance(system_raw, str):
+                system_text = system_raw
+            elif isinstance(system_raw, list):
+                # Array of content blocks like [{"type": "text", "text": "..."}]
+                parts = []
+                for block in system_raw:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                    elif isinstance(block, str):
+                        parts.append(block)
+                system_text = "\n".join(parts)
+
+            # Add tool completion guidance for models that don't stop naturally
+            # This helps models like Devstral know when to stop calling tools
+            tool_guidance = """
+
+CRITICAL: TOOL COMPLETION RULES
+1. After gathering information with Read/Glob/Grep, STOP calling tools and provide your analysis as TEXT
+2. Do NOT read the same file multiple times - use the result you already have
+3. When you have enough information to answer, STOP using tools and respond with text
+4. Maximum 10 tool calls per response - then you MUST provide a text answer
+5. If asked to analyze a project, read key files ONCE then write your analysis as text"""
+
+            if anthropic_tools:
+                system_text = system_text + tool_guidance if system_text else tool_guidance.strip()
+
+            # Translate to OpenAI format
+            openai_messages = []
+            if system_text:
+                openai_messages.append({"role": "system", "content": system_text})
+
+            # Track if we have a prefilled assistant response (for JSON mode)
+            assistant_prefix = None
+
+            for msg in messages:
+                content = msg.get("content", "")
+                role = msg.get("role", "user")
+
+                # Handle content blocks (Anthropic format)
+                if isinstance(content, list):
+                    text_parts = []
+                    tool_uses = []  # tool_use blocks in assistant messages
+                    tool_results = []  # tool_result blocks in user messages
+
+                    for block in content:
+                        if isinstance(block, dict):
+                            block_type = block.get("type", "")
+                            if block_type == "text":
+                                text_parts.append(block.get("text", ""))
+                            elif block_type == "tool_use":
+                                # Assistant is requesting a tool call
+                                # Convert Anthropic tool ID to Mistral-compatible 9-char format
+                                anthropic_id = block.get("id", "")
+                                mistral_id = self.get_mistral_id(anthropic_id)
+                                tool_uses.append({
+                                    "id": mistral_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": block.get("name", ""),
+                                        "arguments": json.dumps(block.get("input", {}))
+                                    }
+                                })
+                            elif block_type == "tool_result":
+                                # User is providing tool results
+                                # Convert Anthropic tool ID to Mistral-compatible 9-char format
+                                anthropic_id = block.get("tool_use_id", "")
+                                mistral_id = self.get_mistral_id(anthropic_id)
+                                tool_results.append({
+                                    "tool_call_id": mistral_id,
+                                    "content": block.get("content", "")
+                                })
+                        elif isinstance(block, str):
+                            text_parts.append(block)
+
+                    # Handle assistant messages with tool calls
+                    if role == "assistant" and tool_uses:
+                        openai_msg = {"role": "assistant"}
+                        if text_parts:
+                            openai_msg["content"] = "\n".join(text_parts)
+                        else:
+                            openai_msg["content"] = None  # Required by OpenAI when tool_calls present
+                        openai_msg["tool_calls"] = tool_uses
+                        openai_messages.append(openai_msg)
+                        continue
+
+                    # Handle user messages with tool results - convert to "tool" role messages
+                    if tool_results:
+                        for tr in tool_results:
+                            openai_messages.append({
+                                "role": "tool",
+                                "tool_call_id": tr["tool_call_id"],
+                                "content": tr["content"] if isinstance(tr["content"], str) else json.dumps(tr["content"])
+                            })
+                        continue
+
+                    content = "\n".join(text_parts)
+
+                # Skip empty assistant messages (Mistral requires content or tool_calls)
+                if role == "assistant" and not content:
+                    continue
+
+                openai_messages.append({
+                    "role": role,
+                    "content": content
+                })
+
+            # Mistral requires last message to be user/tool, not assistant
+            # If Claude is prefilling assistant response (e.g., "{" for JSON),
+            # we need to remove it and add as response_format or prefix hint
+            if openai_messages and openai_messages[-1]["role"] == "assistant":
+                assistant_prefix = openai_messages.pop()["content"]
+                # Add a hint to the system prompt that response should start with this
+                if system_text:
+                    system_text += f"\n\nIMPORTANT: Your response MUST start with: {assistant_prefix}"
+                    # Update system message
+                    if openai_messages and openai_messages[0]["role"] == "system":
+                        openai_messages[0]["content"] = system_text
+                    else:
+                        openai_messages.insert(0, {"role": "system", "content": system_text})
+
+            # Translate Anthropic tools to OpenAI format
+            openai_tools = []
+            for tool in anthropic_tools:
+                openai_tool = {
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name", ""),
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("input_schema", {})
+                    }
+                }
+                openai_tools.append(openai_tool)
+
+            # Build OpenAI request
+            openai_request = {
+                "model": self.backend_model,
+                "messages": openai_messages,
+                "max_tokens": max_tokens,
+                "stream": stream
+            }
+            if temperature is not None:
+                openai_request["temperature"] = temperature
+            if openai_tools:
+                openai_request["tools"] = openai_tools
+                openai_request["tool_choice"] = "auto"
+
+            # Forward to backend
+            headers = {"Content-Type": "application/json"}
+            if self.backend_api_key:
+                headers["Authorization"] = f"Bearer {self.backend_api_key}"
+
+            if stream:
+                # Streaming response
+                self._handle_streaming(openai_request, headers)
+            else:
+                # Non-streaming response
+                print(f"[Translator] Sending to backend: {json.dumps(openai_request)[:500]}")
+                response = requests.post(
+                    f"{self.backend_url}/chat/completions",
+                    headers=headers,
+                    json=openai_request,
+                    timeout=300
+                )
+                if response.status_code != 200:
+                    print(f"[Translator] Backend error {response.status_code}: {response.text[:500]}")
+                response.raise_for_status()
+                openai_response = response.json()
+
+                # Log the finish reason to debug looping
+                choice = openai_response.get("choices", [{}])[0]
+                finish_reason = choice.get("finish_reason", "?")
+                message = choice.get("message", {})
+                has_tool_calls = bool(message.get("tool_calls"))
+                has_content = bool(message.get("content"))
+                print(f"[Translator] Response: finish_reason={finish_reason}, has_tool_calls={has_tool_calls}, has_content={has_content}")
+
+                # Translate back to Anthropic format
+                anthropic_response = self._translate_response(openai_response)
+
+                # Send response
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(anthropic_response).encode())
+
+        except Exception as e:
+            import traceback
+            print(f"[Translator] ERROR: {e}")
+            traceback.print_exc()
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            error_response = {
+                "type": "error",
+                "error": {"type": "api_error", "message": str(e)}
+            }
+            self.wfile.write(json.dumps(error_response).encode())
+
+    def _handle_streaming(self, openai_request, headers):
+        """Handle streaming responses with SSE translation"""
+        import requests
+
+        try:
+            response = requests.post(
+                f"{self.backend_url}/chat/completions",
+                headers=headers,
+                json=openai_request,
+                stream=True,
+                timeout=300
+            )
+            response.raise_for_status()
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+
+            # Send message_start event
+            msg_start = {
+                "type": "message_start",
+                "message": {
+                    "id": f"msg_{uuid.uuid4().hex[:24]}",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": self.backend_model,
+                    "stop_reason": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0}
+                }
+            }
+            self.wfile.write(f"event: message_start\ndata: {json.dumps(msg_start)}\n\n".encode())
+            self.wfile.flush()
+
+            # Track content blocks - we'll add them as we encounter them
+            current_block_index = -1
+            text_block_started = False
+            tool_blocks = {}  # tool_call_index -> {id, name, arguments_buffer}
+            finish_reason = "end_turn"
+
+            # Buffer for paragraph-based content blocks
+            text_buffer = ""
+
+            def flush_content_block(text, is_final=False):
+                """Flush buffered text as a complete content block."""
+                nonlocal text_block_started, current_block_index, text_buffer
+                if not text:
+                    return
+
+                # Start block if needed
+                if not text_block_started:
+                    current_block_index += 1
+                    block_start = {"type": "content_block_start", "index": current_block_index, "content_block": {"type": "text", "text": ""}}
+                    self.wfile.write(f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode())
+                    self.wfile.flush()
+                    text_block_started = True
+
+                # Send the text
+                delta_event = {
+                    "type": "content_block_delta",
+                    "index": current_block_index,
+                    "delta": {"type": "text_delta", "text": text}
+                }
+                self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n".encode())
+                self.wfile.flush()
+
+                # Close block on paragraph boundaries (forces Claude Code to render)
+                if not is_final and text.endswith("\n\n"):
+                    block_stop = {"type": "content_block_stop", "index": current_block_index}
+                    self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
+                    self.wfile.flush()
+                    text_block_started = False  # Next text will start new block
+
+            # Process SSE stream from backend
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                line = line.decode('utf-8')
+                if line.startswith("data: "):
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        choice = chunk.get("choices", [{}])[0]
+                        delta = choice.get("delta", {})
+                        chunk_finish = choice.get("finish_reason")
+                        if chunk_finish:
+                            finish_reason = chunk_finish
+
+                        # Handle text content - buffer and flush on paragraph boundaries
+                        content = delta.get("content", "")
+                        if content:
+                            text_buffer += content
+                            # Flush complete paragraphs as separate content blocks
+                            while "\n\n" in text_buffer:
+                                para, text_buffer = text_buffer.split("\n\n", 1)
+                                flush_content_block(para + "\n\n")
+
+                        # Handle tool calls
+                        tool_calls = delta.get("tool_calls") or []
+                        for tc in tool_calls:
+                            tc_index = tc.get("index", 0)
+                            tc_id = tc.get("id")
+                            func = tc.get("function", {})
+                            func_name = func.get("name")
+                            func_args = func.get("arguments", "")
+
+                            if tc_index not in tool_blocks:
+                                # Close text block if open
+                                if text_block_started:
+                                    block_stop = {"type": "content_block_stop", "index": current_block_index}
+                                    self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
+                                    self.wfile.flush()
+                                    text_block_started = False
+
+                                # Start new tool_use block
+                                current_block_index += 1
+                                # Generate Anthropic-style ID and map it to Mistral's ID
+                                anthropic_id = f"toolu_{uuid.uuid4().hex[:24]}"
+                                if tc_id:
+                                    # Map Mistral's ID to the Anthropic ID we're returning
+                                    self.anthropic_to_mistral[anthropic_id] = tc_id
+                                    self.mistral_to_anthropic[tc_id] = anthropic_id
+                                tool_blocks[tc_index] = {
+                                    "block_index": current_block_index,
+                                    "id": anthropic_id,
+                                    "name": func_name or "",
+                                    "arguments": ""
+                                }
+                                block_start = {
+                                    "type": "content_block_start",
+                                    "index": current_block_index,
+                                    "content_block": {
+                                        "type": "tool_use",
+                                        "id": tool_blocks[tc_index]["id"],
+                                        "name": tool_blocks[tc_index]["name"],
+                                        "input": {}
+                                    }
+                                }
+                                self.wfile.write(f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode())
+                                self.wfile.flush()
+
+                            # Accumulate function arguments
+                            if func_args:
+                                tool_blocks[tc_index]["arguments"] += func_args
+                                delta_event = {
+                                    "type": "content_block_delta",
+                                    "index": tool_blocks[tc_index]["block_index"],
+                                    "delta": {"type": "input_json_delta", "partial_json": func_args}
+                                }
+                                self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n".encode())
+                                self.wfile.flush()
+
+                    except json.JSONDecodeError:
+                        pass
+
+            # Flush any remaining buffered text
+            if text_buffer:
+                flush_content_block(text_buffer, is_final=True)
+
+            # Close any open text block
+            if text_block_started:
+                block_stop = {"type": "content_block_stop", "index": current_block_index}
+                self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
+                self.wfile.flush()
+
+            # Close any open tool blocks
+            for tc_index, tb in tool_blocks.items():
+                block_stop = {"type": "content_block_stop", "index": tb["block_index"]}
+                self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
+                self.wfile.flush()
+
+            # Determine stop reason
+            print(f"[Translator] Stream finished: finish_reason={finish_reason}, tool_blocks={len(tool_blocks)}, text_started={text_block_started}")
+            stop_reason = "end_turn"
+            if finish_reason == "tool_calls":
+                stop_reason = "tool_use"
+            elif finish_reason == "length":
+                stop_reason = "max_tokens"
+
+            # Send message_delta (stop reason)
+            msg_delta = {"type": "message_delta", "delta": {"stop_reason": stop_reason}, "usage": {"output_tokens": 0}}
+            self.wfile.write(f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n".encode())
+            self.wfile.flush()
+
+            # Send message_stop
+            self.wfile.write(f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n".encode())
+            self.wfile.flush()
+
+        except Exception as e:
+            error_event = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
+            self.wfile.write(f"event: error\ndata: {json.dumps(error_event)}\n\n".encode())
+            self.wfile.flush()
+
+    def _translate_response(self, openai_response: dict) -> dict:
+        """Translate OpenAI response to Anthropic format"""
+        choice = openai_response.get("choices", [{}])[0]
+        message = choice.get("message", {})
+        usage = openai_response.get("usage", {})
+        finish_reason = choice.get("finish_reason", "stop")
+
+        content = []
+        # Add text content if present
+        if message.get("content"):
+            content.append({"type": "text", "text": message["content"]})
+
+        # Translate tool_calls to Anthropic tool_use format
+        tool_calls = message.get("tool_calls") or []
+        for tc in tool_calls:
+            func = tc.get("function", {})
+            try:
+                args = json.loads(func.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                args = {}
+            # Generate Anthropic-style ID and map it to Mistral's ID
+            mistral_id = tc.get("id")
+            anthropic_id = f"toolu_{uuid.uuid4().hex[:24]}"
+            if mistral_id:
+                self.anthropic_to_mistral[anthropic_id] = mistral_id
+                self.mistral_to_anthropic[mistral_id] = anthropic_id
+            content.append({
+                "type": "tool_use",
+                "id": anthropic_id,
+                "name": func.get("name", ""),
+                "input": args
+            })
+
+        # Determine stop reason
+        stop_reason = "end_turn"
+        if finish_reason == "tool_calls":
+            stop_reason = "tool_use"
+        elif finish_reason == "length":
+            stop_reason = "max_tokens"
+
+        return {
+            "id": f"msg_{uuid.uuid4().hex[:24]}",
+            "type": "message",
+            "role": "assistant",
+            "content": content,
+            "model": self.backend_model,
+            "stop_reason": stop_reason,
+            "usage": {
+                "input_tokens": usage.get("prompt_tokens", 0),
+                "output_tokens": usage.get("completion_tokens", 0)
+            }
+        }
+
+
+def translator_daemon_main(port: int, backend_url: str, backend_api_key: str, backend_model: str):
+    """Main function for translator daemon process"""
+    # Ensure runtime directory exists
+    _RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Configure handler
+    TranslatorHandler.backend_url = backend_url
+    TranslatorHandler.backend_api_key = backend_api_key
+    TranslatorHandler.backend_model = backend_model
+
+    # Write config file for status checks
+    config = {
+        "port": port,
+        "backend_url": backend_url,
+        "backend_model": backend_model,
+        "pid": os.getpid(),
+        "started": time.time()
+    }
+    TRANSLATOR_CONFIG_FILE.write_text(json.dumps(config, indent=2))
+
+    # Write PID file
+    TRANSLATOR_PID_FILE.write_text(str(os.getpid()))
+
+    # Start server
+    server = HTTPServer(("127.0.0.1", port), TranslatorHandler)
+    print(f"🔄 Translator daemon running on http://127.0.0.1:{port}")
+    print(f"   Backend: {backend_url}")
+    print(f"   Model: {backend_model}")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Cleanup
+        if TRANSLATOR_PID_FILE.exists():
+            TRANSLATOR_PID_FILE.unlink()
+        if TRANSLATOR_CONFIG_FILE.exists():
+            TRANSLATOR_CONFIG_FILE.unlink()
+
+
+def ensure_translator_running(backend_url: str, backend_api_key: str, backend_model: str) -> int:
+    """
+    Ensure translator daemon is running with correct config.
+    Returns the port the daemon is listening on.
+    Auto-starts daemon if not running.
+    """
+    port = TRANSLATOR_DEFAULT_PORT
+
+    # Check if already running
+    if TRANSLATOR_PID_FILE.exists():
+        try:
+            pid = int(TRANSLATOR_PID_FILE.read_text().strip())
+            # Check if process is alive
+            os.kill(pid, 0)
+
+            # Check if config matches
+            if TRANSLATOR_CONFIG_FILE.exists():
+                config = json.loads(TRANSLATOR_CONFIG_FILE.read_text())
+                if (config.get("backend_url") == backend_url and
+                    config.get("backend_model") == backend_model):
+                    # Already running with correct config
+                    return config.get("port", port)
+                else:
+                    # Config mismatch - kill and restart
+                    os.kill(pid, signal.SIGTERM)
+                    time.sleep(0.5)
+        except (ProcessLookupError, ValueError, OSError):
+            # Process not running or invalid PID
+            pass
+
+    # Start daemon in background
+    _RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Fork and detach
+    cmd = [
+        sys.executable, __file__,
+        "translator", "--daemon",
+        "--port", str(port),
+        "--backend-url", backend_url,
+        "--backend-model", backend_model
+    ]
+    if backend_api_key:
+        cmd.extend(["--backend-api-key", backend_api_key])
+
+    # Start detached process
+    subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True
+    )
+
+    # Wait for daemon to start
+    for _ in range(50):  # 5 seconds max
+        time.sleep(0.1)
+        if TRANSLATOR_PID_FILE.exists():
+            try:
+                pid = int(TRANSLATOR_PID_FILE.read_text().strip())
+                os.kill(pid, 0)
+                return port
+            except (ProcessLookupError, ValueError):
+                pass
+
+    raise RuntimeError("Failed to start translator daemon")
+
+
+class ProjectWorker(threading.Thread):
+    """Continuous build + test worker for one project."""
+
+    def __init__(self, path: Path, status_dir: Path):
+        super().__init__(daemon=True)
+        self.path = path
+        self.status_dir = status_dir
+        self.status_file = status_dir / f"{path.name}.json"
+        self.running = True
+        self.last_build_status = "unknown"
+        self.last_test_status = "unknown"
+        self.last_build_ok = None  # timestamp
+        self.last_test_ok = None   # timestamp
+        self.last_errors = []      # last non-empty error list (for stale display)
+        self.test_cycle = 0        # run tests every N builds
+        self.project_types = self._detect_project_types()
+
+        # Build commands per type
+        self.build_commands = {
+            "rust": ["cargo", "check", "--message-format=short"],
+            "node": ["npm", "run", "build"],
+            "python": ["python", "-m", "py_compile"],
+        }
+        # Test commands per type
+        self.test_commands = {
+            "rust": ["cargo", "test", "--no-fail-fast", "--", "--format=terse"],
+            "node": ["npm", "test"],
+            "python": ["pytest", "-q", "--tb=no"],
+        }
+
+    def _detect_project_types(self) -> list:
+        """Detect project type(s) based on config files. Checks subdirs too."""
+        types = []
+        # Check root
+        if (self.path / "Cargo.toml").exists():
+            types.append("rust")
+        if (self.path / "package.json").exists():
+            types.append("node")
+        if (self.path / "pyproject.toml").exists() or (self.path / "setup.py").exists():
+            types.append("python")
+        if (self.path / "requirements.txt").exists() and "python" not in types:
+            types.append("python")
+        # Check common subdirs (frontend/backend pattern)
+        for subdir in ["frontend", "backend", "web", "api", "server", "client"]:
+            sub = self.path / subdir
+            if sub.exists():
+                if (sub / "package.json").exists() and "node" not in types:
+                    types.append("node")
+                if (sub / "Cargo.toml").exists() and "rust" not in types:
+                    types.append("rust")
+        return types
+
+    def _get_mtime(self) -> float:
+        """Get max mtime of source files."""
+        max_mtime = 0.0
+        patterns = {
+            "rust": ["src/**/*.rs", "Cargo.toml", "**/Cargo.toml"],
+            "node": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.js", "src/**/*.vue", "package.json", "**/package.json"],
+            "python": ["**/*.py"],
+        }
+        for ptype in self.project_types:
+            for pattern in patterns.get(ptype, []):
+                for f in self.path.glob(pattern):
+                    try:
+                        mtime = f.stat().st_mtime
+                        if mtime > max_mtime:
+                            max_mtime = mtime
+                    except (OSError, FileNotFoundError):
+                        pass
+        return max_mtime
+
+    def _parse_errors(self, stderr: str, ptype: str) -> list:
+        """Extract ALL error lines (truncation happens at display time)."""
+        errors = []
+        lines = stderr.splitlines()
+
+        if ptype == "rust":
+            # --message-format=short outputs: "src/file.rs:10:5: error[E0432]: msg"
+            # Also capture regular "error[E...]:" lines
+            for line in lines:
+                # Skip summary lines and warnings
+                if line.startswith("error: could not compile"):
+                    continue
+                if "warning:" in line:
+                    continue
+                # Capture actual errors
+                if "error[E" in line or (": error:" in line):
+                    errors.append(line.strip()[:120])
+            # If no specific errors found, fall back to summary
+            if not errors:
+                for line in lines:
+                    if line.startswith("error:"):
+                        errors.append(line[:120])
+                        break
+        elif ptype == "node":
+            for line in lines:
+                if "error" in line.lower() or "Error" in line:
+                    errors.append(line[:120])
+        else:
+            # Generic: first 20 non-empty lines
+            for line in lines[:20]:
+                line = line.strip()
+                if line:
+                    errors.append(line[:120])
+        return errors
+
+    def _parse_test_results(self, output: str, ptype: str) -> dict:
+        """Parse test output to extract pass/fail counts."""
+        passed = 0
+        failed = 0
+        failures = []
+
+        if ptype == "rust":
+            # Look for "test result: ok. X passed; Y failed"
+            for line in output.splitlines():
+                if "test result:" in line:
+                    import re
+                    m = re.search(r'(\d+) passed.*?(\d+) failed', line)
+                    if m:
+                        passed = int(m.group(1))
+                        failed = int(m.group(2))
+                elif "FAILED" in line and "test " in line:
+                    failures.append(line.strip()[:80])
+        elif ptype == "python":
+            # pytest: "X passed, Y failed"
+            for line in output.splitlines():
+                if " passed" in line or " failed" in line:
+                    import re
+                    m = re.search(r'(\d+) passed', line)
+                    if m:
+                        passed = int(m.group(1))
+                    m = re.search(r'(\d+) failed', line)
+                    if m:
+                        failed = int(m.group(1))
+                elif "FAILED" in line:
+                    failures.append(line.strip()[:80])
+
+        return {"passed": passed, "failed": failed, "failures": failures[:5]}
+
+    def _write_status(self, build_status: str, build_errors: list = None,
+                      test_status: str = None, test_results: dict = None):
+        """Write comprehensive status to file."""
+        now = time.time()
+
+        # Update last_ok timestamps
+        if build_status == "ok":
+            self.last_build_ok = now
+        if test_status == "ok":
+            self.last_test_ok = now
+
+        # Track last non-empty errors for stale display
+        current_errors = build_errors or []
+        if current_errors:
+            self.last_errors = current_errors[:5]
+            self.last_error_count = len(current_errors)
+        stale_errors = self.last_errors if (not current_errors and self.last_errors) else []
+        stale_count = getattr(self, 'last_error_count', 0) if stale_errors else 0
+
+        data = {
+            "project": str(self.path),
+            "name": self.path.name,
+            "types": self.project_types,
+            "timestamp": now,
+            "build": {
+                "status": build_status,
+                "errors": current_errors[:5],
+                "error_count": len(current_errors),
+                "stale_errors": stale_errors,
+                "stale_error_count": stale_count,
+                "last_ok": self.last_build_ok,
+            },
+        }
+
+        if test_status:
+            data["tests"] = {
+                "status": test_status,
+                "passed": test_results.get("passed", 0) if test_results else 0,
+                "failed": test_results.get("failed", 0) if test_results else 0,
+                "failures": test_results.get("failures", []) if test_results else [],
+                "last_ok": self.last_test_ok,
+            }
+
+        self.status_file.write_text(json.dumps(data, indent=2))
+
+    def _run_build(self) -> tuple:
+        """Run build. Returns (changed_during_build, success)."""
+        mtime_before = self._get_mtime()
+
+        all_errors = []
+        success = True
+
+        for ptype in self.project_types:
+            if ptype not in self.build_commands:
+                continue
+            cmd = self.build_commands[ptype]
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=300,
+                    cwd=str(self.path)
+                )
+                if result.returncode != 0:
+                    success = False
+                    errors = self._parse_errors(result.stderr, ptype)
+                    all_errors.extend(errors)
+            except subprocess.TimeoutExpired:
+                success = False
+                all_errors.append(f"[{ptype}] build timeout (300s)")
+            except FileNotFoundError:
+                pass
+
+        mtime_after = self._get_mtime()
+        changed = mtime_after > mtime_before
+
+        status = "ok" if success else "broken"
+        if status != self.last_build_status:
+            print(f"[watchd] {self.path.name}: BUILD {'OK' if success else 'BROKEN'}")
+        self.last_build_status = status
+
+        return changed, success, all_errors
+
+    def _run_tests(self) -> tuple:
+        """Run tests. Returns (success, results_dict)."""
+        all_passed = 0
+        all_failed = 0
+        all_failures = []
+
+        for ptype in self.project_types:
+            if ptype not in self.test_commands:
+                continue
+            cmd = self.test_commands[ptype]
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=600,
+                    cwd=str(self.path)
+                )
+                output = result.stdout + result.stderr
+                parsed = self._parse_test_results(output, ptype)
+                all_passed += parsed["passed"]
+                all_failed += parsed["failed"]
+                all_failures.extend(parsed["failures"])
+            except subprocess.TimeoutExpired:
+                all_failures.append(f"[{ptype}] test timeout (600s)")
+                all_failed += 1
+            except FileNotFoundError:
+                pass
+
+        success = all_failed == 0
+        status = "ok" if success else "failed"
+        if status != self.last_test_status:
+            print(f"[watchd] {self.path.name}: TESTS {all_passed}/{all_passed + all_failed}")
+        self.last_test_status = status
+
+        return success, {"passed": all_passed, "failed": all_failed, "failures": all_failures[:5]}
+
+    def run(self):
+        """Main worker loop."""
+        print(f"[watchd] Starting worker for {self.path}")
+        while self.running:
+            changed, build_ok, build_errors = self._run_build()
+
+            # Run tests every 5 build cycles if build is ok
+            test_status = None
+            test_results = None
+            self.test_cycle += 1
+            if build_ok and self.test_cycle >= 5:
+                self.test_cycle = 0
+                test_ok, test_results = self._run_tests()
+                test_status = "ok" if test_ok else "failed"
+
+            self._write_status(
+                "ok" if build_ok else "broken",
+                build_errors,
+                test_status,
+                test_results
+            )
+
+            if changed:
+                continue
+            time.sleep(2)
+
+    def stop(self):
+        """Stop the worker."""
+        self.running = False
+        if self.status_file.exists():
+            self.status_file.unlink()
+
+    def get_status(self) -> dict:
+        """Get current status."""
+        if self.status_file.exists():
+            try:
+                return json.loads(self.status_file.read_text())
+            except Exception:
+                pass
+        return {"name": self.path.name, "build": {"status": self.last_build_status}}
+
+
+class DevWorker(ProjectWorker):
+    """
+    Extended worker that also runs the project binary.
+
+    Inspired by bacon (https://dystroy.org/bacon/):
+    - Continuously builds AND runs the project
+    - Restarts the binary on successful builds
+    - Kills the binary on build errors (to avoid stale state)
+
+    Usage:
+        DevWorker(path, status_dir)                    # Use default command
+        DevWorker(path, status_dir, ["npm", "dev"])    # Custom command (validated)
+    """
+
+    # Allowed command prefixes for security
+    ALLOWED_COMMANDS = {"npm", "pnpm", "cargo", "pytest"}
+
+    def __init__(self, path: Path, status_dir: Path, custom_cmd: list = None):
+        super().__init__(path, status_dir)
+        self.dev_process: subprocess.Popen = None
+        self.custom_cmd = self._validate_cmd(custom_cmd)
+        self.dev_commands = {
+            "rust": ["cargo", "run"],
+            "node": ["npm", "run", "dev"],
+            "python": ["pytest", "--watch"],  # pytest-watch if available
+        }
+
+    def _validate_cmd(self, cmd: list) -> list:
+        """Validate custom command uses allowed executables only."""
+        if not cmd:
+            return None
+        if cmd[0] not in self.ALLOWED_COMMANDS:
+            raise ValueError(f"Command '{cmd[0]}' not allowed. Use: {', '.join(self.ALLOWED_COMMANDS)}")
+        return cmd
+
+    def _get_dev_command(self) -> list:
+        """Get the dev command to run."""
+        if self.custom_cmd:
+            return self.custom_cmd
+
+        # Find first matching dev command
+        for ptype in self.project_types:
+            if ptype in self.dev_commands:
+                return self.dev_commands[ptype]
+        return None
+
+    def _start_dev_process(self):
+        """Start the dev server/binary."""
+        if self.dev_process and self.dev_process.poll() is None:
+            return  # Already running
+
+        cmd = self._get_dev_command()
+        if not cmd:
+            print(f"[watchd] {self.path.name}: No dev command available")
+            return
+
+        try:
+            print(f"[watchd] {self.path.name}: Starting dev server ({' '.join(cmd)})")
+            self.dev_process = subprocess.Popen(
+                cmd,
+                cwd=str(self.path),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except FileNotFoundError as e:
+            print(f"[watchd] {self.path.name}: Failed to start: {e}")
+
+    def _stop_dev_process(self):
+        """Stop the dev server/binary."""
+        if self.dev_process and self.dev_process.poll() is None:
+            print(f"[watchd] {self.path.name}: Stopping dev server")
+            self.dev_process.terminate()
+            try:
+                self.dev_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.dev_process.kill()
+            self.dev_process = None
+
+    def _restart_dev_process(self):
+        """Restart the dev server/binary."""
+        self._stop_dev_process()
+        self._start_dev_process()
+
+    def run(self):
+        """Main worker loop with dev server management."""
+        print(f"[watchd] Starting DEV worker for {self.path}")
+
+        # Initial build
+        changed, build_ok, errors = self._run_build()
+        self._write_status("ok" if build_ok else "broken", errors)
+        if build_ok:
+            self._start_dev_process()
+
+        while self.running:
+            prev_status = self.last_build_status
+            changed, build_ok, errors = self._run_build()
+
+            # Run tests occasionally if build ok
+            test_status = None
+            test_results = None
+            self.test_cycle += 1
+            if build_ok and self.test_cycle >= 5:
+                self.test_cycle = 0
+                test_ok, test_results = self._run_tests()
+                test_status = "ok" if test_ok else "failed"
+
+            self._write_status("ok" if build_ok else "broken", errors, test_status, test_results)
+
+            # Handle status transitions for dev server
+            if self.last_build_status == "ok" and prev_status == "broken":
+                # Build fixed - restart dev server
+                self._restart_dev_process()
+            elif self.last_build_status == "broken" and prev_status == "ok":
+                # Build broke - stop dev server
+                self._stop_dev_process()
+            elif self.last_build_status == "ok" and changed:
+                # Files changed during build - restart to get new code
+                self._restart_dev_process()
+
+            if changed:
+                continue  # Immediate rebuild
+            time.sleep(2)
+
+    def stop(self):
+        """Stop the worker and dev process."""
+        self._stop_dev_process()
+        super().stop()
+
+    def get_status(self) -> dict:
+        """Get current status including dev process info."""
+        status = super().get_status()
+        status["dev_mode"] = True
+        status["dev_running"] = self.dev_process is not None and self.dev_process.poll() is None
+        return status
+
+
+class WatchDaemonHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for the watch daemon."""
+
+    daemon_instance = None  # Set by WatchDaemon
+
+    def log_message(self, format, *args):
+        """Suppress default logging."""
+        pass
+
+    def _check_auth(self) -> bool:
+        """Verify authorization token."""
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+            return token == self.daemon_instance.token
+        return False
+
+    def _send_json(self, data: dict, status: int = 200):
+        """Send JSON response."""
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/status":
+            if not self._check_auth():
+                self._send_json({"error": "unauthorized"}, 401)
+                return
+            status = {
+                path: worker.get_status()
+                for path, worker in self.daemon_instance.projects.items()
+            }
+            self._send_json({"projects": status})
+        elif self.path == "/health":
+            self._send_json({"status": "ok", "projects": len(self.daemon_instance.projects)})
+        else:
+            self._send_json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        if not self._check_auth():
+            self._send_json({"error": "unauthorized"}, 401)
+            return
+
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length).decode()
+
+        try:
+            data = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            self._send_json({"error": "invalid json"}, 400)
+            return
+
+        if self.path == "/watch":
+            path = data.get("path")
+            if not path:
+                self._send_json({"error": "path required"}, 400)
+                return
+            dev_mode = data.get("dev_mode", False)
+            dev_cmd = data.get("dev_cmd")  # Optional custom command
+            result = self.daemon_instance.add_project(Path(path), dev_mode, dev_cmd)
+            self._send_json(result)
+
+        elif self.path == "/test":
+            path = data.get("path")
+            test_type = data.get("type", "auto")
+            if not path:
+                self._send_json({"error": "path required"}, 400)
+                return
+            result = self.daemon_instance.run_tests(Path(path), test_type)
+            self._send_json(result)
+
+        else:
+            self._send_json({"error": "not found"}, 404)
+
+    def do_DELETE(self):
+        if not self._check_auth():
+            self._send_json({"error": "unauthorized"}, 401)
+            return
+
+        if self.path.startswith("/watch"):
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length).decode()
+
+            try:
+                data = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                self._send_json({"error": "invalid json"}, 400)
+                return
+
+            path = data.get("path")
+            if not path:
+                self._send_json({"error": "path required"}, 400)
+                return
+
+            result = self.daemon_instance.remove_project(Path(path))
+            self._send_json(result)
+        else:
+            self._send_json({"error": "not found"}, 404)
+
+
+class WatchDaemon:
+    """Central daemon managing all project watchers."""
+
+    def __init__(self, port: int = WATCHD_DEFAULT_PORT):
+        self.port = port
+        self.projects: Dict[str, ProjectWorker] = {}
+        self.status_dir = WATCHD_STATUS_DIR
+        self.token = self._load_or_create_token()
+        self.server = None
+        self.running = False
+
+    def _load_or_create_token(self) -> str:
+        """Load token from creds file or create new one."""
+        if WATCHD_CREDS_FILE.exists():
+            for line in WATCHD_CREDS_FILE.read_text().splitlines():
+                if line.startswith("PALACE_WATCH_TOKEN="):
+                    return line.split("=", 1)[1].strip()
+
+        # Generate new token
+        token = str(uuid.uuid4())
+        WATCHD_CREDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        WATCHD_CREDS_FILE.write_text(
+            f"PALACE_WATCH_TOKEN={token}\n"
+            f"PALACE_WATCH_PORT={self.port}\n"
+        )
+        return token
+
+    def add_project(self, path: Path, dev_mode: bool = False, dev_cmd: list = None) -> dict:
+        """Add a project to watch.
+
+        Args:
+            path: Project directory
+            dev_mode: If True, also run the project binary (cargo run / npm dev)
+            dev_cmd: Custom dev command (e.g., ["npm", "run", "dev-server"])
+        """
+        path = path.resolve()
+        key = str(path)
+
+        if key in self.projects:
+            # If upgrading to dev mode, restart with DevWorker
+            existing = self.projects[key]
+            if dev_mode and not isinstance(existing, DevWorker):
+                existing.stop()
+                del self.projects[key]
+            else:
+                return {"status": "already_watching", "path": key}
+
+        # Validate project
+        if not path.exists():
+            return {"status": "error", "error": "path does not exist"}
+
+        # Create appropriate worker
+        try:
+            if dev_mode:
+                worker = DevWorker(path, self.status_dir, dev_cmd)
+            else:
+                worker = ProjectWorker(path, self.status_dir)
+        except ValueError as e:
+            return {"status": "error", "error": str(e)}
+
+        if not worker.project_types:
+            return {"status": "error", "error": "no recognized project type"}
+
+        worker.start()
+        self.projects[key] = worker
+        result = {"status": "ok", "path": key, "types": worker.project_types}
+        if dev_mode:
+            result["dev_mode"] = True
+            result["dev_cmd"] = dev_cmd or worker._get_dev_command() if isinstance(worker, DevWorker) else None
+        return result
+
+    def remove_project(self, path: Path) -> dict:
+        """Remove a project from watch."""
+        path = path.resolve()
+        key = str(path)
+
+        if key not in self.projects:
+            return {"status": "not_watching", "path": key}
+
+        self.projects[key].stop()
+        del self.projects[key]
+        return {"status": "ok", "path": key}
+
+    def run_tests(self, path: Path, test_type: str = "auto") -> dict:
+        """Run tests for a project."""
+        path = path.resolve()
+
+        # Auto-detect test type
+        if test_type == "auto":
+            if (path / "Cargo.toml").exists():
+                test_type = "cargo"
+            elif (path / "pytest.ini").exists() or (path / "pyproject.toml").exists():
+                test_type = "pytest"
+            elif (path / "package.json").exists():
+                test_type = "npm"
+            else:
+                return {"status": "error", "error": "cannot detect test type"}
+
+        # Test commands
+        commands = {
+            "cargo": ["cargo", "test"],
+            "pytest": ["pytest", "-v"],
+            "npm": ["npm", "test"],
+        }
+
+        cmd = commands.get(test_type)
+        if not cmd:
+            return {"status": "error", "error": f"unknown test type: {test_type}"}
+
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=600, cwd=str(path)
+            )
+            return {
+                "status": "complete" if result.returncode == 0 else "failed",
+                "returncode": result.returncode,
+                "stdout": result.stdout[-2000:] if result.stdout else "",
+                "stderr": result.stderr[-1000:] if result.stderr else "",
+            }
+        except subprocess.TimeoutExpired:
+            return {"status": "timeout", "error": "test timeout (600s)"}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def get_all_status(self) -> dict:
+        """Get status of all projects."""
+        return {
+            path: worker.get_status()
+            for path, worker in self.projects.items()
+        }
+
+    def _write_pid_file(self):
+        """Write PID file."""
+        WATCHD_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        WATCHD_PID_FILE.write_text(str(os.getpid()))
+
+    def _remove_pid_file(self):
+        """Remove PID file."""
+        if WATCHD_PID_FILE.exists():
+            WATCHD_PID_FILE.unlink()
+
+    def run(self):
+        """Run the daemon server."""
+        self.status_dir.mkdir(parents=True, exist_ok=True)
+
+        WatchDaemonHandler.daemon_instance = self
+
+        try:
+            self.server = HTTPServer(("127.0.0.1", self.port), WatchDaemonHandler)
+        except OSError as e:
+            print(f"[watchd] Failed to start: {e}")
+            sys.exit(1)
+
+        self._write_pid_file()
+        self.running = True
+
+        def handle_signal(signum, frame):
+            print(f"\n[watchd] Received signal {signum}, shutting down...")
+            self.shutdown()
+
+        signal.signal(signal.SIGTERM, handle_signal)
+        signal.signal(signal.SIGINT, handle_signal)
+
+        print(f"[watchd] Palace Watch Daemon started on port {self.port}")
+        print(f"[watchd] PID file: {WATCHD_PID_FILE}")
+        print(f"[watchd] Credentials: {WATCHD_CREDS_FILE}")
+
+        try:
+            self.server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.shutdown()
+
+    def shutdown(self):
+        """Shutdown the daemon."""
+        if not self.running:
+            return
+
+        self.running = False
+        print("[watchd] Stopping all workers...")
+
+        for worker in self.projects.values():
+            worker.stop()
+
+        if self.server:
+            self.server.shutdown()
+
+        self._remove_pid_file()
+        print("[watchd] Shutdown complete")
+
+
+def watchd_is_running() -> bool:
+    """Check if the watch daemon is running."""
+    if not WATCHD_PID_FILE.exists():
+        return False
+
+    try:
+        pid = int(WATCHD_PID_FILE.read_text().strip())
+        os.kill(pid, 0)  # Check if process exists
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def watchd_get_port() -> int:
+    """Get the daemon port from credentials file."""
+    if WATCHD_CREDS_FILE.exists():
+        for line in WATCHD_CREDS_FILE.read_text().splitlines():
+            if line.startswith("PALACE_WATCH_PORT="):
+                try:
+                    return int(line.split("=", 1)[1].strip())
+                except ValueError:
+                    pass
+    return WATCHD_DEFAULT_PORT
+
+
+def watchd_get_token() -> Optional[str]:
+    """Get the auth token from credentials file."""
+    if WATCHD_CREDS_FILE.exists():
+        for line in WATCHD_CREDS_FILE.read_text().splitlines():
+            if line.startswith("PALACE_WATCH_TOKEN="):
+                return line.split("=", 1)[1].strip()
+    return None
+
+
+def watchd_spawn_daemon():
+    """Spawn the daemon as a detached process."""
+    # Use the same python and script
+    python_exe = sys.executable
+    script_path = Path(__file__).resolve()
+
+    # Spawn detached
+    subprocess.Popen(
+        [python_exe, str(script_path), "watchd"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+    )
+
+    # Wait for daemon to be ready
+    port = watchd_get_port()
+    for _ in range(50):  # 5 seconds max
+        time.sleep(0.1)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.1)
+            result = sock.connect_ex(("127.0.0.1", port))
+            sock.close()
+            if result == 0:
+                return True
+        except Exception:
+            pass
+    return False
+
 def is_interactive() -> bool:
     """Detect if Palace is running interactively (can invoke Claude) vs from within Claude Code"""
     # Check if we're in a CI environment or being called from Claude Code
@@ -47,7 +1544,7 @@ def is_interactive() -> bool:
 class Palace:
     """Palace orchestration layer - coordinates Claude invocations"""
 
-    def __init__(self, strict_mode: bool = True, force_claude: bool = False, force_glm: bool = False, force_opus: bool = False) -> None:
+    def __init__(self, strict_mode: bool = True, force_claude: bool = False, force_glm: bool = False, force_glmv: bool = False, force_opus: bool = False, force_mixed: bool = False, force_devstral: bool = False, force_devstral_small: bool = False, force_ollama: bool = False) -> None:
         self.project_root = Path.cwd()
         self.palace_dir = self.project_root / ".palace"
         self.config_file = self.palace_dir / "config.json"
@@ -55,7 +1552,13 @@ class Palace:
         self.modified_files = set()  # Track files modified during execution
         self.force_claude = force_claude  # Use Claude even in turbo mode
         self.force_glm = force_glm  # Use GLM even in normal mode
+        self.force_glmv = force_glmv  # Use GLM-4.6v (vision model)
         self.force_opus = force_opus  # Force Opus model for all tasks
+        self.force_mixed = force_mixed  # GLM for prompter/analyzer, Claude for swarm
+        self.force_devstral = force_devstral  # Devstral 2 (123B) via Mistral API
+        self.force_devstral_small = force_devstral_small  # Devstral Small 2 (24B) via Ollama or Mistral
+        self.force_ollama = force_ollama  # Force local Ollama for --smol
+        self.simple_menu = False  # Use simple text menu instead of TUI (for LLM automation)
 
     def ensure_palace_dir(self) -> None:
         """Ensure .palace directory exists"""
@@ -314,6 +1817,231 @@ class Palace:
         # Check if remaining is only numbers, spaces, commas, dashes
         return bool(re.match(r'^[\d,\s\-]+$', clean))
 
+    def _claude_call(self, prompt: str, model: str = "claude-haiku-4-5",
+                     system: str = None, max_tokens: int = 4096) -> str:
+        """
+        Make a claude CLI call with stream-json output.
+
+        Uses claude -p with --output-format stream-json for consistent behavior
+        across all Palace operations. No SDK dependency.
+        """
+        import subprocess
+
+        # Build environment with proper API key routing
+        env = os.environ.copy()
+        zai_key = os.environ.get("ZAI_API_KEY", "")
+        if zai_key:
+            env["ANTHROPIC_API_KEY"] = zai_key
+            env["ANTHROPIC_BASE_URL"] = "https://api.z.ai/api/anthropic"
+
+        # Build CLI command
+        cmd = [
+            "claude",
+            "-p", prompt,
+            "--model", model,
+            "--max-tokens", str(max_tokens),
+            "--output-format", "stream-json",
+        ]
+        if system:
+            cmd.extend(["--system", system])
+
+        try:
+            result = subprocess.run(
+                cmd,
+                env=env,
+                cwd=self.project_root,
+                capture_output=True,
+                text=True,
+                timeout=120
+            )
+
+            # Parse stream-json output - collect all assistant text
+            output_text = ""
+            for line in result.stdout.split('\n'):
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                    if event.get("type") == "assistant" and "message" in event:
+                        msg = event["message"]
+                        if isinstance(msg, dict) and "content" in msg:
+                            for block in msg.get("content", []):
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    output_text += block.get("text", "")
+                        elif isinstance(msg, str):
+                            output_text += msg
+                    elif event.get("type") == "content_block_delta":
+                        delta = event.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            output_text += delta.get("text", "")
+                except json.JSONDecodeError:
+                    continue
+
+            return output_text.strip() if output_text else result.stdout.strip()
+
+        except subprocess.TimeoutExpired:
+            return "Error: Claude call timed out"
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+    def _get_sdk_client(self):
+        """
+        Get a properly configured Anthropic SDK client.
+
+        Prefers z.ai keys if available, falls back to ANTHROPIC_API_KEY.
+        This ensures consistent SDK usage across all Palace operations.
+        """
+        import anthropic
+
+        zai_key = os.environ.get("ZAI_API_KEY", "")
+        if zai_key:
+            return anthropic.Anthropic(
+                api_key=zai_key,
+                base_url="https://api.z.ai/api/anthropic"
+            )
+        else:
+            # Fall back to default Anthropic SDK (uses ANTHROPIC_API_KEY)
+            return anthropic.Anthropic()
+
+    def _get_file_tools(self):
+        """Define tools for file verification operations."""
+        return [
+            {
+                "name": "read_file",
+                "description": "Read the contents of a file. Use this to verify file existence and contents.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the file to read"
+                        },
+                        "max_lines": {
+                            "type": "integer",
+                            "description": "Maximum number of lines to read (default: 50)",
+                            "default": 50
+                        }
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
+                "name": "list_files",
+                "description": "List files in a directory matching a pattern.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "directory": {
+                            "type": "string",
+                            "description": "Directory to list"
+                        },
+                        "pattern": {
+                            "type": "string",
+                            "description": "Glob pattern to match (default: *)",
+                            "default": "*"
+                        }
+                    },
+                    "required": ["directory"]
+                }
+            },
+            {
+                "name": "file_exists",
+                "description": "Check if a file or directory exists.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to check"
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        ]
+
+    def _handle_tool_call(self, tool_name: str, tool_input: dict) -> str:
+        """Execute a tool call and return the result."""
+        import glob as glob_module
+
+        if tool_name == "read_file":
+            path = tool_input.get("path", "")
+            max_lines = tool_input.get("max_lines", 50)
+            try:
+                if not os.path.exists(path):
+                    return f"Error: File not found: {path}"
+                with open(path, 'r') as f:
+                    lines = f.readlines()[:max_lines]
+                return ''.join(lines)
+            except Exception as e:
+                return f"Error reading file: {e}"
+
+        elif tool_name == "list_files":
+            directory = tool_input.get("directory", ".")
+            pattern = tool_input.get("pattern", "*")
+            try:
+                full_pattern = os.path.join(directory, pattern)
+                files = glob_module.glob(full_pattern)
+                return '\n'.join(files[:50]) if files else "No files found"
+            except Exception as e:
+                return f"Error listing files: {e}"
+
+        elif tool_name == "file_exists":
+            path = tool_input.get("path", "")
+            exists = os.path.exists(path)
+            is_file = os.path.isfile(path) if exists else False
+            is_dir = os.path.isdir(path) if exists else False
+            return json.dumps({"exists": exists, "is_file": is_file, "is_directory": is_dir})
+
+        return f"Unknown tool: {tool_name}"
+
+    def _sdk_call_with_tools(self, prompt: str, model: str = "claude-haiku-4-5",
+                             system: str = None, max_iterations: int = 5) -> str:
+        """
+        Make an SDK call with tool_use support for file verification.
+
+        This enables the model to read files, check existence, and verify work.
+        """
+        client = self._get_sdk_client()
+        tools = self._get_file_tools()
+        messages = [{"role": "user", "content": prompt}]
+
+        for _ in range(max_iterations):
+            response = client.messages.create(
+                model=model,
+                max_tokens=4096,
+                system=system or "",
+                tools=tools,
+                messages=messages
+            )
+
+            # Check if we need to handle tool calls
+            if response.stop_reason == "tool_use":
+                # Process tool calls
+                tool_results = []
+                assistant_content = response.content
+
+                for block in assistant_content:
+                    if block.type == "tool_use":
+                        result = self._handle_tool_call(block.name, block.input)
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result
+                        })
+
+                # Add assistant message and tool results
+                messages.append({"role": "assistant", "content": assistant_content})
+                messages.append({"role": "user", "content": tool_results})
+            else:
+                # Extract text response
+                for block in response.content:
+                    if hasattr(block, 'text'):
+                        return block.text
+                return ""
+
+        return "Max iterations reached"
+
     def _parse_selection_with_llm(self, selection: str, actions: List[dict]) -> dict:
         """
         Use Haiku to parse complex natural language selection.
@@ -324,8 +2052,6 @@ class Palace:
         - is_custom_task: Whether this is a custom task (not selecting from menu)
         - custom_task: The custom task description if is_custom_task
         """
-        import anthropic
-
         # Build action context for the LLM
         action_context = "\n".join([
             f"{a.get('num')}. {a.get('label')}: {a.get('description', '')}"
@@ -355,7 +2081,7 @@ User selection: {selection}
 
 Parse this and return JSON."""
 
-        client = anthropic.Anthropic()
+        client = self._get_sdk_client()
         response = client.messages.create(
             model="claude-haiku-4-5",
             max_tokens=256,
@@ -935,6 +2661,16 @@ Take this into account as you continue the task.
                     "base_url": "https://openrouter.ai/api/v1",
                     "format": "openai",
                     "api_key_env": "OPENROUTER_API_KEY"
+                },
+                "mistral": {
+                    "base_url": "https://api.mistral.ai/v1",
+                    "format": "openai",
+                    "api_key_env": "MISTRAL_API_KEY"
+                },
+                "ollama-devstral": {
+                    "base_url": "http://10.7.1.135:11434/v1",
+                    "format": "openai",
+                    "api_key_env": ""  # Ollama doesn't need auth
                 }
             },
             "model_aliases": {
@@ -942,7 +2678,11 @@ Take this into account as you continue the task.
                 "sonnet": {"provider": "anthropic", "model": "claude-sonnet-4-5"},
                 "haiku": {"provider": "anthropic", "model": "claude-haiku-4-5"},
                 "glm": {"provider": "z.ai", "model": "glm-4.6"},
-                "glm-fast": {"provider": "z.ai", "model": "glm-4-flash"}
+                "glmv": {"provider": "z.ai", "model": "glm-4.6v"},
+                "glm-fast": {"provider": "z.ai", "model": "glm-4-flash"},
+                "devstral": {"provider": "mistral", "model": "devstral-2512"},
+                "devstral-small": {"provider": "ollama-devstral", "model": "devstral-small-2"},
+                "smol": {"provider": "ollama-devstral", "model": "devstral-small-2"}
             }
         }
 
@@ -963,18 +2703,50 @@ Take this into account as you continue the task.
 
         return defaults
 
+    def _check_ollama_available(self, base_url: str) -> bool:
+        """Check if Ollama is reachable at the given URL."""
+        import socket
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(base_url)
+            host = parsed.hostname or "localhost"
+            port = parsed.port or 11434
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)  # 1 second timeout
+            result = sock.connect_ex((host, port))
+            sock.close()
+            return result == 0
+        except Exception:
+            return False
+
     def resolve_model(self, model_or_alias: str) -> Tuple[str, str]:
         """
         Resolve model alias to (provider, model) tuple.
 
         If alias not found, assumes Anthropic provider with model name as-is.
+
+        Smart fallback: For 'smol'/'devstral-small', checks if Ollama is available.
+        If not, falls back to Mistral API with devstral-small-2505.
         """
         config = self.get_provider_config()
         aliases = config.get("model_aliases", {})
 
         if model_or_alias in aliases:
             alias_config = aliases[model_or_alias]
-            return alias_config["provider"], alias_config["model"]
+            provider = alias_config["provider"]
+            model = alias_config["model"]
+
+            # Smart fallback for Ollama-based aliases
+            if provider.startswith("ollama"):
+                ollama_config = config["providers"].get(provider, {})
+                ollama_url = ollama_config.get("base_url", "http://localhost:11434")
+
+                if not self._check_ollama_available(ollama_url):
+                    # Fallback to Mistral API
+                    print(f"⚠️  Ollama not available at {ollama_url}, falling back to Mistral API")
+                    return "mistral", "labs-devstral-small-2512"
+
+            return provider, model
 
         # Not an alias, assume Anthropic
         return "anthropic", model_or_alias
@@ -1077,13 +2849,14 @@ Take this into account as you continue the task.
         return {"role": "assistant", "content": content}
 
     def invoke_provider(self, provider: str, model: str, messages: List[dict],
-                        system: str = None, **kwargs) -> Dict[str, Any]:
+                        system: str = None, max_retries: int = 5, **kwargs) -> Dict[str, Any]:
         """
-        Invoke any configured provider.
+        Invoke any configured provider with exponential backoff retry on 429 errors.
 
         Handles format translation automatically based on provider config.
         """
         import requests
+        import random
 
         config = self.get_provider_config()
         provider_config = config["providers"].get(provider)
@@ -1096,47 +2869,80 @@ Take this into account as you continue the task.
         api_key_env = provider_config.get("api_key_env", "")
         api_key = os.environ.get(api_key_env, "")
 
-        if fmt == "anthropic":
-            # Use Anthropic SDK
-            import anthropic
-            client = anthropic.Anthropic(
-                api_key=api_key if api_key else None,
-                base_url=base_url if base_url and "anthropic.com" not in base_url else None
-            )
-            response = client.messages.create(
-                model=model,
-                messages=messages,
-                system=system or "",
-                max_tokens=kwargs.get("max_tokens", 4096)
-            )
-            return {"content": [{"type": "text", "text": c.text} for c in response.content if hasattr(c, 'text')]}
+        last_exception = None
 
-        else:
-            # OpenAI-compatible API (OpenRouter, etc.)
-            openai_messages = self.translate_to_openai_format(messages, system)
-            request_body = {
-                "model": model,
-                "messages": openai_messages,
-                "max_tokens": kwargs.get("max_tokens", 4096)
-            }
+        for attempt in range(max_retries):
+            try:
+                if fmt == "anthropic":
+                    # Use Anthropic SDK
+                    import anthropic
+                    client = anthropic.Anthropic(
+                        api_key=api_key if api_key else None,
+                        base_url=base_url if base_url and "anthropic.com" not in base_url else None
+                    )
+                    response = client.messages.create(
+                        model=model,
+                        messages=messages,
+                        system=system or "",
+                        max_tokens=kwargs.get("max_tokens", 4096)
+                    )
+                    return {"content": [{"type": "text", "text": c.text} for c in response.content if hasattr(c, 'text')]}
 
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
+                else:
+                    # OpenAI-compatible API (OpenRouter, etc.)
+                    openai_messages = self.translate_to_openai_format(messages, system)
+                    request_body = {
+                        "model": model,
+                        "messages": openai_messages,
+                        "max_tokens": kwargs.get("max_tokens", 4096)
+                    }
 
-            # OpenRouter-specific headers
-            if "openrouter" in provider.lower():
-                headers["HTTP-Referer"] = "https://github.com/anthropics/palace"
-                headers["X-Title"] = "Palace RHSI"
+                    headers = {
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json"
+                    }
 
-            response = requests.post(
-                f"{base_url}/chat/completions",
-                headers=headers,
-                json=request_body
-            )
-            response.raise_for_status()
-            return self.translate_openai_to_anthropic(response.json())
+                    # OpenRouter-specific headers
+                    if "openrouter" in provider.lower():
+                        headers["HTTP-Referer"] = "https://github.com/anthropics/palace"
+                        headers["X-Title"] = "Palace RHSI"
+
+                    response = requests.post(
+                        f"{base_url}/chat/completions",
+                        headers=headers,
+                        json=request_body
+                    )
+                    response.raise_for_status()
+                    return self.translate_openai_to_anthropic(response.json())
+
+            except Exception as e:
+                last_exception = e
+                error_str = str(e)
+                status_code = None
+
+                # Extract status code from various exception types
+                if hasattr(e, 'status_code'):
+                    status_code = e.status_code
+                elif hasattr(e, 'response') and hasattr(e.response, 'status_code'):
+                    status_code = e.response.status_code
+                elif '429' in error_str:
+                    status_code = 429
+
+                # Only retry on 429 (rate limit) errors
+                if status_code == 429:
+                    if attempt < max_retries - 1:
+                        # Exponential backoff with jitter: 1s, 2s, 4s, 8s, 16s base
+                        base_delay = 2 ** attempt
+                        jitter = random.uniform(0, 1)
+                        delay = base_delay + jitter
+                        print(f"⏳ Rate limited (429), retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})...")
+                        time.sleep(delay)
+                        continue
+                # Non-retryable error, raise immediately
+                raise
+
+        # All retries exhausted
+        raise last_exception
 
     # ========================================================================
     # Benchmarking System
@@ -1342,9 +3148,10 @@ Return JSON only:
 
         try:
             # Use GLM via Z.ai for ranking - need enough tokens for large task lists
+            glm_model = "glm-4.6v" if self.force_glmv else "glm-4.6"
             response = self.invoke_provider(
                 provider="z.ai",
-                model="glm-4.6",
+                model=glm_model,
                 messages=[{"role": "user", "content": ranking_prompt}],
                 max_tokens=4096
             )
@@ -1404,6 +3211,9 @@ Return JSON only:
         """
         Evaluate whether to auto-continue turbo mode or present options to user.
 
+        Uses claude -p with --output-format stream-json for evaluation.
+        Claude CLI has its own tools for file verification.
+
         Args:
             next_tasks: List of next task descriptions
             iteration: Current RHSI iteration number
@@ -1415,7 +3225,7 @@ Return JSON only:
                 "confidence": 0.0-1.0
             }
         """
-        import anthropic
+        import subprocess
 
         if not next_tasks:
             return {
@@ -1442,9 +3252,13 @@ Return JSON only:
             for action in recent_actions[-5:]:
                 history_context += f"- {action.get('action')}: {action.get('details', {})}\n"
 
+        # Get current working directory for file verification
+        cwd = os.getcwd()
+
         prompt = f"""Evaluate continuation strategy for an RHSI turbo mode loop.
 
 Current iteration: {iteration}
+Working directory: {cwd}
 
 Next tasks identified:
 {chr(10).join(f"- {t}" for t in next_tasks)}
@@ -1452,50 +3266,92 @@ Next tasks identified:
 Recent history:
 {history_context if history_context else "No recent history"}
 
+IMPORTANT: Use your Read and Glob tools to VERIFY work before deciding:
+- If tasks claim files were created, check they actually exist
+- If tasks mention specific implementations, verify the code is there
+- Don't trust claims without verification
+
 Decision criteria:
 1. **Auto-continue** if:
    - Tasks are obvious completions of previous work
    - Tasks are fixing known issues from last iteration
    - No novel strategic decisions required
    - High confidence the right path is clear
+   - File verification confirms claimed work was done
 
 2. **Present options** if:
    - Tasks represent new strategic directions
    - Multiple valid approaches exist
    - User input would materially improve outcome
    - Tasks require clarification or prioritization
+   - File verification shows claimed work is MISSING
 
-Reply with JSON only:
-{{"strategy": "auto_continue" or "present_options", "reason": "1-sentence explanation", "confidence": 0.0-1.0}}"""
+After verification, reply with JSON only:
+{{"strategy": "auto_continue" or "present_options", "reason": "1-sentence explanation", "confidence": 0.0-1.0, "verified_files": ["list of files checked"]}}"""
 
         try:
-            # Use GLM for quick evaluation
+            # Build environment with proper API key routing
+            env = os.environ.copy()
             zai_key = os.environ.get("ZAI_API_KEY", "")
             if zai_key:
-                client = anthropic.Anthropic(
-                    api_key=zai_key,
-                    base_url="https://api.z.ai/api/anthropic"
-                )
-            else:
-                client = anthropic.Anthropic()
+                env["ANTHROPIC_API_KEY"] = zai_key
+                env["ANTHROPIC_BASE_URL"] = "https://api.z.ai/api/anthropic"
 
-            response = client.messages.create(
-                model="glm-4.6",
-                max_tokens=300,
-                messages=[{"role": "user", "content": prompt}]
+            # Use claude CLI with stream-json output
+            glm_model = "glm-4.6v" if self.force_glmv else "glm-4.6"
+            cmd = [
+                "claude",
+                "-p", prompt,
+                "--model", glm_model,
+                                "--output-format", "stream-json",
+                "--dangerously-skip-permissions",  # Allow file reads without prompts
+            ]
+
+            result = subprocess.run(
+                cmd,
+                env=env,
+                cwd=self.project_root,
+                capture_output=True,
+                text=True,
+                timeout=120
             )
 
-            response_text = response.content[0].text.strip()
+            # Parse stream-json output - collect all assistant text
+            output_text = ""
+            for line in result.stdout.split('\n'):
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                    if event.get("type") == "assistant" and "message" in event:
+                        msg = event["message"]
+                        if isinstance(msg, dict) and "content" in msg:
+                            for block in msg.get("content", []):
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    output_text += block.get("text", "")
+                        elif isinstance(msg, str):
+                            output_text += msg
+                    elif event.get("type") == "content_block_delta":
+                        delta = event.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            output_text += delta.get("text", "")
+                    elif event.get("type") == "result" and "result" in event:
+                        # Final result message
+                        output_text = event.get("result", output_text)
+                except json.JSONDecodeError:
+                    continue
 
-            # Parse JSON
+            response_text = output_text.strip() if output_text else result.stdout.strip()
+
+            # Parse JSON from response
             if "{" in response_text:
                 json_start = response_text.find("{")
                 json_end = response_text.rfind("}") + 1
-                result = json.loads(response_text[json_start:json_end])
+                parsed = json.loads(response_text[json_start:json_end])
 
                 # Validate and return
-                if result.get("strategy") in ["auto_continue", "present_options"]:
-                    return result
+                if parsed.get("strategy") in ["auto_continue", "present_options"]:
+                    return parsed
 
             # Fallback
             return {
@@ -1504,6 +3360,12 @@ Reply with JSON only:
                 "confidence": 0.5
             }
 
+        except subprocess.TimeoutExpired:
+            return {
+                "strategy": "present_options",
+                "reason": "Evaluation timed out",
+                "confidence": 0.0
+            }
         except Exception as e:
             # On error, default to presenting options (safer)
             return {
@@ -1514,12 +3376,14 @@ Reply with JSON only:
 
     def evaluate_turbo_completion(self) -> Dict[str, Any]:
         """
-        Evaluate if turbo mode goals are complete using Opus.
+        Evaluate if turbo mode goals are complete.
 
-        Reads README.md and specs, evaluates codebase state, decides if done.
+        Uses claude -p with --output-format stream-json for evaluation.
+        Claude CLI has its own tools for reading files and verifying state.
+
         Returns: {complete: bool, reason: str, next_tasks: list}
         """
-        import anthropic
+        import subprocess
 
         # Gather context
         readme_content = ""
@@ -1535,7 +3399,6 @@ Reply with JSON only:
 
         # Get file listing
         try:
-            import subprocess
             files = subprocess.run(
                 ["find", ".", "-type", "f", "-name", "*.py", "-o", "-name", "*.md", "-o", "-name", "*.toml"],
                 cwd=self.project_root,
@@ -1556,29 +3419,66 @@ README.md:
 Current files:
 {files}
 
+Use your Read and Glob tools to verify the actual codebase state matches what the README/SPEC claims should exist.
+
 Based on the README requirements, is the project complete?
 
 Reply with JSON only:
 {{"complete": true/false, "reason": "brief explanation", "next_tasks": ["task1", "task2"] if not complete else []}}"""
 
         try:
-            # Use Z.ai for evaluation (same as turbo mode agents)
+            # Build environment with proper API key routing
+            env = os.environ.copy()
             zai_key = os.environ.get("ZAI_API_KEY", "")
             if zai_key:
-                client = anthropic.Anthropic(
-                    api_key=zai_key,
-                    base_url="https://api.z.ai/api/anthropic"
-                )
-            else:
-                client = anthropic.Anthropic()
+                env["ANTHROPIC_API_KEY"] = zai_key
+                env["ANTHROPIC_BASE_URL"] = "https://api.z.ai/api/anthropic"
 
-            response = client.messages.create(
-                model="glm-4.6",  # Use GLM for cheap evaluation
-                max_tokens=500,
-                messages=[{"role": "user", "content": prompt}]
+            # Use claude CLI with stream-json output
+            glm_model = "glm-4.6v" if self.force_glmv else "glm-4.6"
+            cmd = [
+                "claude",
+                "-p", prompt,
+                "--model", glm_model,
+                                "--output-format", "stream-json",
+                "--dangerously-skip-permissions",  # Allow file reads without prompts
+            ]
+
+            result = subprocess.run(
+                cmd,
+                env=env,
+                cwd=self.project_root,
+                capture_output=True,
+                text=True,
+                timeout=120
             )
 
-            response_text = response.content[0].text.strip()
+            # Parse stream-json output - collect all assistant text
+            output_text = ""
+            for line in result.stdout.split('\n'):
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                    if event.get("type") == "assistant" and "message" in event:
+                        msg = event["message"]
+                        if isinstance(msg, dict) and "content" in msg:
+                            for block in msg.get("content", []):
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    output_text += block.get("text", "")
+                        elif isinstance(msg, str):
+                            output_text += msg
+                    elif event.get("type") == "content_block_delta":
+                        delta = event.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            output_text += delta.get("text", "")
+                    elif event.get("type") == "result" and "result" in event:
+                        # Final result message
+                        output_text = event.get("result", output_text)
+                except json.JSONDecodeError:
+                    continue
+
+            response_text = output_text.strip() if output_text else result.stdout.strip()
 
             # Parse JSON from response
             if "{" in response_text:
@@ -1588,6 +3488,8 @@ Reply with JSON only:
 
             return {"complete": True, "reason": "Evaluation complete", "next_tasks": []}
 
+        except subprocess.TimeoutExpired:
+            return {"complete": True, "reason": "Evaluation timed out", "next_tasks": []}
         except Exception as e:
             # On error, assume complete to avoid infinite loops
             return {"complete": True, "reason": f"Evaluation error: {str(e)[:50]}", "next_tasks": []}
@@ -1607,79 +3509,87 @@ Reply with JSON only:
 
         return "\n".join(prompt_parts)
 
-    def spawn_swarm(self, assignments: Dict[str, Dict[str, Any]],
-                    base_prompt: str) -> Dict[str, Any]:
+    def _spawn_single_agent(self, task_num: str, assignment: Dict[str, Any],
+                            base_prompt: str, quiet: bool = False,
+                            continuation_context: str = "") -> Optional[Dict[str, Any]]:
         """
-        Spawn parallel Claude CLI processes for swarm execution.
+        Spawn a single Claude CLI process for swarm execution.
+
+        Args:
+            continuation_context: If provided, prepended to explain this is a retry after interruption
+
+        Returns dict with process info, or None on failure.
         """
-        processes = {}
         config = self.get_provider_config()
+        model_alias = assignment.get("model", "sonnet")
+        task = assignment.get("task", {})
+        task_label = task.get("label", f"Task {task_num}")
 
-        for task_num, assignment in assignments.items():
-            model_alias = assignment.get("model", "sonnet")  # Keep for effort labeling
-            task = assignment.get("task", {})
-            task_label = task.get("label", f"Task {task_num}")
+        # TURBO MODE: Default to GLM-4.6 via Z.ai for cheap parallel execution
+        if self.force_opus and not self.force_mixed:
+            provider = "anthropic"
+            model = "claude-opus-4-5-20251101"
+        elif self.force_mixed:
+            provider = "anthropic"
+            model = "claude-opus-4-5-20251101" if self.force_opus else "claude-sonnet-4-5"
+        elif self.force_claude:
+            provider = "anthropic"
+            model_map = {
+                "haiku": "claude-haiku-4-5",
+                "sonnet": "claude-sonnet-4-5",
+                "opus": "claude-opus-4-5-20251101"
+            }
+            model = model_map.get(model_alias, "claude-sonnet-4-5")
+        elif self.force_glmv:
+            provider = "z.ai"
+            model = "glm-4.6v"
+        else:
+            provider = "z.ai"
+            model = "glm-4.6"
 
-            # TURBO MODE: Default to GLM-4.6 via Z.ai for cheap parallel execution
-            # Override with --claude flag to use Claude models for higher quality
-            # Override with --opus flag to force Opus for all tasks
-            # The model_alias (haiku/sonnet/opus) indicates ranked effort level
-            if self.force_opus:
-                # Force Opus for all tasks (maximum quality, maximum cost)
-                provider = "anthropic"
-                model = "claude-opus-4-5-20251101"
-            elif self.force_claude:
-                # Use Claude models via Anthropic (higher cost, higher quality)
-                provider = "anthropic"
-                model_map = {
-                    "haiku": "claude-haiku-4-5",
-                    "sonnet": "claude-sonnet-4-5",
-                    "opus": "claude-opus-4-5-20251101"
-                }
-                model = model_map.get(model_alias, "claude-sonnet-4-5")
-            else:
-                # Use GLM for cost efficiency (default turbo behavior)
-                provider = "z.ai"
-                model = "glm-4.6"
-            provider_config = config["providers"].get(provider, {})
+        provider_config = config["providers"].get(provider, {})
+        agent_id = f"{model_alias}-{task_num}"
 
-            agent_id = f"{model_alias}-{task_num}"
+        # Build task prompt
+        prompt = self.build_swarm_prompt(
+            task=f"{task_label}: {task.get('description', '')}",
+            agent_id=agent_id,
+            base_context=base_prompt
+        )
 
-            # Build task prompt
-            prompt = self.build_swarm_prompt(
-                task=f"{task_label}: {task.get('description', '')}",
-                agent_id=agent_id,
-                base_context=base_prompt
-            )
+        # Add continuation context if this is a retry
+        if continuation_context:
+            prompt = f"""⚠️ CONTINUATION NOTICE:
+Your previous attempt was interrupted due to API rate limiting (429 error).
+You should pick up where you left off and continue working on the same task.
 
-            # Prepare environment with provider credentials
-            env = os.environ.copy()
-            api_key_env = provider_config.get("api_key_env", "ANTHROPIC_API_KEY")
-            base_url = provider_config.get("base_url", "")
+Previous progress/context:
+{continuation_context}
 
-            # Route to correct provider API
-            if provider == "anthropic":
-                # Use default Anthropic - unset any overrides
-                env.pop("ANTHROPIC_AUTH_TOKEN", None)
-                env.pop("ANTHROPIC_BASE_URL", None)
-            elif provider == "z.ai":
-                # Z.ai uses Anthropic format with different endpoint
-                zai_key = os.environ.get("ZAI_API_KEY", "")
-                if zai_key:
-                    env["ANTHROPIC_AUTH_TOKEN"] = zai_key
-                    env["ANTHROPIC_BASE_URL"] = "https://api.z.ai/api/anthropic"
-            elif provider == "openrouter":
-                # OpenRouter needs translation - TODO: set up translator proxy
-                openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
-                if openrouter_key:
-                    env["ANTHROPIC_AUTH_TOKEN"] = openrouter_key
-                    # TODO: Need translator proxy URL for OpenRouter
-                    # env["ANTHROPIC_BASE_URL"] = "http://localhost:8080/openrouter"
-            elif base_url and "anthropic.com" not in base_url:
-                env["ANTHROPIC_BASE_URL"] = base_url
+---
 
-            # System prompt for swarm agent
-            swarm_system = f"""You are agent {agent_id} in a parallel swarm.
+{prompt}"""
+
+        # Prepare environment with provider credentials
+        env = os.environ.copy()
+        base_url = provider_config.get("base_url", "")
+
+        if provider == "anthropic":
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+            env.pop("ANTHROPIC_BASE_URL", None)
+        elif provider == "z.ai":
+            zai_key = os.environ.get("ZAI_API_KEY", "")
+            if zai_key:
+                env["ANTHROPIC_AUTH_TOKEN"] = zai_key
+                env["ANTHROPIC_BASE_URL"] = "https://api.z.ai/api/anthropic"
+        elif provider == "openrouter":
+            openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+            if openrouter_key:
+                env["ANTHROPIC_AUTH_TOKEN"] = openrouter_key
+        elif base_url and "anthropic.com" not in base_url:
+            env["ANTHROPIC_BASE_URL"] = base_url
+
+        swarm_system = f"""You are agent {agent_id} in a parallel swarm.
 
 When your task is complete: output a summary, then stop.
 
@@ -1687,68 +3597,84 @@ If you verify another agent's task is complete (tests pass), output:
 [VERIFIED: agent-id]
 This tells Palace to stop that agent."""
 
-            # Build CLI command - bidirectional streaming JSON
-            cmd = [
-                "claude",
-                "--model", model,
-                "--append-system-prompt", swarm_system,
-                "--verbose",
-                "--input-format", "stream-json",
-                "--output-format", "stream-json",
-                "--permission-prompt-tool", "mcp__palace__handle_permission",
-            ]
+        cmd = [
+            "claude",
+            "--model", model,
+            "--append-system-prompt", swarm_system,
+            "--verbose",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--dangerously-skip-permissions",
+        ]
 
-            # Debug: show what we're running and which API
-            api_target = "Anthropic"
-            if provider == "z.ai":
-                api_target = "Z.ai"
-            elif provider == "openrouter":
-                api_target = "OpenRouter"
+        if not quiet:
+            api_target = "Anthropic" if provider == "anthropic" else "Z.ai" if provider == "z.ai" else "OpenRouter"
             print(f"   🚀 {agent_id}: {model} via {api_target}")
 
-            try:
-                process = subprocess.Popen(
-                    cmd,
-                    env=env,
-                    cwd=self.project_root,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True
-                )
+        try:
+            process = subprocess.Popen(
+                cmd,
+                env=env,
+                cwd=self.project_root,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
 
-                # Send initial prompt via streaming JSON
-                initial_message = {
-                    "type": "user",
-                    "message": {"role": "user", "content": prompt}
-                }
-                process.stdin.write(json.dumps(initial_message) + "\n")
-                process.stdin.flush()
+            initial_message = {
+                "type": "user",
+                "message": {"role": "user", "content": prompt}
+            }
+            process.stdin.write(json.dumps(initial_message) + "\n")
+            process.stdin.flush()
 
-                processes[task_num] = {
-                    "process": process,
-                    "agent_id": agent_id,
-                    "model": model_alias,
-                    "task": task_label,
-                }
+            return {
+                "process": process,
+                "agent_id": agent_id,
+                "model": model_alias,
+                "task": task_label,
+                "assignment": assignment,  # Store for respawn
+                "retry_count": 0,
+            }
 
-            except Exception as e:
-                print(f"❌ Failed to spawn {agent_id}: {e}")
+        except Exception as e:
+            print(f"❌ Failed to spawn {agent_id}: {e}")
+            return None
+
+    def spawn_swarm(self, assignments: Dict[str, Dict[str, Any]],
+                    base_prompt: str) -> Dict[str, Any]:
+        """
+        Spawn parallel Claude CLI processes for swarm execution.
+        """
+        processes = {}
+
+        for task_num, assignment in assignments.items():
+            result = self._spawn_single_agent(task_num, assignment, base_prompt)
+            if result:
+                processes[task_num] = result
 
         return processes
 
-    def monitor_swarm(self, processes: Dict[str, Any]) -> Dict[str, Any]:
+    def monitor_swarm(self, processes: Dict[str, Any], base_prompt: str = "") -> Dict[str, Any]:
         """
         Monitor swarm processes and interleave their output.
 
+        Includes exponential backoff retry on 429 rate limit errors.
         Returns results when all processes complete.
         """
         import select
         import threading
+        import random
         from datetime import datetime
+
+        MAX_RETRIES = 5  # Maximum retry attempts per agent
 
         results = {}
         active = dict(processes)
+
+        # Track pending respawns (task_num -> (respawn_time, retry_count))
+        pending_respawns = {}
 
         # Print date header
         print(f"\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1802,9 +3728,37 @@ This tells Palace to stop that agent."""
             elif elapsed > 5:
                 agent_confidence[task_num] = max(0.0, agent_confidence[task_num] - 0.1)
 
-        while active:
-            # Debug: show we're still monitoring
-            # print(f"  [monitoring {len(active)} active agents]", end="\r", flush=True)
+        while active or pending_respawns:
+            # Check for pending respawns that are ready
+            now = time.time()
+            for task_num, respawn_info in list(pending_respawns.items()):
+                if now >= respawn_info["respawn_time"]:
+                    # Time to respawn this agent
+                    assignment = respawn_info["assignment"]
+                    retry_count = respawn_info["retry_count"]
+                    continuation_ctx = respawn_info.get("continuation_context", "")
+
+                    print(f"🔄 Respawning agent for task {task_num} (attempt {retry_count}/{MAX_RETRIES})...")
+
+                    result = self._spawn_single_agent(
+                        task_num, assignment, base_prompt,
+                        quiet=True, continuation_context=continuation_ctx
+                    )
+                    if result:
+                        result["retry_count"] = retry_count
+                        active[task_num] = result
+                        buffers[task_num] = ""  # Reset buffer for new attempt
+                        agent_confidence[task_num] = 1.0
+                        agent_last_action[task_num] = time.time()
+                        agent_action_count[task_num] = 0
+
+                    del pending_respawns[task_num]
+
+            # If only pending respawns remain, sleep briefly
+            if not active and pending_respawns:
+                time.sleep(0.5)
+                continue
+
             for task_num, info in list(active.items()):
                 process = info["process"]
                 agent_id = info["agent_id"]
@@ -1817,6 +3771,47 @@ This tells Palace to stop that agent."""
 
                     # Calculate duration
                     duration = time.time() - agent_last_action.get(task_num, time.time())
+
+                    # Check for 429 rate limit error in output
+                    output_text = buffers[task_num]
+                    is_rate_limited = "429" in output_text and ("rate" in output_text.lower() or "concurrency" in output_text.lower() or "1302" in output_text)
+                    retry_count = info.get("retry_count", 0)
+
+                    if is_rate_limited and retry_count < MAX_RETRIES and base_prompt:
+                        # Schedule respawn with exponential backoff
+                        base_delay = 2 ** retry_count
+                        jitter = random.uniform(0, 1)
+                        delay = base_delay + jitter
+                        respawn_time = time.time() + delay
+
+                        print(f"⏳ {agent_id} hit rate limit (429), retrying in {delay:.1f}s (attempt {retry_count + 1}/{MAX_RETRIES})...")
+
+                        # Extract useful context from previous output (last 2000 chars before error)
+                        # Filter out JSON stream noise to get actual progress
+                        prev_output = output_text
+                        # Try to extract just the text/tool outputs, not raw JSON
+                        progress_lines = []
+                        for line in prev_output.split('\n'):
+                            line = line.strip()
+                            if not line or line.startswith('{'):
+                                continue
+                            # Keep human-readable progress indicators
+                            if any(x in line for x in ['📖', '✏️', '📝', '💻', '🔍', '🔎', '🔧', '✅', '❌']):
+                                progress_lines.append(line)
+                        continuation_ctx = '\n'.join(progress_lines[-20:]) if progress_lines else "(No progress captured before interruption)"
+
+                        # Store respawn info
+                        pending_respawns[task_num] = {
+                            "respawn_time": respawn_time,
+                            "retry_count": retry_count + 1,
+                            "assignment": info.get("assignment", {}),
+                            "continuation_context": continuation_ctx,
+                        }
+
+                        # Remove from active (will be re-added after respawn)
+                        if task_num in active:
+                            del active[task_num]
+                        continue
 
                     results[task_num] = {
                         "agent": agent_id,
@@ -2031,10 +4026,15 @@ This tells Palace to stop that agent."""
         Returns results from all swarm agents.
         """
         print("\n🚀 TURBO MODE ACTIVATED")
-        if self.force_opus:
+        if self.force_mixed:
+            swarm_model = "Opus" if self.force_opus else "Sonnet"
+            print(f"🔀 MIXED mode - Claude {swarm_model} swarm (GLM prompter)")
+        elif self.force_opus:
             print("🔥 Using Claude Opus for ALL tasks (maximum quality, maximum cost)")
         elif self.force_claude:
             print("💎 Using Claude models (high quality, higher cost)")
+        elif self.force_glmv:
+            print("👁️ Using GLM-4.6V vision model (cost-efficient, multimodal)")
         else:
             print("💰 Using GLM-4.6 (cost-efficient, fast)")
         print("─" * 50)
@@ -2052,8 +4052,8 @@ This tells Palace to stop that agent."""
         print("🐝 Spawning parallel agents...")
         processes = self.spawn_swarm(assignments, base_context)
 
-        # Step 3: Monitor and interleave
-        results = self.monitor_swarm(processes)
+        # Step 3: Monitor and interleave (pass base_context for 429 retry respawns)
+        results = self.monitor_swarm(processes, base_context)
 
         return {
             "assignments": assignments,
@@ -2241,12 +4241,155 @@ This is WRONG because:
 The parser regex is: ^(\\d+)\\.\\s+(.+)$ for labels, then 3-space indent for descriptions."""
 
         # Determine which model to use
-        if self.force_opus:
+        # --opus: Opus for everything (highest quality)
+        # --mixed: GLM for initial prompt, Claude for swarm (cost-effective)
+        # --claude: Sonnet for everything
+        # --glm: GLM for everything
+        # --glmv: GLM-4.6v (vision model) for everything
+        # --devstral: Devstral 2 (123B) via Mistral API - sovereign French model
+        # --devstral-small/--smol: Devstral Small 2 (24B) local - plane coding!
+        # default: Sonnet
+        if self.force_devstral or self.force_devstral_small:
+            # Check for requests library (needed by translator)
+            try:
+                import requests
+            except ImportError:
+                print("❌ Missing dependency: requests")
+                print("   Install with: pip install requests")
+                response = input("\n   Install now? [Y/n] ").strip().lower()
+                if response in ('', 'y', 'yes'):
+                    subprocess.run([sys.executable, "-m", "pip", "install", "requests"], check=True)
+                    print("✅ Installed requests")
+                else:
+                    print("⚠️  Falling back to Sonnet")
+                    model = "claude-sonnet-4-5"
+                    env = None
+                    # Skip the rest of devstral setup
+                    self.force_devstral = False
+                    self.force_devstral_small = False
+
+        if self.force_devstral:
+            # Devstral 2 (123B) via Mistral API - sovereign French alternative to GLM
+            # Auto-start translator daemon to convert Anthropic <-> OpenAI format
+            mistral_key = os.environ.get("MISTRAL_API_KEY", "")
+            if not mistral_key:
+                print("⚠️  No MISTRAL_API_KEY - falling back to Sonnet")
+                model = "claude-sonnet-4-5"
+                env = None
+            else:
+                backend_url = "https://api.mistral.ai/v1"
+                backend_model = "devstral-2512"
+                try:
+                    translator_port = ensure_translator_running(backend_url, mistral_key, backend_model)
+                    model = backend_model
+                    env = os.environ.copy()
+                    env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{translator_port}"
+                    # Translator doesn't need auth - it handles that internally
+                    env.pop("ANTHROPIC_API_KEY", None)
+                    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+                except Exception as e:
+                    print(f"⚠️  Failed to start translator: {e} - falling back to Sonnet")
+                    model = "claude-sonnet-4-5"
+                    env = None
+        elif self.force_devstral_small:
+            # Devstral Small 2 (24B) - smart backend selection:
+            # 1. --ollama flag → force local Ollama
+            # 2. Ollama endpoint available → use local (offline capable!)
+            # 3. MISTRAL_API_KEY set → use Mistral API
+            # 4. Fallback to Sonnet
+            import socket
+
+            ollama_url = os.environ.get("DEVSTRAL_SMALL_ENDPOINT", "http://10.7.1.135:11434/v1")
+            mistral_key = os.environ.get("MISTRAL_API_KEY", "")
+
+            def check_ollama_available():
+                """Quick check if Ollama endpoint is reachable"""
+                try:
+                    # Parse host:port from URL
+                    import urllib.parse
+                    parsed = urllib.parse.urlparse(ollama_url)
+                    host = parsed.hostname or "localhost"
+                    port = parsed.port or 11434
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(1)
+                    result = sock.connect_ex((host, port))
+                    sock.close()
+                    return result == 0
+                except:
+                    return False
+
+            use_ollama = False
+            use_mistral = False
+
+            if self.force_ollama:
+                # Explicit --ollama flag
+                use_ollama = True
+                if not check_ollama_available():
+                    print(f"⚠️  --ollama specified but Ollama not available at {ollama_url}")
+                    print("   Falling back to Sonnet")
+                    model = "claude-sonnet-4-5"
+                    env = None
+                    use_ollama = False
+            elif check_ollama_available():
+                # Ollama available - use it (offline mode!)
+                use_ollama = True
+            elif mistral_key:
+                # No Ollama but have Mistral API key
+                use_mistral = True
+            else:
+                print("⚠️  No Ollama endpoint and no MISTRAL_API_KEY - falling back to Sonnet")
+                model = "claude-sonnet-4-5"
+                env = None
+
+            if use_ollama:
+                # Local Ollama with devstral-small (need to pull: ollama pull devstral)
+                backend_model = "devstral"  # Ollama model name
+                try:
+                    translator_port = ensure_translator_running(ollama_url, "", backend_model)
+                    model = backend_model
+                    env = os.environ.copy()
+                    env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{translator_port}"
+                    env.pop("ANTHROPIC_API_KEY", None)
+                    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+                except Exception as e:
+                    print(f"⚠️  Failed to start translator: {e} - falling back to Sonnet")
+                    model = "claude-sonnet-4-5"
+                    env = None
+            elif use_mistral:
+                # Mistral API with labs-devstral-small-2512
+                backend_url = "https://api.mistral.ai/v1"
+                backend_model = "labs-devstral-small-2512"
+                try:
+                    translator_port = ensure_translator_running(backend_url, mistral_key, backend_model)
+                    model = backend_model
+                    env = os.environ.copy()
+                    env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{translator_port}"
+                    env.pop("ANTHROPIC_API_KEY", None)
+                    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+                except Exception as e:
+                    print(f"⚠️  Failed to start translator: {e} - falling back to Sonnet")
+                    model = "claude-sonnet-4-5"
+                    env = None
+        elif self.force_opus and not self.force_mixed:
             # Force Opus for all tasks (highest quality, highest cost)
             model = "claude-opus-4-5-20251101"
             env = None  # Use default environment
-        elif self.force_glm:
-            # Use GLM for cost savings (requires Z.ai API key)
+        elif self.force_glmv:
+            # Use GLM-4.6v vision model
+            model = "glm-4.6v"
+            # Set up environment for Z.ai
+            env = os.environ.copy()
+            zai_key = os.environ.get("ZAI_API_KEY", "")
+            if zai_key:
+                env["ANTHROPIC_AUTH_TOKEN"] = zai_key
+                env["ANTHROPIC_BASE_URL"] = "https://api.z.ai/api/anthropic"
+            else:
+                # No Z.ai key - fall back to Sonnet
+                model = "claude-sonnet-4-5"
+                env = None
+        elif self.force_mixed or self.force_glm:
+            # Mixed mode: GLM for initial prompt (swarm uses Claude separately)
+            # Or explicit --glm flag
             model = "glm-4.6"
             # Set up environment for Z.ai
             env = os.environ.copy()
@@ -2254,8 +4397,12 @@ The parser regex is: ^(\\d+)\\.\\s+(.+)$ for labels, then 3-space indent for des
             if zai_key:
                 env["ANTHROPIC_AUTH_TOKEN"] = zai_key
                 env["ANTHROPIC_BASE_URL"] = "https://api.z.ai/api/anthropic"
+            else:
+                # No Z.ai key - fall back to Sonnet
+                model = "claude-sonnet-4-5"
+                env = None
         else:
-            # Use Claude Sonnet (default)
+            # Use Claude Sonnet (default, or explicit --claude)
             model = "claude-sonnet-4-5"
             env = None  # Use default environment
 
@@ -2266,14 +4413,24 @@ The parser regex is: ^(\\d+)\\.\\s+(.+)$ for labels, then 3-space indent for des
             "--verbose",
             "--input-format", "stream-json",
             "--output-format", "stream-json",
-            "--permission-prompt-tool", "mcp__palace__handle_permission",
+            "--dangerously-skip-permissions",
         ]
 
         print("🏛️  Palace - Invoking Claude...")
         if not self.strict_mode:
             print("⚡ YOLO mode active - test validation disabled")
-        if self.force_opus:
+        if self.force_devstral:
+            print("🇫🇷 DEVSTRAL mode - using Devstral 2 (123B) via Mistral API")
+        elif self.force_devstral_small:
+            endpoint = os.environ.get("DEVSTRAL_SMALL_ENDPOINT", "10.7.1.135:11434")
+            print(f"✈️  SMOL mode - using Devstral Small 2 (24B) local @ {endpoint}")
+        elif self.force_mixed:
+            swarm_model = "Opus" if self.force_opus else "Sonnet"
+            print(f"🔀 MIXED mode - GLM-4.6 prompter, Claude {swarm_model} swarm")
+        elif self.force_opus:
             print("🔥 OPUS mode active - using Claude Opus for maximum quality")
+        elif self.force_glmv:
+            print("👁️ GLMV mode active - using GLM-4.6v vision model")
         elif self.force_glm:
             print("💰 GLM mode active - using GLM-4.6 for cost savings")
         print()
@@ -2351,82 +4508,149 @@ The parser regex is: ^(\\d+)\\.\\s+(.+)$ for labels, then 3-space indent for des
             return 1, None
 
     def _parse_actions_menu(self, text: str) -> List[dict]:
-        """Parse actions from text - supports multiple formats"""
+        """Parse actions from markdown text using proper AST parsing.
+
+        Uses mistune to parse markdown into an AST, then finds the ACTIONS:
+        section and extracts list items from it.
+        """
+        try:
+            import mistune
+        except ImportError:
+            # Fallback to simple regex if mistune not available
+            return self._parse_actions_menu_fallback(text)
+
         actions = []
 
-        # Try multiple action header patterns
-        action_section = None
-        patterns = [
-            ("ACTIONS:", 1),
-            ("## Next Action:", 0),  # Single action format
-            ("**Next Action:**", 0),
-            ("Next steps:", 1),
-            ("Suggested actions:", 1),
-        ]
+        def extract_text(token) -> str:
+            """Recursively extract text from a token and its children."""
+            if isinstance(token, str):
+                return token
+            if isinstance(token, dict):
+                if token.get('type') == 'text':
+                    return token.get('raw', '') or token.get('children', '')
+                if token.get('type') in ('strong', 'emphasis', 'codespan'):
+                    children = token.get('children', [])
+                    if isinstance(children, str):
+                        return children
+                    return ''.join(extract_text(c) for c in children)
+                children = token.get('children', [])
+                if isinstance(children, list):
+                    return ''.join(extract_text(c) for c in children)
+                if isinstance(children, str):
+                    return children
+            if isinstance(token, list):
+                return ''.join(extract_text(t) for t in token)
+            return ''
 
-        for pattern, _ in patterns:
-            if pattern in text:
-                action_section = text.split(pattern, 1)[1].strip()
+        # Parse markdown to AST
+        md = mistune.create_markdown(renderer=None)
+        tokens = md(text)
+
+        # Find the ACTIONS: section
+        # Strategy: Find paragraph containing "ACTIONS:" and get the next list
+        found_actions_header = False
+        action_list = None
+
+        for i, token in enumerate(tokens):
+            if token.get('type') == 'paragraph':
+                para_text = extract_text(token).strip()
+                if para_text == 'ACTIONS:' or para_text.startswith('ACTIONS:'):
+                    found_actions_header = True
+                    continue
+
+            # Also check for heading containing "ACTIONS"
+            if token.get('type') == 'heading':
+                heading_text = extract_text(token).strip().upper()
+                if 'ACTIONS' in heading_text or 'NEXT STEPS' in heading_text:
+                    found_actions_header = True
+                    continue
+
+            # If we found the header and this is a list, use it
+            if found_actions_header and token.get('type') == 'list':
+                action_list = token
                 break
 
-        # Also detect numbered lists anywhere in the text
-        if not action_section:
-            # Look for numbered list patterns like "1. Do something"
-            numbered = re.findall(r'^\s*(\d+)\.\s+\*?\*?([^\n*]+)', text, re.MULTILINE)
-            if numbered:
-                for num, label in numbered[:7]:  # Max 7 actions
-                    actions.append({
-                        "num": num,
-                        "label": label.strip(),
-                        "description": "",
-                        "subactions": []
-                    })
-                return actions
+        # If no ACTIONS: header found, find the LAST list in the document
+        # (Claude usually puts actions at the end)
+        if not action_list:
+            for token in reversed(tokens):
+                if token.get('type') == 'list':
+                    action_list = token
+                    break
+
+        if not action_list:
             return []
 
-        lines = action_section.split("\n")
-        current_action = None
-
-        for line in lines:
-            # Empty line ends menu
-            if not line.strip() and current_action:
-                actions.append(current_action)
-                current_action = None
+        # Extract actions from the list
+        list_items = action_list.get('children', [])
+        for idx, item in enumerate(list_items):
+            if item.get('type') != 'list_item':
                 continue
 
-            # Numbered action: "1. Label text here"
-            match = re.match(r'^(\d+)\.\s+(.+)$', line)
-            if match:
-                if current_action:
-                    actions.append(current_action)
-                current_action = {
-                    "num": match.group(1),
-                    "label": match.group(2),
-                    "description": "",
-                    "subactions": []
-                }
-                continue
+            # Get the text content of this list item
+            item_children = item.get('children', [])
+            label_parts = []
+            description_parts = []
 
-            # Sub-action: "   a. Sub label"
-            match = re.match(r'^\s+([a-z])\.\s+(.+)$', line)
-            if match and current_action:
-                current_action["subactions"].append({
-                    "letter": match.group(1),
-                    "label": match.group(2)
-                })
-                continue
-
-            # Description line (indented, no number/letter)
-            if line.startswith("   ") and current_action:
-                if current_action["description"]:
-                    current_action["description"] += " " + line.strip()
+            for child in item_children:
+                if child.get('type') == 'paragraph':
+                    # First paragraph is the label
+                    if not label_parts:
+                        label_parts.append(extract_text(child))
+                    else:
+                        description_parts.append(extract_text(child))
+                elif child.get('type') == 'list':
+                    # Nested list = subactions (ignore for now, could be description)
+                    pass
                 else:
-                    current_action["description"] = line.strip()
+                    # Other content goes to description
+                    desc_text = extract_text(child)
+                    if desc_text.strip():
+                        description_parts.append(desc_text)
 
-        if current_action:
-            actions.append(current_action)
+            label = ' '.join(label_parts).strip()
+            description = ' '.join(description_parts).strip()
 
-        return actions
+            if label:
+                actions.append({
+                    "num": str(idx + 1),
+                    "label": label,
+                    "description": description,
+                    "subactions": []
+                })
+
+        return actions[:15]
+
+    def _parse_actions_menu_fallback(self, text: str) -> List[dict]:
+        """Fallback regex-based parser if mistune is not available."""
+        actions = []
+
+        # Find ACTIONS: section
+        match = re.search(r'(?:^|\n)ACTIONS:\s*\n', text, re.MULTILINE)
+        if not match:
+            return []
+
+        action_section = text[match.end():].strip()
+
+        # Simple numbered list extraction
+        pattern = r'^(\d+)\.\s+(.+?)(?=\n\d+\.|$)'
+        for m in re.finditer(pattern, action_section, re.MULTILINE | re.DOTALL):
+            num = m.group(1)
+            content = m.group(2).strip()
+            # Split first line as label, rest as description
+            lines = content.split('\n', 1)
+            label = lines[0].strip()
+            description = lines[1].strip() if len(lines) > 1 else ""
+            # Clean markdown
+            label = re.sub(r'\*\*([^*]+)\*\*', r'\1', label)
+            actions.append({
+                "num": num,
+                "label": label,
+                "description": description,
+                "subactions": []
+            })
+
+        return actions[:15]
 
     def _format_action_choice(self, action: dict, width: int = 100) -> str:
         """Format action for display with truncated description"""
@@ -2705,6 +4929,17 @@ The parser regex is: ^(\\d+)\\.\\s+(.+)$ for labels, then 3-space indent for des
 
     def _show_steering_prompt(self, actions: List[dict]) -> Optional[List[dict]]:
         """Show persistent steering prompt - works with or without detected actions"""
+        # Use simple menu for LLM automation (--simple-menu flag)
+        if self.simple_menu:
+            if actions:
+                return self._show_simple_menu(actions)
+            else:
+                print()
+                custom = input("> ").strip()
+                if custom and custom.lower() not in ("q", "quit", "exit"):
+                    return [{"num": "c", "label": custom, "description": "Custom task", "_custom": True}]
+                return None
+
         try:
             import questionary
             from questionary import Style
@@ -2835,7 +5070,7 @@ The parser regex is: ^(\\d+)\\.\\s+(.+)$ for labels, then 3-space indent for des
         # Check for resume mode
         resume_id = getattr(args, 'resume', None)
         selection = getattr(args, 'select', None)
-        turbo_mode = getattr(args, 'turbo', False)
+        turbo_mode = getattr(args, 'turbo', False) or self.force_mixed  # --mixed implies turbo
         guidance = ' '.join(getattr(args, 'guidance', []))
 
         session_id = None
@@ -3724,6 +5959,362 @@ exec "{palace_venv_python}" "{palace_path}" "$@"
             print("❌ Permissions command should be called by Claude Code, not directly")
             sys.exit(1)
 
+    def cmd_watch(self, args):
+        """
+        Register current directory with the watch daemon.
+
+        First invocation spawns the daemon automatically.
+        Subsequent calls register additional folders to watch.
+
+        Usage:
+            pal watch                      - Start watching current directory
+            pal watch dev                  - Watch + run (cargo run / npm dev)
+            pal watch dev npm run server   - Watch + custom command
+            pal watch --remove             - Stop watching current directory
+            pal watch --status             - Show daemon status
+
+        Allowed dev commands: npm, pnpm, cargo, pytest
+        """
+        import urllib.request
+        import urllib.error
+
+        project_dir = Path.cwd()
+        remove_mode = getattr(args, 'remove', False)
+        status_mode = getattr(args, 'status', False)
+
+        # Check for dev mode: 'pal watch dev' or 'pal watch dev npm run server'
+        dev_arg = getattr(args, 'dev', None)
+        dev_mode = dev_arg == "dev"
+        dev_cmd_args = getattr(args, 'dev_cmd', [])
+        dev_cmd = dev_cmd_args if dev_cmd_args else None
+
+        # 1. Check if daemon is running
+        if not watchd_is_running():
+            if remove_mode or status_mode:
+                print("Daemon not running")
+                return
+
+            print("Starting watch daemon...")
+            if not watchd_spawn_daemon():
+                print("Failed to start daemon")
+                sys.exit(1)
+            print("Daemon started")
+
+        # 2. Get credentials
+        port = watchd_get_port()
+        token = watchd_get_token()
+
+        if not token:
+            print("No credentials found")
+            sys.exit(1)
+
+        base_url = f"http://127.0.0.1:{port}"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        def make_request(method: str, path: str, data: dict = None):
+            body = json.dumps(data).encode() if data else None
+            req = urllib.request.Request(
+                f"{base_url}{path}",
+                data=body,
+                headers=headers,
+                method=method
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return json.loads(resp.read().decode())
+            except urllib.error.HTTPError as e:
+                return {"error": e.read().decode()}
+            except urllib.error.URLError as e:
+                return {"error": str(e)}
+
+        # 3. Execute command
+        if status_mode:
+            result = make_request("GET", "/status")
+            if "error" in result:
+                print(f"Error: {result['error']}")
+            else:
+                projects = result.get("projects", {})
+                if not projects:
+                    print("No projects being watched")
+                else:
+                    for path, status in projects.items():
+                        st = status.get("status", "unknown")
+                        icon = "ok" if st == "ok" else "BROKEN"
+                        print(f"[{icon}] {path}")
+                        if st == "broken" and status.get("error"):
+                            print(f"     {status['error'][:100]}")
+
+        elif remove_mode:
+            result = make_request("DELETE", "/watch", {"path": str(project_dir)})
+            if result.get("status") == "ok":
+                print(f"Stopped watching {project_dir}")
+            elif result.get("status") == "not_watching":
+                print(f"Not watching {project_dir}")
+            else:
+                print(f"Error: {result.get('error', 'unknown')}")
+
+        else:
+            payload = {"path": str(project_dir)}
+            if dev_mode:
+                payload["dev_mode"] = True
+                if dev_cmd:
+                    payload["dev_cmd"] = dev_cmd
+
+            result = make_request("POST", "/watch", payload)
+            if result.get("status") == "ok":
+                types = ", ".join(result.get("types", []))
+                mode = " (dev mode)" if result.get("dev_mode") else ""
+                print(f"Watching {project_dir} ({types}){mode}")
+                if result.get("dev_cmd"):
+                    print(f"Dev command: {' '.join(result['dev_cmd'])}")
+                print(f"Status: pal build-status")
+            elif result.get("status") == "already_watching":
+                print(f"Already watching {project_dir}")
+            else:
+                print(f"Error: {result.get('error', 'unknown')}")
+
+    def cmd_watchd(self, args):
+        """
+        Run the watch daemon in foreground (for systemd).
+
+        This is the daemon process that manages all project workers.
+        Usually spawned automatically by `pal watch`, but can be run
+        directly for systemd integration.
+
+        systemd service file: /etc/systemd/system/palace-watchd.service
+        """
+        daemon = WatchDaemon()
+        daemon.run()
+
+    def cmd_build_status(self, args):
+        """
+        Check build/test status of all watched projects.
+
+        Output format (token efficient):
+        - "ok" if everything healthy
+        - Otherwise: per-project breakdown
+
+        Example broken output:
+            wave-brain-v2:
+              build: error[E0433] cannot find `BrainState` @ src/training/mod.rs:47
+              tests: 238/241 pass, 3 fail
+                - test_input_history_buffer: assertion failed
+                - test_coherence_tracking: timeout
+              last green: 14:32:07 (4h 13m ago)
+        """
+        status_dir = WATCHD_STATUS_DIR
+
+        if not status_dir.exists():
+            print("ok")
+            return
+
+        def format_last_green(ts):
+            """Format timestamp as 'HH:MM:SS (Xh Ym ago)' or 'never'."""
+            if not ts:
+                return "never"
+            delta = time.time() - ts
+            time_str = time.strftime("%H:%M:%S", time.localtime(ts))
+            if delta < 60:
+                return f"{time_str} ({int(delta)}s ago)"
+            elif delta < 3600:
+                return f"{time_str} ({int(delta/60)}m ago)"
+            elif delta < 86400:
+                hours = int(delta / 3600)
+                mins = int((delta % 3600) / 60)
+                return f"{time_str} ({hours}h {mins}m ago)"
+            else:
+                return f"{time_str} ({int(delta/86400)}d ago)"
+
+        def format_error(err_line):
+            """Extract compact error format: error[E0XXX] message @ file:line"""
+            import re
+            # Try Rust format: file:line:col: error[E0XXX]: message
+            rust_match = re.match(r'([^:]+):(\d+):\d+: (error\[E\d+\]): (.+)', err_line)
+            if rust_match:
+                file, line, code, msg = rust_match.groups()
+                # Truncate message if too long
+                msg = msg[:50] + "..." if len(msg) > 50 else msg
+                return f"{code} {msg} @ {file}:{line}"
+            # Fallback: just truncate
+            return err_line[:80] + "..." if len(err_line) > 80 else err_line
+
+        projects = {}
+        for status_file in status_dir.glob("*.json"):
+            try:
+                data = json.loads(status_file.read_text())
+                name = data.get("name", status_file.stem)
+                build = data.get("build", {})
+                tests = data.get("tests")
+
+                project_issues = {}
+
+                # Check build status
+                if build.get("status") == "broken":
+                    errors = build.get("errors", [])[:5]
+                    error_count = build.get("error_count", len(errors))
+                    stale_errors = build.get("stale_errors", [])[:5]
+                    stale_count = build.get("stale_error_count", len(stale_errors))
+                    # Use current errors, or stale if none
+                    display_errors = errors if errors else stale_errors
+                    display_count = error_count if errors else stale_count
+                    is_stale = bool(not errors and stale_errors)
+                    project_issues["build"] = {
+                        "errors": [format_error(e) for e in display_errors],
+                        "error_count": display_count,
+                        "stale": is_stale,
+                        "last_green": format_last_green(build.get("last_ok"))
+                    }
+
+                # Check test status
+                if tests and tests.get("status") == "failed":
+                    passed = tests.get("passed", 0)
+                    failed = tests.get("failed", 0)
+                    failures = tests.get("failures", [])[:5]
+                    project_issues["tests"] = {
+                        "passed": passed,
+                        "failed": failed,
+                        "failures": failures,
+                        "last_green": format_last_green(tests.get("last_ok"))
+                    }
+
+                if project_issues:
+                    projects[name] = project_issues
+            except Exception:
+                pass
+
+        if not projects:
+            print("ok")
+        else:
+            for name, issues in projects.items():
+                print(f"{name}:")
+                if "build" in issues:
+                    b = issues["build"]
+                    stale_marker = " [stale]" if b.get("stale") else ""
+                    errors = b.get("errors", [])
+                    count = b.get("error_count", len(errors))
+                    if errors:
+                        print(f"  build: {count} error{'s' if count != 1 else ''}:{stale_marker}")
+                        for err in errors:
+                            print(f"    - {err}")
+                    else:
+                        print(f"  build: broken (no errors captured){stale_marker}")
+                if "tests" in issues:
+                    t = issues["tests"]
+                    total = t['passed'] + t['failed']
+                    print(f"  tests: {t['passed']}/{total} pass, {t['failed']} fail")
+                    for failure in t["failures"]:
+                        print(f"    - {failure}")
+                # Show last green (prefer build timestamp, fall back to tests)
+                last_green = issues.get("build", {}).get("last_green") or issues.get("tests", {}).get("last_green") or "never"
+                print(f"  last green: {last_green}")
+
+    def cmd_translator(self, args):
+        """
+        Manage the API translator daemon.
+
+        The translator daemon translates Anthropic API format to OpenAI format,
+        enabling Claude Code to work with Mistral, Ollama, and other OpenAI-compatible
+        backends.
+
+        Usage:
+            pal translator                      # Check status
+            pal translator --stop               # Stop the translator daemon
+            pal translator --daemon --detach    # Start daemon and detach from terminal
+        """
+        # Handle --detach: fork and run daemon in background
+        if getattr(args, 'detach', False):
+            port = getattr(args, 'port', TRANSLATOR_DEFAULT_PORT)
+            backend_url = getattr(args, 'backend_url', 'https://api.mistral.ai/v1')
+            backend_api_key = getattr(args, 'backend_api_key', '') or os.environ.get('MISTRAL_API_KEY', '')
+            backend_model = getattr(args, 'backend_model', 'devstral-2512')
+
+            # Double-fork to fully detach from terminal
+            pid = os.fork()
+            if pid > 0:
+                # Parent - wait briefly for daemon to start
+                time.sleep(0.5)
+                print(f"🔄 Translator daemon started (PID will be in {TRANSLATOR_PID_FILE})")
+                print(f"   Backend: {backend_url}")
+                print(f"   Model: {backend_model}")
+                print(f"   Endpoint: http://127.0.0.1:{port}/v1/messages")
+                return
+
+            # Child - detach from terminal
+            os.setsid()  # New session
+            pid2 = os.fork()
+            if pid2 > 0:
+                os._exit(0)  # Exit first child
+
+            # Grandchild - the actual daemon
+            # Redirect stdio to /dev/null
+            sys.stdin = open(os.devnull, 'r')
+            sys.stdout = open(os.devnull, 'w')
+            sys.stderr = open(os.devnull, 'w')
+
+            # Run the daemon
+            translator_daemon_main(port, backend_url, backend_api_key, backend_model)
+            os._exit(0)
+
+        if getattr(args, 'daemon', False):
+            # Run as daemon process (foreground - for debugging or nohup)
+            port = getattr(args, 'port', TRANSLATOR_DEFAULT_PORT)
+            backend_url = getattr(args, 'backend_url', 'https://api.mistral.ai/v1')
+            backend_api_key = getattr(args, 'backend_api_key', '') or os.environ.get('MISTRAL_API_KEY', '')
+            backend_model = getattr(args, 'backend_model', 'devstral-2512')
+            translator_daemon_main(port, backend_url, backend_api_key, backend_model)
+            return
+
+        if getattr(args, 'stop', False):
+            # Stop the daemon
+            if TRANSLATOR_PID_FILE.exists():
+                try:
+                    pid = int(TRANSLATOR_PID_FILE.read_text().strip())
+                    os.kill(pid, signal.SIGTERM)
+                    print(f"🛑 Stopped translator daemon (PID {pid})")
+                    # Clean up
+                    if TRANSLATOR_PID_FILE.exists():
+                        TRANSLATOR_PID_FILE.unlink()
+                    if TRANSLATOR_CONFIG_FILE.exists():
+                        TRANSLATOR_CONFIG_FILE.unlink()
+                except (ProcessLookupError, ValueError):
+                    print("⚠️  Translator daemon not running (stale PID file)")
+                    if TRANSLATOR_PID_FILE.exists():
+                        TRANSLATOR_PID_FILE.unlink()
+            else:
+                print("⚠️  Translator daemon not running")
+            return
+
+        # Default: show status
+        if TRANSLATOR_PID_FILE.exists() and TRANSLATOR_CONFIG_FILE.exists():
+            try:
+                pid = int(TRANSLATOR_PID_FILE.read_text().strip())
+                os.kill(pid, 0)  # Check if alive
+                config = json.loads(TRANSLATOR_CONFIG_FILE.read_text())
+                port = config.get('port', TRANSLATOR_DEFAULT_PORT)
+                backend = config.get('backend_url', 'unknown')
+                model = config.get('backend_model', 'unknown')
+                started = config.get('started', 0)
+                uptime = time.time() - started if started else 0
+
+                print(f"🔄 Translator daemon running")
+                print(f"   PID: {pid}")
+                print(f"   Port: {port}")
+                print(f"   Backend: {backend}")
+                print(f"   Model: {model}")
+                if uptime > 0:
+                    hours = int(uptime / 3600)
+                    mins = int((uptime % 3600) / 60)
+                    print(f"   Uptime: {hours}h {mins}m")
+                print(f"\n   Claude Code endpoint: http://127.0.0.1:{port}/v1/messages")
+            except (ProcessLookupError, ValueError):
+                print("⚠️  Translator daemon not running (stale PID file)")
+        else:
+            print("⚠️  Translator daemon not running")
+            print("\nTo start manually:")
+            print("  pal translator --daemon --backend-url https://api.mistral.ai/v1 --backend-model devstral-2512")
+            print("\nOr just use --devstral or --smol flags - daemon auto-starts!")
+
+
 def main():
     import argparse
 
@@ -3733,7 +6324,7 @@ def main():
     )
 
     parser.add_argument('--version', action='version', version=f'Palace {VERSION}')
-    parser.add_argument('--strict', action='store_true', default=True,
+    parser.add_argument('--strict', action='store_true', default=False,
                         help='Strict mode: Enforce test validation (default)')
     parser.add_argument('--yolo', action='store_true',
                         help='YOLO mode: Skip all test validation (--no-strict)')
@@ -3741,8 +6332,18 @@ def main():
                         help='Use Claude models even in turbo mode (higher quality, higher cost)')
     parser.add_argument('--glm', action='store_true',
                         help='Use GLM model even in normal mode (lower cost, faster)')
+    parser.add_argument('--glmv', action='store_true',
+                        help='Use GLM-4.6v vision model (multimodal support)')
     parser.add_argument('--opus', action='store_true',
                         help='Force Opus model for all tasks (maximum quality, maximum cost)')
+    parser.add_argument('--mixed', action='store_true',
+                        help='Mixed mode: GLM prompter + Claude swarm (--opus for Opus swarm)')
+    parser.add_argument('--devstral', action='store_true',
+                        help='Use Devstral 2 (123B) via Mistral API - sovereign French model')
+    parser.add_argument('--devstral-small', '--smol', action='store_true', dest='devstral_small',
+                        help='Use Devstral Small 2 (24B) via local Ollama - fully local inference')
+    parser.add_argument('--simple-menu', action='store_true',
+                        help='Use simple text menu instead of TUI (for LLM automation over tmux)')
 
     subparsers = parser.add_subparsers(dest='command', help='Commands')
 
@@ -3760,8 +6361,18 @@ def main():
                              help='Use Claude models even in turbo mode (higher quality, higher cost)')
     parser_next.add_argument('--glm', action='store_true',
                              help='Use GLM model even in normal mode (lower cost, faster)')
+    parser_next.add_argument('--glmv', action='store_true',
+                             help='Use GLM-4.6v vision model (multimodal support)')
     parser_next.add_argument('--opus', action='store_true',
                              help='Force Opus model for all tasks (maximum quality, maximum cost)')
+    parser_next.add_argument('--mixed', action='store_true',
+                             help='Mixed mode: GLM prompter + Claude swarm (--opus for Opus swarm)')
+    parser_next.add_argument('--devstral', action='store_true',
+                             help='Use Devstral 2 (123B) via Mistral API')
+    parser_next.add_argument('--devstral-small', '--smol', action='store_true', dest='devstral_small',
+                             help='Use Devstral Small 2 (24B) via local Ollama')
+    parser_next.add_argument('--simple-menu', action='store_true',
+                             help='Use simple text menu instead of TUI (for LLM automation)')
 
     parser_new = subparsers.add_parser('new', help='Ask Claude to create a new project')
     parser_new.add_argument('name', nargs='?', help='Project name')
@@ -3769,24 +6380,36 @@ def main():
                             help='Use Claude models (higher quality, higher cost)')
     parser_new.add_argument('--glm', action='store_true',
                             help='Use GLM model (lower cost, faster)')
+    parser_new.add_argument('--glmv', action='store_true',
+                            help='Use GLM-4.6v vision model (multimodal support)')
     parser_new.add_argument('--opus', action='store_true',
                             help='Force Opus model (maximum quality, maximum cost)')
+    parser_new.add_argument('--mixed', action='store_true',
+                            help='Mixed mode: GLM prompter + Claude swarm')
 
     parser_scaffold = subparsers.add_parser('scaffold', help='Ask Claude to scaffold the project')
     parser_scaffold.add_argument('--claude', action='store_true',
                                  help='Use Claude models (higher quality, higher cost)')
     parser_scaffold.add_argument('--glm', action='store_true',
                                  help='Use GLM model (lower cost, faster)')
+    parser_scaffold.add_argument('--glmv', action='store_true',
+                                 help='Use GLM-4.6v vision model (multimodal support)')
     parser_scaffold.add_argument('--opus', action='store_true',
                                  help='Force Opus model (maximum quality, maximum cost)')
+    parser_scaffold.add_argument('--mixed', action='store_true',
+                                 help='Mixed mode: GLM prompter + Claude swarm')
 
     parser_test = subparsers.add_parser('test', help='Ask Claude to run tests')
     parser_test.add_argument('--claude', action='store_true',
                              help='Use Claude models (higher quality, higher cost)')
     parser_test.add_argument('--glm', action='store_true',
                              help='Use GLM model (lower cost, faster)')
+    parser_test.add_argument('--glmv', action='store_true',
+                             help='Use GLM-4.6v vision model (multimodal support)')
     parser_test.add_argument('--opus', action='store_true',
                              help='Force Opus model (maximum quality, maximum cost)')
+    parser_test.add_argument('--mixed', action='store_true',
+                             help='Mixed mode: GLM prompter + Claude swarm')
 
     # Utility commands
     subparsers.add_parser('install', help='Install Palace commands to Claude Code')
@@ -3811,6 +6434,27 @@ def main():
 
     subparsers.add_parser('permissions', help='Handle Claude Code permission requests (internal)')
 
+    # Build monitoring
+    parser_watch = subparsers.add_parser('watch', help='Register current directory with watch daemon')
+    parser_watch.add_argument('--remove', action='store_true', help='Stop watching current directory')
+    parser_watch.add_argument('--status', action='store_true', help='Show daemon status')
+    parser_watch.add_argument('dev', nargs='?', help='Enable dev mode (also runs binary)')
+    parser_watch.add_argument('dev_cmd', nargs='*', help='Custom dev command (e.g., npm run server)')
+
+    subparsers.add_parser('watchd', help='Run watch daemon in foreground (for systemd)')
+    subparsers.add_parser('build-status', help='Check build status of all watched projects')
+
+    # Translator daemon for Mistral/Ollama
+    parser_translator = subparsers.add_parser('translator', help='Manage API translator daemon (Anthropic <-> OpenAI)')
+    parser_translator.add_argument('--status', action='store_true', help='Show translator daemon status')
+    parser_translator.add_argument('--stop', action='store_true', help='Stop translator daemon')
+    parser_translator.add_argument('--daemon', action='store_true', help='Run as daemon (foreground, for debugging)')
+    parser_translator.add_argument('--detach', action='store_true', help='Start daemon and fully detach from terminal')
+    parser_translator.add_argument('--port', type=int, default=TRANSLATOR_DEFAULT_PORT, help='Port to listen on')
+    parser_translator.add_argument('--backend-url', default='https://api.mistral.ai/v1', help='Backend API URL')
+    parser_translator.add_argument('--backend-api-key', default='', help='Backend API key')
+    parser_translator.add_argument('--backend-model', default='devstral-2512', help='Backend model name')
+
     args = parser.parse_args()
 
     if not args.command:
@@ -3818,14 +6462,21 @@ def main():
         return
 
     # Determine strict mode: --yolo disables, otherwise default to --strict
-    strict_mode = not args.yolo if hasattr(args, 'yolo') else args.strict
+    #strict_mode = not args.yolo if hasattr(args, 'yolo') else args.strict
+    strict_mode = False
 
     # Determine provider overrides
     force_claude = getattr(args, 'claude', False)
     force_glm = getattr(args, 'glm', False)
+    force_glmv = getattr(args, 'glmv', False)
     force_opus = getattr(args, 'opus', False)
+    force_mixed = getattr(args, 'mixed', False)
+    force_devstral = getattr(args, 'devstral', False)
+    force_devstral_small = getattr(args, 'devstral_small', False)
+    simple_menu = getattr(args, 'simple_menu', False)
 
-    palace = Palace(strict_mode=strict_mode, force_claude=force_claude, force_glm=force_glm, force_opus=force_opus)
+    palace = Palace(strict_mode=strict_mode, force_claude=force_claude, force_glm=force_glm, force_glmv=force_glmv, force_opus=force_opus, force_mixed=force_mixed, force_devstral=force_devstral, force_devstral_small=force_devstral_small)
+    palace.simple_menu = simple_menu
 
     commands = {
         'next': palace.cmd_next,
@@ -3840,6 +6491,10 @@ def main():
         'import': palace.cmd_import,
         'analyze': palace.cmd_analyze,
         'permissions': palace.cmd_permissions,
+        'watch': palace.cmd_watch,
+        'watchd': palace.cmd_watchd,
+        'build-status': palace.cmd_build_status,
+        'translator': palace.cmd_translator,
     }
 
     if args.command in commands:
