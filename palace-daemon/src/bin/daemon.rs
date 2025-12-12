@@ -5,7 +5,21 @@
 //! - Context Cache (swarm consciousness)
 //! - Agent Coordination (spawn/announce)
 //!
-//! HTTP API on port 19848:
+//! ## Model Routing
+//!
+//! By default, ALL models map to devstral-2512 (free):
+//! - opus, sonnet, haiku → devstral-2512
+//! - devstral, mistral, codestral → devstral-2512
+//!
+//! Run with `--real` flag to use actual Claude API for opus/sonnet/haiku:
+//! ```bash
+//! palace-daemon --real  # Now opus/sonnet/haiku cost real money
+//! ```
+//!
+//! This lets you test swarm architectures for FREE, then flip to real Claude when needed.
+//!
+//! ## HTTP API (default port 19848)
+//!
 //! - POST /v1/messages - Anthropic-compatible messages API (translated to backend)
 //! - GET /health - Health check
 //! - POST /context/delta - Apply context delta
@@ -22,6 +36,7 @@ use axum::{
 };
 use palace_daemon::translator::{handle_messages, TranslatorState};
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
@@ -31,6 +46,44 @@ use tracing_subscriber::{fmt, EnvFilter};
 const DEFAULT_PORT: u16 = 19848;
 const DEFAULT_BACKEND_URL: &str = "https://api.mistral.ai/v1";
 const DEFAULT_BACKEND_MODEL: &str = "devstral-2512";
+
+/// Get runtime directory for PID/config files (same as Python's palace.py)
+fn get_runtime_dir() -> PathBuf {
+    std::env::var("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".palace/run")
+        })
+        .join("palace")
+}
+
+/// Write PID and config files so `pal` can detect us
+fn write_runtime_files(port: u16, backend_url: &str, backend_model: &str) -> std::io::Result<()> {
+    let runtime_dir = get_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir)?;
+
+    // Write PID file
+    let pid_file = runtime_dir.join("translator.pid");
+    std::fs::write(&pid_file, std::process::id().to_string())?;
+
+    // Write config file (matches Python's format)
+    let config_file = runtime_dir.join("translator.json");
+    let config = json!({
+        "port": port,
+        "backend_url": backend_url,
+        "backend_model": backend_model,
+        "started_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    });
+    std::fs::write(&config_file, serde_json::to_string(&config)?)?;
+
+    info!("📝 Runtime files: {}", runtime_dir.display());
+    Ok(())
+}
 
 #[derive(Clone)]
 struct AppState {

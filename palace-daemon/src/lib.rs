@@ -23,6 +23,7 @@ pub mod delta;
 pub mod block;
 pub mod timeline;
 pub mod classifier;
+pub mod spawn;
 
 use dashmap::DashMap;
 use memmap2::Mmap;

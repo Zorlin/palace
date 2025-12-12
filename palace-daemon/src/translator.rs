@@ -13,9 +13,37 @@ use futures::stream::{self, Stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use uuid::Uuid;
+
+/// Bidirectional ID mapping for tool calls across providers
+#[derive(Default)]
+pub struct ToolIdMap {
+    /// source_id -> target_id
+    forward: HashMap<String, String>,
+    /// target_id -> source_id
+    reverse: HashMap<String, String>,
+}
+
+impl ToolIdMap {
+    /// Store a bidirectional mapping
+    pub fn insert(&mut self, source_id: String, target_id: String) {
+        self.reverse.insert(target_id.clone(), source_id.clone());
+        self.forward.insert(source_id, target_id);
+    }
+
+    /// Get target ID from source ID
+    pub fn get_target(&self, source_id: &str) -> Option<&String> {
+        self.forward.get(source_id)
+    }
+
+    /// Get source ID from target ID (reverse lookup)
+    pub fn get_source(&self, target_id: &str) -> Option<&String> {
+        self.reverse.get(target_id)
+    }
+}
 
 /// Shared state for the translator
 #[derive(Clone)]
@@ -25,6 +53,8 @@ pub struct TranslatorState {
     pub backend_api_key: String,
     pub backend_model: String,
     pub model_registry: Arc<RwLock<ModelRegistry>>,
+    /// Tool ID mapping for consistent round-trips (anthropic <-> backend)
+    pub tool_id_map: Arc<RwLock<ToolIdMap>>,
 }
 
 /// Model registry for multi-model routing
@@ -193,7 +223,42 @@ impl TranslatorState {
             backend_api_key,
             backend_model,
             model_registry: Arc::new(RwLock::new(ModelRegistry::default())),
+            tool_id_map: Arc::new(RwLock::new(ToolIdMap::default())),
         }
+    }
+
+    /// Generate a stable backend-compatible ID from an Anthropic tool ID
+    /// Mistral/OpenAI need 9-char alphanumeric IDs
+    fn get_or_create_backend_id(&self, anthropic_id: &str) -> String {
+        // Check if we already have a mapping
+        {
+            let map = self.tool_id_map.read();
+            if let Some(backend_id) = map.get_target(anthropic_id) {
+                return backend_id.clone();
+            }
+        }
+
+        // Generate a deterministic 9-char ID using simple hash
+        // This ensures the same anthropic_id always maps to the same backend_id
+        let mut hash: u64 = 0;
+        for (i, byte) in anthropic_id.bytes().enumerate() {
+            hash = hash.wrapping_add((byte as u64).wrapping_mul(31_u64.wrapping_pow(i as u32)));
+        }
+        let backend_id = format!("{:09x}", hash % 0xFFFFFFFFFF).chars().take(9).collect::<String>();
+
+        // Store the bidirectional mapping
+        {
+            let mut map = self.tool_id_map.write();
+            map.insert(anthropic_id.to_string(), backend_id.clone());
+        }
+
+        backend_id
+    }
+
+    /// Look up the original anthropic ID from a backend ID (reverse lookup)
+    fn get_anthropic_id(&self, backend_id: &str) -> Option<String> {
+        let map = self.tool_id_map.read();
+        map.get_source(backend_id).cloned()
     }
 
     /// Translate Anthropic request to OpenAI format
@@ -240,16 +305,11 @@ impl TranslatorState {
                                 text_parts.push(text.clone());
                             }
                             ContentBlock::ToolUse { id, name, input } => {
-                                // Generate Mistral-compatible 9-char ID
-                                let mistral_id: String = id.chars().filter(|c| c.is_alphanumeric()).take(9).collect();
-                                let mistral_id = if mistral_id.len() < 9 {
-                                    format!("{:0>9}", mistral_id)
-                                } else {
-                                    mistral_id
-                                };
+                                // Use bidirectional mapping for consistent ID round-trips
+                                let backend_id = self.get_or_create_backend_id(id);
 
                                 tool_calls.push(OpenAIToolCall {
-                                    id: mistral_id,
+                                    id: backend_id,
                                     call_type: "function".to_string(),
                                     function: OpenAIFunction {
                                         name: name.clone(),
@@ -290,12 +350,13 @@ impl TranslatorState {
 
                         // Tool results become "tool" role messages
                         for (tool_id, content) in tool_results {
-                            let mistral_id: String = tool_id.chars().filter(|c| c.is_alphanumeric()).take(9).collect();
+                            // Look up the backend ID that corresponds to this anthropic ID
+                            let backend_id = self.get_or_create_backend_id(&tool_id);
                             messages.push(OpenAIMessage {
                                 role: "tool".to_string(),
                                 content,
                                 tool_calls: None,
-                                tool_call_id: Some(mistral_id),
+                                tool_call_id: Some(backend_id),
                             });
                         }
                     }
@@ -436,6 +497,9 @@ pub async fn handle_messages(
 ) -> Response {
     let stream = req.stream.unwrap_or(true);
 
+    tracing::info!("📨 /v1/messages request: model={}, stream={}, messages={}",
+        req.model, stream, req.messages.len());
+
     if stream {
         handle_streaming(state, req).await
     } else {
@@ -486,11 +550,11 @@ async fn handle_non_streaming(
     };
 
     // Translate OpenAI response to Anthropic format
-    let anthropic_response = translate_openai_response(&openai_response, &state.backend_model);
+    let anthropic_response = translate_openai_response(&openai_response, &state.backend_model, &state);
     Json(anthropic_response).into_response()
 }
 
-fn translate_openai_response(openai: &Value, model: &str) -> Value {
+fn translate_openai_response(openai: &Value, model: &str, state: &TranslatorState) -> Value {
     let choice = &openai["choices"][0];
     let message = &choice["message"];
     let finish_reason = choice["finish_reason"].as_str().unwrap_or("end_turn");
@@ -504,13 +568,23 @@ fn translate_openai_response(openai: &Value, model: &str) -> Value {
         }
     }
 
-    // Add tool calls
+    // Add tool calls - map backend IDs to anthropic format and store mapping
     if let Some(tool_calls) = message["tool_calls"].as_array() {
         for tc in tool_calls {
-            let id = format!("toolu_{}", Uuid::new_v4().to_string().replace("-", "")[..24].to_string());
+            let backend_id = tc["id"].as_str().unwrap_or("");
+            // Generate anthropic-style ID and store bidirectional mapping
+            let anthropic_id = format!("toolu_{}", Uuid::new_v4().to_string().replace("-", "")[..24].to_string());
+
+            // Store the mapping: anthropic_id <-> backend_id
+            // This allows tool_result with anthropic_id to find the backend_id
+            {
+                let mut map = state.tool_id_map.write();
+                map.insert(anthropic_id.clone(), backend_id.to_string());
+            }
+
             content.push(json!({
                 "type": "tool_use",
-                "id": id,
+                "id": anthropic_id,
                 "name": tc["function"]["name"],
                 "input": serde_json::from_str::<Value>(
                     tc["function"]["arguments"].as_str().unwrap_or("{}")
@@ -707,6 +781,14 @@ async fn handle_streaming(
                             // Start new tool_use block
                             current_block_index += 1;
                             let anthropic_id = format!("toolu_{}", &Uuid::new_v4().to_string().replace("-", "")[..24]);
+
+                            // Store bidirectional mapping: anthropic_id <-> backend_id
+                            // This allows tool_result with anthropic_id to find the backend_id
+                            if let Some(backend_id) = tc_id {
+                                let mut map = state.tool_id_map.write();
+                                map.insert(anthropic_id.clone(), backend_id.to_string());
+                            }
+
                             tool_blocks.insert(tc_index, (current_block_index as usize, anthropic_id.clone()));
 
                             let block_start = ContentBlockStart {

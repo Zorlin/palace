@@ -38,8 +38,11 @@ pub struct ClassifierConfig {
 impl Default for ClassifierConfig {
     fn default() -> Self {
         Self {
-            model: "qwen2.5:1.5b".to_string(),
-            ollama_host: "http://localhost:11434".to_string(),
+            model: std::env::var("CLASSIFIER_MODEL")
+                .unwrap_or_else(|_| "hf.co/unsloth/Qwen3-4B-GGUF".to_string()),
+            // Use the Ollama instance at 10.7.1.135
+            ollama_host: std::env::var("OLLAMA_HOST")
+                .unwrap_or_else(|_| "http://10.7.1.135:11434".to_string()),
             max_tokens: 50,
             temperature: 0.1,
             system_prompt: CLASSIFIER_SYSTEM_PROMPT.to_string(),
@@ -196,7 +199,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = ClassifierConfig::default();
-        assert_eq!(config.model, "qwen2.5:1.5b");
+        assert_eq!(config.model, "hf.co/unsloth/Qwen3-4B-GGUF");
         assert!(config.temperature < 0.5); // Low for consistency
     }
 
