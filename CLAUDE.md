@@ -2,6 +2,27 @@
 
 This document explains how Palace integrates with Claude Code to enable Recursive Hierarchical Self Improvement (RHSI).
 
+## ⚠️ CRITICAL: Model Names
+
+**NEVER use old Claude model names. The ONLY valid Claude models are:**
+
+- `claude-opus-4-5-20251101` (Premium tier)
+- `claude-sonnet-4-5` (Standard tier)
+- `claude-haiku-4-5` (Cheap tier)
+
+**DO NOT USE:** `claude-3-opus`, `claude-3-sonnet`, `claude-3-haiku`, `claude-opus-4`, `claude-sonnet-4`, or ANY other variant.
+
+**Other valid models:**
+- `devstral-2512` - Devstral 2 (123B) via Mistral API (Free tier - preview)
+- `devstral-small-2` / `labs-devstral-small-2512` - Devstral Small 2 (24B) (Local tier)
+- `glm-4.6v` - GLM-4.6V via Z.ai (Free tier - flatrate)
+- `glm-4.6` - GLM-4.6 via Z.ai (Free tier - flatrate)
+- `openai/gpt-5.1-codex-max` - GPT-5.1 Codex Max via OpenRouter (Premium tier)
+- `google/gemini-3-pro-preview` - Gemini 3 Pro via OpenRouter (Premium tier)
+- `gpt-oss-20b` - Local open source model (Local tier)
+
+**This applies to ALL code, tests, examples, and documentation.**
+
 ## 🥇 Golden Rule #1: TDD (Test-Driven Development)
 
 **EVERY feature, EVERY change, EVERY improvement MUST have tests.**

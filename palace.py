@@ -16,6 +16,7 @@ import os
 import json
 import subprocess
 import re
+import shlex
 import shutil
 import uuid
 import time
@@ -1030,10 +1031,6 @@ class TranslatorHandler(BaseHTTPRequestHandler):
         if tools:
             request_body["tools"] = tools
 
-        print(f"[Debug] Anthropic request - model: {model_id}, base_url: {base_url}, messages: {len(messages)}", flush=True)
-        if messages:
-            print(f"[Debug]   First message role: {messages[0].get('role')}, content type: {type(messages[0].get('content'))}", flush=True)
-
         try:
             response = requests.post(
                 f"{base_url}/messages",
@@ -1041,14 +1038,8 @@ class TranslatorHandler(BaseHTTPRequestHandler):
                 json=request_body,
                 timeout=120
             )
-            print(f"[Debug] Anthropic response status: {response.status_code}", flush=True)
-            if response.status_code != 200:
-                print(f"[Debug] Anthropic response body: {response.text[:500]}", flush=True)
             response.raise_for_status()
-            result = response.json()
-            print(f"[Debug] Anthropic response has content: {bool(result.get('content'))}", flush=True)
-            print(f"[Debug] Anthropic full response: {json.dumps(result)[:500]}", flush=True)
-            return result
+            return response.json()
         except requests.exceptions.HTTPError as e:
             # Try to get detailed error from response body
             try:
@@ -2857,6 +2848,71 @@ def ensure_translator_running(backend_url: str, backend_api_key: str, backend_mo
     raise RuntimeError("Failed to start translator daemon")
 
 
+# Rust translator PID file
+RUST_TRANSLATOR_PID_FILE = _RUNTIME_DIR / "rust-translator.pid"
+
+def ensure_rust_translator_running() -> int:
+    """
+    Ensure the Rust palace-translator daemon is running.
+    Returns the port (always 19848).
+    The Rust daemon reads API keys from environment and has models configured.
+    """
+    port = TRANSLATOR_DEFAULT_PORT
+
+    # Check if already running via health endpoint
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as resp:
+            if resp.read().decode() == "OK":
+                return port
+    except Exception:
+        pass
+
+    # Find the Rust binary
+    # First check if we're in the palace-public directory
+    script_dir = Path(__file__).resolve().parent
+    binary_paths = [
+        script_dir / "target" / "release" / "palace-translator",
+        Path("/mnt/castle/garage/palace-public/target/release/palace-translator"),
+        Path.home() / ".palace" / "bin" / "palace-translator",
+    ]
+
+    binary = None
+    for p in binary_paths:
+        if p.exists():
+            binary = p
+            break
+
+    if binary is None:
+        raise RuntimeError("palace-translator binary not found. Run 'cargo build -p palace-daemon --release'")
+
+    # Start the daemon
+    _RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Pass through environment - daemon reads ZAI_API_KEY, MISTRAL_API_KEY from env
+    subprocess.Popen(
+        [str(binary)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        env=os.environ.copy()  # Pass through all env vars including API keys
+    )
+
+    # Wait for daemon to start (check health endpoint)
+    for _ in range(50):  # 5 seconds max
+        time.sleep(0.1)
+        try:
+            import urllib.request
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as resp:
+                if resp.read().decode() == "OK":
+                    return port
+        except Exception:
+            pass
+
+    raise RuntimeError("Failed to start Rust translator daemon")
+
+
 class ProjectWorker(threading.Thread):
     """Continuous build + test worker for one project."""
 
@@ -2874,6 +2930,9 @@ class ProjectWorker(threading.Thread):
         self.test_cycle = 0        # run tests every N builds
         self.project_types = self._detect_project_types()
 
+        # Detect project owner for running builds as correct user
+        self.project_owner = self._detect_owner()
+
         # Build commands per type
         self.build_commands = {
             "rust": ["cargo", "check", "--message-format=short"],
@@ -2886,6 +2945,28 @@ class ProjectWorker(threading.Thread):
             "node": ["npm", "test"],
             "python": ["pytest", "-q", "--tb=no"],
         }
+
+    def _detect_owner(self) -> Optional[str]:
+        """Detect the owner of the project directory."""
+        try:
+            import pwd
+            stat_info = self.path.stat()
+            owner = pwd.getpwuid(stat_info.st_uid).pw_name
+            current_user = pwd.getpwuid(os.getuid()).pw_name
+            # Only return owner if we're root and owner is different
+            if current_user == "root" and owner != "root":
+                return owner
+        except (KeyError, OSError):
+            pass
+        return None
+
+    def _wrap_cmd_for_owner(self, cmd: list) -> list:
+        """Wrap command with runuser if needed to run as project owner."""
+        if self.project_owner:
+            # Use login shell (-l) to get proper PATH with cargo, npm, etc.
+            cmd_str = " ".join(shlex.quote(c) for c in cmd)
+            return ["runuser", "-u", self.project_owner, "--", "bash", "-lc", cmd_str]
+        return cmd
 
     def _detect_project_types(self) -> list:
         """Detect project type(s) based on config files. Checks subdirs too."""
@@ -3051,7 +3132,7 @@ class ProjectWorker(threading.Thread):
         for ptype in self.project_types:
             if ptype not in self.build_commands:
                 continue
-            cmd = self.build_commands[ptype]
+            cmd = self._wrap_cmd_for_owner(self.build_commands[ptype])
             try:
                 result = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=300,
@@ -3086,7 +3167,7 @@ class ProjectWorker(threading.Thread):
         for ptype in self.project_types:
             if ptype not in self.test_commands:
                 continue
-            cmd = self.test_commands[ptype]
+            cmd = self._wrap_cmd_for_owner(self.test_commands[ptype])
             try:
                 result = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=600,
@@ -3393,6 +3474,31 @@ class WatchDaemonHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "not found"}, 404)
 
 
+def _get_owner_for_path(path: Path) -> Optional[str]:
+    """Get owner of path if running as root and owner is different."""
+    try:
+        import pwd
+        stat_info = path.stat()
+        owner = pwd.getpwuid(stat_info.st_uid).pw_name
+        current_user = pwd.getpwuid(os.getuid()).pw_name
+        if current_user == "root" and owner != "root":
+            return owner
+    except (KeyError, OSError):
+        pass
+    return None
+
+
+def _wrap_cmd_for_path_owner(cmd: list, path: Path) -> list:
+    """Wrap command with runuser if needed to run as path owner."""
+    owner = _get_owner_for_path(path)
+    if owner:
+        # Use login shell (-l) to get proper PATH with cargo, npm, etc.
+        # The command is passed as a single string to bash -lc
+        cmd_str = " ".join(shlex.quote(c) for c in cmd)
+        return ["runuser", "-u", owner, "--", "bash", "-lc", cmd_str]
+    return cmd
+
+
 class WatchDaemon:
     """Central daemon managing all project watchers."""
 
@@ -3501,6 +3607,9 @@ class WatchDaemon:
         cmd = commands.get(test_type)
         if not cmd:
             return {"status": "error", "error": f"unknown test type: {test_type}"}
+
+        # Wrap command to run as project owner if we're root
+        cmd = _wrap_cmd_for_path_owner(cmd, path)
 
         try:
             result = subprocess.run(
@@ -3660,11 +3769,12 @@ def is_interactive() -> bool:
 class Palace:
     """Palace orchestration layer - coordinates Claude invocations"""
 
-    def __init__(self, strict_mode: bool = True, force_claude: bool = False, force_glm: bool = False, force_glmv: bool = False, force_opus: bool = False, force_mixed: bool = False, force_devstral: bool = False, force_devstral_small: bool = False, force_ollama: bool = False) -> None:
+    def __init__(self, strict_mode: bool = True, yolo_mode: bool = False, force_claude: bool = False, force_glm: bool = False, force_glmv: bool = False, force_opus: bool = False, force_mixed: bool = False, force_devstral: bool = False, force_devstral_small: bool = False, force_ollama: bool = False) -> None:
         self.project_root = Path.cwd()
         self.palace_dir = self.project_root / ".palace"
         self.config_file = self.palace_dir / "config.json"
         self.strict_mode = strict_mode
+        self.yolo_mode = yolo_mode
         self.modified_files = set()  # Track files modified during execution
         self.force_claude = force_claude  # Use Claude even in turbo mode
         self.force_glm = force_glm  # Use GLM even in normal mode
@@ -3948,7 +4058,7 @@ class Palace:
         zai_key = os.environ.get("ZAI_API_KEY", "")
         if zai_key:
             env["ANTHROPIC_API_KEY"] = zai_key
-            env["ANTHROPIC_BASE_URL"] = "https://api.z.ai/api/anthropic"
+            env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:19848"
 
         # Build CLI command
         cmd = [
@@ -5411,7 +5521,7 @@ After verification, reply with JSON only:
             zai_key = os.environ.get("ZAI_API_KEY", "")
             if zai_key:
                 env["ANTHROPIC_API_KEY"] = zai_key
-                env["ANTHROPIC_BASE_URL"] = "https://api.z.ai/api/anthropic"
+                env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:19848"
 
             # Use claude CLI with stream-json output
             glm_model = "glm-4.6v" if self.force_glmv else "glm-4.6"
@@ -5548,7 +5658,7 @@ Reply with JSON only:
             zai_key = os.environ.get("ZAI_API_KEY", "")
             if zai_key:
                 env["ANTHROPIC_API_KEY"] = zai_key
-                env["ANTHROPIC_BASE_URL"] = "https://api.z.ai/api/anthropic"
+                env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:19848"
 
             # Use claude CLI with stream-json output
             glm_model = "glm-4.6v" if self.force_glmv else "glm-4.6"
@@ -5656,12 +5766,22 @@ Reply with JSON only:
                 "opus": "claude-opus-4-5-20251101"
             }
             model = model_map.get(model_alias, "claude-sonnet-4-5")
+        elif self.force_devstral:
+            provider = "mistral"
+            model = "devstral-2512"
+        elif self.force_devstral_small:
+            provider = "mistral"
+            model = "devstral-small-2"
         elif self.force_glmv:
             provider = "z.ai"
             model = "glm-4.6v"
-        else:
+        elif self.force_glm:
             provider = "z.ai"
             model = "glm-4.6"
+        else:
+            # Default to Claude Sonnet
+            provider = "anthropic"
+            model = "claude-sonnet-4-5"
 
         provider_config = config["providers"].get(provider, {})
         agent_id = f"{model_alias}-{task_num}"
@@ -5697,7 +5817,12 @@ Previous progress/context:
             zai_key = os.environ.get("ZAI_API_KEY", "")
             if zai_key:
                 env["ANTHROPIC_AUTH_TOKEN"] = zai_key
-                env["ANTHROPIC_BASE_URL"] = "https://api.z.ai/api/anthropic"
+                env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:19848"
+        elif provider == "mistral":
+            # Mistral via our translator daemon (handles auth internally)
+            env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:19848"
+            env.pop("ANTHROPIC_API_KEY", None)
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
         elif provider == "openrouter":
             openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
             if openrouter_key:
@@ -5715,6 +5840,7 @@ This tells Palace to stop that agent."""
 
         cmd = [
             "claude",
+            "--print",
             "--model", model,
             "--append-system-prompt", swarm_system,
             "--verbose",
@@ -5724,7 +5850,7 @@ This tells Palace to stop that agent."""
         ]
 
         if not quiet:
-            api_target = "Anthropic" if provider == "anthropic" else "Z.ai" if provider == "z.ai" else "OpenRouter"
+            api_target = {"anthropic": "Anthropic", "z.ai": "Z.ai", "mistral": "Mistral", "openrouter": "OpenRouter"}.get(provider, provider)
             print(f"   🚀 {agent_id}: {model} via {api_target}")
 
         try:
@@ -6149,10 +6275,16 @@ This tells Palace to stop that agent."""
             print("🔥 Using Claude Opus for ALL tasks (maximum quality, maximum cost)")
         elif self.force_claude:
             print("💎 Using Claude models (high quality, higher cost)")
+        elif self.force_devstral:
+            print("🇫🇷 Using Devstral 2 (123B) via Mistral API")
+        elif self.force_devstral_small:
+            print("✈️ Using Devstral Small 2 (24B) local")
         elif self.force_glmv:
             print("👁️ Using GLM-4.6V vision model (cost-efficient, multimodal)")
-        else:
+        elif self.force_glm:
             print("💰 Using GLM-4.6 (cost-efficient, fast)")
+        else:
+            print("💎 Using Claude Sonnet (default)")
         print("─" * 50)
 
         # Step 1: Rank tasks by model
@@ -6321,40 +6453,27 @@ This tells Palace to stop that agent."""
         - selected_actions: list of action dicts if user selected any, None otherwise
         """
         # Menu format instructions for action selection
-        menu_prompt = """IMPORTANT: End your response with an ACTIONS: menu. The format MUST be EXACTLY like this:
+        menu_prompt = """IMPORTANT: End your response with suggested actions in a YAML code block.
 
-ACTIONS:
-1. Short action label here
-   Description line indented exactly 3 spaces. Keep it to one or two lines.
+Format EXACTLY like this:
 
-2. Another action label
-   Description for this action.
+```yaml
+actions:
+  - label: Short action label here
+    description: Brief description of what this action does
+  - label: Another action label
+    description: Description for this action
+```
 
-3. Third option if needed
-   a. Sub-option when there are variations
-   b. Another sub-option
-
-CORRECT FORMAT RULES:
-- "ACTIONS:" header on its own line (triggers the menu parser)
-- Number followed by period and space: "1. "
-- Action label on same line as number
-- Description on NEXT line, indented EXACTLY 3 spaces
-- ONE blank line between actions
-- Sub-actions use lowercase letters: "   a. "
-
-WRONG (DO NOT DO THIS):
----
-8. Action Name
-
-Description on separate line with blank above it.
----
-
-This is WRONG because:
-- Uses "---" separators (breaks parser)
-- Blank line between label and description (breaks parser)
-- No indentation on description (breaks parser)
-
-The parser regex is: ^(\\d+)\\.\\s+(.+)$ for labels, then 3-space indent for descriptions."""
+RULES:
+- Use a ```yaml code block (required for parsing)
+- The key must be "actions:" containing a list
+- Each action needs "label:" (required) and "description:" (optional but recommended)
+- Keep labels concise (under 60 chars)
+- Descriptions can be detailed (up to 1000 chars) - they provide important context for execution
+- INCLUDE ALL SUGGESTED ACTIONS - do NOT filter or reduce the list
+- If you identified 50 tasks, include all 50 in the actions block
+- The user will select which ones to execute from the full list"""
 
         # Determine which model to use
         # --opus: Opus for everything (highest quality)
@@ -6491,28 +6610,40 @@ The parser regex is: ^(\\d+)\\.\\s+(.+)$ for labels, then 3-space indent for des
             model = "claude-opus-4-5-20251101"
             env = None  # Use default environment
         elif self.force_glmv:
-            # Use GLM-4.6v vision model
-            model = "glm-4.6v"
-            # Set up environment for Z.ai
-            env = os.environ.copy()
+            # Use GLM-4.6v vision model via Rust translator (passthrough with rate limiting)
             zai_key = os.environ.get("ZAI_API_KEY", "")
             if zai_key:
-                env["ANTHROPIC_AUTH_TOKEN"] = zai_key
-                env["ANTHROPIC_BASE_URL"] = "https://api.z.ai/api/anthropic"
+                try:
+                    translator_port = ensure_rust_translator_running()
+                    model = "glm-4.6v"
+                    env = os.environ.copy()
+                    env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{translator_port}"
+                    env.pop("ANTHROPIC_API_KEY", None)
+                    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+                except Exception as e:
+                    print(f"⚠️  Failed to start translator: {e} - falling back to Sonnet")
+                    model = "claude-sonnet-4-5"
+                    env = None
             else:
                 # No Z.ai key - fall back to Sonnet
                 model = "claude-sonnet-4-5"
                 env = None
         elif self.force_mixed or self.force_glm:
             # Mixed mode: GLM for initial prompt (swarm uses Claude separately)
-            # Or explicit --glm flag
-            model = "glm-4.6"
-            # Set up environment for Z.ai
-            env = os.environ.copy()
+            # Or explicit --glm flag - use Rust translator (passthrough with rate limiting)
             zai_key = os.environ.get("ZAI_API_KEY", "")
             if zai_key:
-                env["ANTHROPIC_AUTH_TOKEN"] = zai_key
-                env["ANTHROPIC_BASE_URL"] = "https://api.z.ai/api/anthropic"
+                try:
+                    translator_port = ensure_rust_translator_running()
+                    model = "glm-4.6"
+                    env = os.environ.copy()
+                    env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{translator_port}"
+                    env.pop("ANTHROPIC_API_KEY", None)
+                    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+                except Exception as e:
+                    print(f"⚠️  Failed to start translator: {e} - falling back to Sonnet")
+                    model = "claude-sonnet-4-5"
+                    env = None
             else:
                 # No Z.ai key - fall back to Sonnet
                 model = "claude-sonnet-4-5"
@@ -6524,17 +6655,28 @@ The parser regex is: ^(\\d+)\\.\\s+(.+)$ for labels, then 3-space indent for des
 
         cmd = [
             "claude",
+            "--print",
             "--model", model,
             "--append-system-prompt", menu_prompt,
             "--verbose",
             "--input-format", "stream-json",
             "--output-format", "stream-json",
-            "--dangerously-skip-permissions",
         ]
+        # Claude CLI blocks --dangerously-skip-permissions as root - no workaround
+        if os.getuid() == 0:
+            print("❌ ERROR: Palace cannot run as root")
+            print()
+            print("   Claude CLI blocks permission bypass for root users.")
+            print("   This is a security feature with no override.")
+            print()
+            print("   Run as a normal user instead:")
+            print("     sudo -u wings pal next [options]")
+            print()
+            print("   Note: Many tools (Playwright, etc.) also require non-root.")
+            sys.exit(1)
+        cmd.append("--dangerously-skip-permissions")
 
         print("🏛️  Palace - Invoking Claude...")
-        if not self.strict_mode:
-            print("⚡ YOLO mode active - test validation disabled")
         if self.force_devstral:
             print("🇫🇷 DEVSTRAL mode - using Devstral 2 (123B) via Mistral API")
         elif self.force_devstral_small:
@@ -6623,12 +6765,86 @@ The parser regex is: ^(\\d+)\\.\\s+(.+)$ for labels, then 3-space indent for des
             print(f"❌ Error invoking Claude: {e}")
             return 1, None
 
-    def _parse_actions_menu(self, text: str) -> List[dict]:
-        """Parse actions from markdown text using proper AST parsing.
+    def _parse_actions_yaml(self, text: str) -> List[dict]:
+        """Parse actions from YAML in the response.
 
-        Uses mistune to parse markdown into an AST, then finds the ACTIONS:
-        section and extracts list items from it.
+        Looks for YAML blocks containing 'actions:' list.
+        Format:
+        ```yaml
+        actions:
+          - label: Do something
+            description: Optional description
+          - label: Another thing
+        ```
         """
+        import yaml
+
+        actions = []
+
+        # Find YAML code blocks
+        yaml_pattern = r'```(?:yaml|yml)?\s*\n(.*?)```'
+        matches = re.findall(yaml_pattern, text, re.DOTALL | re.IGNORECASE)
+
+        for yaml_content in matches:
+            try:
+                data = yaml.safe_load(yaml_content)
+                if not isinstance(data, dict):
+                    continue
+
+                # Look for 'actions' key
+                action_list = data.get('actions', [])
+                if not action_list:
+                    continue
+
+                for idx, item in enumerate(action_list):
+                    if isinstance(item, str):
+                        # Simple string item
+                        actions.append({
+                            "num": str(idx + 1),
+                            "label": item,
+                            "description": "",
+                            "subactions": []
+                        })
+                    elif isinstance(item, dict):
+                        # Dict with label/description
+                        label = item.get('label', item.get('name', ''))
+                        description = item.get('description', item.get('desc', ''))
+                        if label:
+                            actions.append({
+                                "num": str(idx + 1),
+                                "label": str(label),
+                                "description": str(description) if description else "",
+                                "subactions": []
+                            })
+
+                # If we found actions, return them
+                if actions:
+                    return actions
+
+            except yaml.YAMLError:
+                continue
+
+        return []
+
+    def _parse_actions_menu(self, text: str) -> List[dict]:
+        """Parse actions from text - tries YAML first, then falls back to markdown.
+
+        YAML format (preferred):
+        ```yaml
+        actions:
+          - label: Do something
+            description: Optional description
+          - label: Another thing
+        ```
+
+        Falls back to markdown parsing if no YAML found.
+        """
+        # Try YAML first - it's cleaner and more reliable
+        yaml_actions = self._parse_actions_yaml(text)
+        if yaml_actions:
+            return yaml_actions
+
+        # Fall back to markdown parsing
         try:
             import mistune
         except ImportError:
@@ -6735,7 +6951,7 @@ The parser regex is: ^(\\d+)\\.\\s+(.+)$ for labels, then 3-space indent for des
                     "subactions": []
                 })
 
-        return actions[:15]
+        return actions
 
     def _parse_actions_menu_fallback(self, text: str) -> List[dict]:
         """Fallback regex-based parser if mistune is not available."""
@@ -6766,7 +6982,7 @@ The parser regex is: ^(\\d+)\\.\\s+(.+)$ for labels, then 3-space indent for des
                 "subactions": []
             })
 
-        return actions[:15]
+        return actions
 
     def _format_action_choice(self, action: dict, width: int = 100) -> str:
         """Format action for display with truncated description"""
@@ -7340,11 +7556,11 @@ Be concrete and actionable. The user will select which action(s) to execute."""
                         print("📋 Generating options for user selection...")
                         # Generate and present action menu to user
                         # Break out to normal RHSI loop with action menu
-                        current_prompt = "Evaluate the current state and suggest next actions. Include an ACTIONS: section."
+                        current_prompt = "Evaluate the current state and suggest next actions. End with a ```yaml actions: block."
                         break  # Exit turbo loop, present menu to user
                     else:
                         # Fallback: let Claude decide
-                        current_prompt = "Evaluate the current state and suggest next actions. Include an ACTIONS: section."
+                        current_prompt = "Evaluate the current state and suggest next actions. End with a ```yaml actions: block."
                         continue
 
             # Build prompt for next iteration based on selected actions
@@ -7359,7 +7575,7 @@ Be concrete and actionable. The user will select which action(s) to execute."""
                 task_desc = action.get("label", "")
                 return f"""Execute this task: {task_desc}
 
-After completing, suggest possible next actions. Include an ACTIONS: section with multiple options."""
+After completing, suggest possible next actions in a ```yaml actions: block."""
             else:
                 task_desc = action.get("label", "")
                 task_detail = action.get("description", "")
@@ -7368,7 +7584,7 @@ After completing, suggest possible next actions. Include an ACTIONS: section wit
                 return f"""Execute this action: {task_desc}
 {f"Details: {task_detail}" if task_detail else ""}{mod_text}
 
-After completing, suggest possible next actions. Include an ACTIONS: section with multiple options."""
+After completing, suggest possible next actions in a ```yaml actions: block."""
         else:
             tasks = []
             for a in actions:
@@ -8454,7 +8670,7 @@ def main():
                         help='Force Opus model for all tasks (maximum quality, maximum cost)')
     parser.add_argument('--mixed', action='store_true',
                         help='Mixed mode: GLM prompter + Claude swarm (--opus for Opus swarm)')
-    parser.add_argument('--devstral', action='store_true',
+    parser.add_argument('--devstral', '--mistral', action='store_true',
                         help='Use Devstral 2 (123B) via Mistral API - sovereign French model')
     parser.add_argument('--devstral-small', '--smol', action='store_true', dest='devstral_small',
                         help='Use Devstral Small 2 (24B) via local Ollama - fully local inference')
@@ -8483,12 +8699,14 @@ def main():
                              help='Force Opus model for all tasks (maximum quality, maximum cost)')
     parser_next.add_argument('--mixed', action='store_true',
                              help='Mixed mode: GLM prompter + Claude swarm (--opus for Opus swarm)')
-    parser_next.add_argument('--devstral', action='store_true',
+    parser_next.add_argument('--devstral', '--mistral', action='store_true',
                              help='Use Devstral 2 (123B) via Mistral API')
     parser_next.add_argument('--devstral-small', '--smol', action='store_true', dest='devstral_small',
                              help='Use Devstral Small 2 (24B) via local Ollama')
     parser_next.add_argument('--simple-menu', action='store_true',
                              help='Use simple text menu instead of TUI (for LLM automation)')
+    parser_next.add_argument('--yolo', action='store_true',
+                             help='YOLO mode: bypass safety checks (required for root)')
 
     parser_new = subparsers.add_parser('new', help='Ask Claude to create a new project')
     parser_new.add_argument('name', nargs='?', help='Project name')
@@ -8577,9 +8795,10 @@ def main():
         parser.print_help()
         return
 
-    # Determine strict mode: --yolo disables, otherwise default to --strict
-    #strict_mode = not args.yolo if hasattr(args, 'yolo') else args.strict
-    strict_mode = False
+    # Strict mode: validate codebase compiles/builds between RHSI loops
+    strict_mode = getattr(args, 'strict', False)
+    # Yolo mode: bypass safety checks (required for root)
+    yolo_mode = getattr(args, 'yolo', False)
 
     # Determine provider overrides
     force_claude = getattr(args, 'claude', False)
@@ -8591,7 +8810,7 @@ def main():
     force_devstral_small = getattr(args, 'devstral_small', False)
     simple_menu = getattr(args, 'simple_menu', False)
 
-    palace = Palace(strict_mode=strict_mode, force_claude=force_claude, force_glm=force_glm, force_glmv=force_glmv, force_opus=force_opus, force_mixed=force_mixed, force_devstral=force_devstral, force_devstral_small=force_devstral_small)
+    palace = Palace(strict_mode=strict_mode, yolo_mode=yolo_mode, force_claude=force_claude, force_glm=force_glm, force_glmv=force_glmv, force_opus=force_opus, force_mixed=force_mixed, force_devstral=force_devstral, force_devstral_small=force_devstral_small)
     palace.simple_menu = simple_menu
 
     commands = {
