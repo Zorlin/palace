@@ -3,6 +3,7 @@ name = "palace-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Palace CLI - RHSI Development Assistant"
 
 [[bin]]
 name = "pal"
@@ -14,7 +15,14 @@ palace-translator = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = "0.9"
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+dirs = "5"
+libc = "0.2"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"
