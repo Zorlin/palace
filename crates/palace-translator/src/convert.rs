@@ -78,9 +78,20 @@ impl ToolIdMapper {
         short
     }
 
-    /// Get the original long ID if we have a mapping, otherwise return the ID as-is
+    /// Get the original long ID if we have a mapping.
+    /// If not found AND the ID is too long for Mistral, shorten it.
+    /// This handles Claude-generated tool IDs (toolu_xxx) that we never saw before.
     pub fn to_long(&self, short_id: &str) -> String {
-        self.short_to_long.get(short_id).cloned().unwrap_or_else(|| short_id.to_string())
+        if let Some(long_id) = self.short_to_long.get(short_id) {
+            return long_id.clone();
+        }
+        // ID not in our mapper - if it's already Mistral-compatible, use as-is
+        // Otherwise shorten it (handles Claude's own toolu_xxx IDs)
+        if is_valid_mistral_id(short_id) {
+            short_id.to_string()
+        } else {
+            shorten_tool_id(short_id)
+        }
     }
 
     /// Register a mapping (used when we see a new ID from OpenAI response)
