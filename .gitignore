@@ -1,5 +1,6 @@
 # Palace runtime
 .palace/
+victories/**
 
 # MCP configuration (user-specific)
 .mcp.json
@@ -214,3 +215,4 @@ __marimo__/
 
 # Unfiltered garbo
 synthesis/
+CLAUDE.local.md

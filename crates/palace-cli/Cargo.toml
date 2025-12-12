@@ -1,0 +1,20 @@
+[package]
+name = "palace-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pal"
+path = "src/main.rs"
+
+[dependencies]
+palace-core = { workspace = true }
+palace-translator = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
