@@ -2394,7 +2394,50 @@ Do NOT use Skill() or natural language like "passing to X" - only @@switch= work
                 .collect();
             info!("OpenAI message order: {:?}", role_order);
 
-            // SAFEGUARD: Mistral and some OpenAI-compatible APIs require the last message
+            // SAFEGUARD 1: Fix orphaned Tool messages.
+            // Tool messages can ONLY follow Assistant messages with tool_calls (or other Tool messages).
+            // If we find Tool messages without proper context, convert them to User text.
+            let mut i = 0;
+            let mut in_tool_response_block = false;  // True after seeing Assistant+tool_calls, stays true for Tool messages
+            while i < openai_messages.len() {
+                let msg = &openai_messages[i];
+                match msg.role {
+                    openai::Role::Assistant => {
+                        in_tool_response_block = msg.tool_calls.as_ref().map(|tc| !tc.is_empty()).unwrap_or(false);
+                    }
+                    openai::Role::Tool => {
+                        if !in_tool_response_block {
+                            // Orphaned tool message - convert to User with the tool result as text
+                            info!("Message order fix: orphaned Tool message at index {}, converting to User", i);
+                            let content = openai_messages[i].content.clone();
+                            let tool_id = openai_messages[i].tool_call_id.clone().unwrap_or_default();
+                            openai_messages[i] = openai::Message {
+                                role: openai::Role::User,
+                                content: Some(openai::Content::Text(format!(
+                                    "[Tool result for {}]: {}",
+                                    tool_id,
+                                    match content {
+                                        Some(openai::Content::Text(t)) => t,
+                                        Some(openai::Content::Parts(_)) => "[complex content]".to_string(),
+                                        None => "[empty]".to_string(),
+                                    }
+                                ))),
+                                tool_calls: None,
+                                tool_call_id: None,
+                                name: None,
+                            };
+                        }
+                        // Stay in tool response block - more Tool messages can follow
+                    }
+                    _ => {
+                        // Any other role ends the tool response block
+                        in_tool_response_block = false;
+                    }
+                }
+                i += 1;
+            }
+
+            // SAFEGUARD 2: Mistral and some OpenAI-compatible APIs require the last message
             // to be from the user or tool. If the last message is assistant, add a continuation
             // prompt to fix the conversation structure.
             if let Some(last_msg) = openai_messages.last() {
