@@ -9,6 +9,10 @@ description = "Palace CLI - RHSI Development Assistant"
 name = "pal"
 path = "src/main.rs"
 
+[[bin]]
+name = "palace"
+path = "src/palace_main.rs"
+
 [dependencies]
 palace-core = { workspace = true }
 palace-translator = { workspace = true }
@@ -23,6 +27,8 @@ clap = { version = "4", features = ["derive"] }
 dirs = "5"
 libc = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
+ratatui = { version = "0.26", features = ["all-widgets"] }
+crossterm = "0.27"
 
 [dev-dependencies]
 tempfile = "3"
