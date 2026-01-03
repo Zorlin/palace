@@ -159,7 +159,13 @@ impl App {
                 for suggestion in suggestions {
                     // Skip duplicates
                     if !self.db.has_task_with_label(&suggestion.label) {
-                        self.db.add_task(suggestion.label, suggestion.description)?;
+                        self.db.add_task(
+                            suggestion.label,
+                            suggestion.description,
+                            suggestion.time_estimate,
+                            suggestion.complexity,
+                            suggestion.affected_files,
+                        )?;
                         added += 1;
                     }
                 }
@@ -180,6 +186,9 @@ impl App {
             crate::ai::TaskSuggestion {
                 label: t.label.clone(),
                 description: t.description.clone(),
+                time_estimate: t.time_estimate.clone(),
+                complexity: t.complexity.clone(),
+                affected_files: t.affected_files.clone(),
             }
         }).collect();
 

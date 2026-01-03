@@ -8,10 +8,16 @@ const TASKS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("tasks");
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: u64,
-    /// The action label from Claude's YAML
+    /// The action label from Claude's YAML (short, <60 chars)
     pub label: String,
-    /// Description of what this task involves
+    /// Description of what this task involves (can be detailed)
     pub description: String,
+    /// Estimated time to complete (e.g., "5 min", "30 min", "2 hours")
+    pub time_estimate: Option<String>,
+    /// Complexity level (e.g., "trivial", "simple", "moderate", "complex")
+    pub complexity: Option<String>,
+    /// Files likely to be affected
+    pub affected_files: Vec<String>,
     /// When this task was suggested (unix timestamp)
     pub created_at: u64,
     /// Whether user has selected this for execution
@@ -141,7 +147,14 @@ impl Database {
         self.tasks.iter().filter(|t| t.selected).collect()
     }
 
-    pub fn add_task(&mut self, label: String, description: String) -> Result<u64> {
+    pub fn add_task(
+        &mut self,
+        label: String,
+        description: String,
+        time_estimate: Option<String>,
+        complexity: Option<String>,
+        affected_files: Vec<String>,
+    ) -> Result<u64> {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -154,6 +167,9 @@ impl Database {
             id,
             label,
             description,
+            time_estimate,
+            complexity,
+            affected_files,
             created_at,
             selected: false,
             completed: false,

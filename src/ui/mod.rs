@@ -17,7 +17,7 @@ use ratatui::{
 };
 use std::io::{self, Stdout};
 
-pub use task_list::TaskListWidget;
+pub use task_list::{TaskListWidget, TaskDetailWidget};
 
 pub struct Ui {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -73,9 +73,10 @@ fn render(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Header
-            Constraint::Min(10),   // Task list
-            Constraint::Length(3), // Footer/controls
+            Constraint::Length(3),  // Header
+            Constraint::Min(10),    // Task list
+            Constraint::Length(8),  // Detail panel
+            Constraint::Length(3),  // Footer/controls
         ])
         .split(frame.area());
 
@@ -86,10 +87,18 @@ fn render(frame: &mut Frame, app: &App) {
         _ => "",
     };
 
+    let selected_count = app.db.tasks().iter().filter(|t| t.selected).count();
+    let selected_info = if selected_count > 0 {
+        format!(" │ {} selected", selected_count)
+    } else {
+        String::new()
+    };
+
     let header = Paragraph::new(format!(
-        " Palace │ {} │ {} tasks{}",
+        " Palace │ {} │ {} tasks{}{}",
         app.project_path.display(),
         app.db.task_count(),
+        selected_info,
         state_indicator
     ))
     .style(Style::default().fg(Color::Cyan))
@@ -114,6 +123,24 @@ fn render(frame: &mut Frame, app: &App) {
         }
     }
 
+    // Detail panel for focused task
+    if app.state == AppState::TaskList && app.db.task_count() > 0 {
+        let detail_block = Block::default()
+            .borders(Borders::TOP)
+            .title(" Details ")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(detail_block, chunks[2]);
+
+        // Render detail content inside the block
+        let inner = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(chunks[2]);
+
+        let detail_widget = TaskDetailWidget::new(&app.db);
+        frame.render_widget(detail_widget, inner[1]);
+    }
+
     // Footer - show error if any, otherwise controls
     let footer_text = if let Some(ref err) = app.error_message {
         format!(" ⚠ {}", err)
@@ -130,5 +157,5 @@ fn render(frame: &mut Frame, app: &App) {
     let footer = Paragraph::new(footer_text)
         .style(footer_style)
         .block(Block::default().borders(Borders::TOP));
-    frame.render_widget(footer, chunks[2]);
+    frame.render_widget(footer, chunks[3]);
 }

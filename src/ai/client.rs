@@ -40,6 +40,9 @@ struct ContentBlock {
 pub struct TaskSuggestion {
     pub label: String,
     pub description: String,
+    pub time_estimate: Option<String>,
+    pub complexity: Option<String>,
+    pub affected_files: Vec<String>,
 }
 
 impl AnthropicClient {
@@ -68,13 +71,29 @@ Respond ONLY with a YAML list of suggested actions. No other text.
 Format:
 ```yaml
 actions:
-  - label: Short action title
-    description: What this involves
+  - label: Short action title (under 60 chars)
+    description: Detailed description of what this involves and why it matters
+    time_estimate: "15 min"  # estimated time: "5 min", "30 min", "1 hour", "2 hours", etc.
+    complexity: simple  # one of: trivial, simple, moderate, complex
+    affected_files:
+      - src/main.rs
+      - src/lib.rs
   - label: Another action
-    description: Details about it
+    description: Full details about this task
+    time_estimate: "1 hour"
+    complexity: moderate
+    affected_files:
+      - src/api/client.rs
 ```
 
-Be specific and actionable. Suggest as many tasks as make sense - no artificial limits."#;
+RULES:
+- label: Required, keep under 60 chars
+- description: Required, be detailed (up to 1000 chars) - this provides context for execution
+- time_estimate: Optional but helpful
+- complexity: Optional, one of trivial/simple/moderate/complex
+- affected_files: Optional, list files this task will likely touch
+- Suggest as many tasks as make sense - no artificial limits
+- Be specific and actionable"#;
 
         let prompt = format!(
             "Here's the current state of the project at {}:\n\n{}\n\nWhat tasks should I work on next?",
@@ -218,9 +237,13 @@ Be thorough but concise. Show what you're doing."#;
             response
         };
 
-        // Simple YAML parsing for actions list
+        // Parse each action block
         let mut current_label: Option<String> = None;
         let mut current_desc: Option<String> = None;
+        let mut current_time: Option<String> = None;
+        let mut current_complexity: Option<String> = None;
+        let mut current_files: Vec<String> = Vec::new();
+        let mut in_files_list = false;
 
         for line in yaml_content.lines() {
             let trimmed = line.trim();
@@ -231,11 +254,32 @@ Be thorough but concise. Show what you're doing."#;
                     tasks.push(TaskSuggestion {
                         label,
                         description: desc,
+                        time_estimate: current_time.take(),
+                        complexity: current_complexity.take(),
+                        affected_files: std::mem::take(&mut current_files),
                     });
                 }
+                in_files_list = false;
                 current_label = Some(trimmed.trim_start_matches("- label:").trim().to_string());
             } else if trimmed.starts_with("description:") {
+                in_files_list = false;
                 current_desc = Some(trimmed.trim_start_matches("description:").trim().to_string());
+            } else if trimmed.starts_with("time_estimate:") {
+                in_files_list = false;
+                current_time = Some(trimmed.trim_start_matches("time_estimate:").trim().trim_matches('"').to_string());
+            } else if trimmed.starts_with("complexity:") {
+                in_files_list = false;
+                current_complexity = Some(trimmed.trim_start_matches("complexity:").trim().to_string());
+            } else if trimmed.starts_with("affected_files:") {
+                in_files_list = true;
+            } else if in_files_list && trimmed.starts_with("- ") {
+                let file = trimmed.trim_start_matches("- ").trim().to_string();
+                if !file.is_empty() {
+                    current_files.push(file);
+                }
+            } else if !trimmed.starts_with("-") && !trimmed.is_empty() {
+                // Reset files list if we hit a non-list line
+                in_files_list = false;
             }
         }
 
@@ -244,6 +288,9 @@ Be thorough but concise. Show what you're doing."#;
             tasks.push(TaskSuggestion {
                 label,
                 description: desc,
+                time_estimate: current_time,
+                complexity: current_complexity,
+                affected_files: current_files,
             });
         }
 
