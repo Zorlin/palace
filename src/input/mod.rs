@@ -12,6 +12,12 @@ pub enum Event {
     Quit,
     NavigateUp,
     NavigateDown,
+    PageUp,
+    PageDown,
+    JumpUp,    // Ctrl+Up - jump 5 items
+    JumpDown,  // Ctrl+Down - jump 5 items
+    Home,
+    End,
     ToggleSelect,
     SelectAll,
     DeselectAll,
@@ -83,11 +89,25 @@ impl InputHandler {
             (KeyCode::Char('q'), KeyModifiers::NONE) => Some(Event::Quit),
             (KeyCode::Esc, _) => Some(Event::Quit),
 
-            // Navigation
-            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => Some(Event::NavigateUp),
-            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+            // Navigation - single step
+            (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                Some(Event::NavigateUp)
+            }
+            (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
                 Some(Event::NavigateDown)
             }
+
+            // Navigation - jump (Ctrl+Up/Down)
+            (KeyCode::Up, KeyModifiers::CONTROL) => Some(Event::JumpUp),
+            (KeyCode::Down, KeyModifiers::CONTROL) => Some(Event::JumpDown),
+
+            // Navigation - page
+            (KeyCode::PageUp, _) => Some(Event::PageUp),
+            (KeyCode::PageDown, _) => Some(Event::PageDown),
+
+            // Navigation - home/end
+            (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => Some(Event::Home),
+            (KeyCode::End, _) | (KeyCode::Char('G'), KeyModifiers::SHIFT) => Some(Event::End),
 
             // Selection
             (KeyCode::Char(' '), _) => Some(Event::ToggleSelect),

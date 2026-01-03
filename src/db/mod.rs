@@ -11,12 +11,16 @@ pub struct Task {
     /// The action label from Claude's YAML (short, <60 chars)
     pub label: String,
     /// Description of what this task involves (can be detailed)
+    #[serde(default)]
     pub description: String,
     /// Estimated time to complete (e.g., "5 min", "30 min", "2 hours")
+    #[serde(default)]
     pub time_estimate: Option<String>,
     /// Complexity level (e.g., "trivial", "simple", "moderate", "complex")
+    #[serde(default)]
     pub complexity: Option<String>,
     /// Files likely to be affected
+    #[serde(default)]
     pub affected_files: Vec<String>,
     /// When this task was suggested (unix timestamp)
     pub created_at: u64,
@@ -113,6 +117,42 @@ impl Database {
     pub fn select_index(&mut self, index: usize) {
         if index < self.tasks.len() {
             self.cursor = index;
+        }
+    }
+
+    /// Jump up by N items (Ctrl+Up)
+    pub fn jump_up(&mut self, n: usize) {
+        self.cursor = self.cursor.saturating_sub(n);
+    }
+
+    /// Jump down by N items (Ctrl+Down)
+    pub fn jump_down(&mut self, n: usize) {
+        if !self.tasks.is_empty() {
+            self.cursor = (self.cursor + n).min(self.tasks.len() - 1);
+        }
+    }
+
+    /// Page up by visible height
+    pub fn page_up(&mut self, page_size: usize) {
+        self.cursor = self.cursor.saturating_sub(page_size);
+    }
+
+    /// Page down by visible height
+    pub fn page_down(&mut self, page_size: usize) {
+        if !self.tasks.is_empty() {
+            self.cursor = (self.cursor + page_size).min(self.tasks.len() - 1);
+        }
+    }
+
+    /// Jump to first item
+    pub fn jump_to_start(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Jump to last item
+    pub fn jump_to_end(&mut self) {
+        if !self.tasks.is_empty() {
+            self.cursor = self.tasks.len() - 1;
         }
     }
 

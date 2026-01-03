@@ -31,6 +31,8 @@ pub struct App {
     pub should_quit: bool,
     pub ai_client: Option<AnthropicClient>,
     pub error_message: Option<String>,
+    /// Visible height of task list (for page navigation)
+    pub visible_tasks: usize,
 }
 
 impl App {
@@ -64,6 +66,7 @@ impl App {
             should_quit: false,
             ai_client,
             error_message: None,
+            visible_tasks: 10, // Default, updated by UI
         })
     }
 
@@ -109,6 +112,24 @@ impl App {
             }
             Event::NavigateDown => {
                 self.db.select_next();
+            }
+            Event::JumpUp => {
+                self.db.jump_up(5);
+            }
+            Event::JumpDown => {
+                self.db.jump_down(5);
+            }
+            Event::PageUp => {
+                self.db.page_up(self.visible_tasks);
+            }
+            Event::PageDown => {
+                self.db.page_down(self.visible_tasks);
+            }
+            Event::Home => {
+                self.db.jump_to_start();
+            }
+            Event::End => {
+                self.db.jump_to_end();
             }
             Event::ToggleSelect => {
                 self.db.toggle_current_selection();

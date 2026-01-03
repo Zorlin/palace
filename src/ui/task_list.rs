@@ -30,11 +30,37 @@ impl Widget for TaskListWidget<'_> {
 
         let cursor = self.db.cursor();
 
-        // Each task takes 2 lines: label + description
+        // Estimate lines per task: label + desc, focused task gets +1 for details
+        let visible_lines = area.height as usize;
+
+        // Calculate scroll offset - we need to account for the focused task having extra lines
+        // Count lines needed up to and including cursor
+        let lines_before_cursor: usize = (0..cursor).map(|_| 2).sum();
+        let lines_for_cursor = 3; // label + desc + details for focused
+        let total_lines_to_cursor = lines_before_cursor + lines_for_cursor;
+
+        let scroll_offset = if total_lines_to_cursor > visible_lines {
+            // Find which task to start from
+            let mut lines = 0;
+            let mut start = 0;
+            for i in 0..=cursor {
+                let task_lines = if i == cursor { 3 } else { 2 };
+                if lines + task_lines > total_lines_to_cursor - visible_lines {
+                    start = i;
+                    break;
+                }
+                lines += task_lines;
+            }
+            start
+        } else {
+            0
+        };
+
         let mut y = area.y;
 
-        for (i, task) in tasks.iter().enumerate() {
-            if y >= area.y + area.height - 1 {
+        // Render visible tasks
+        for (i, task) in tasks.iter().enumerate().skip(scroll_offset) {
+            if y >= area.y + area.height {
                 break;
             }
 
@@ -88,66 +114,67 @@ impl Widget for TaskListWidget<'_> {
                 buf.set_string(area.x, y, &desc_line, desc_style);
                 y += 1;
             }
-        }
-    }
-}
 
-/// Widget showing details for the focused task
-pub struct TaskDetailWidget<'a> {
-    db: &'a Database,
-}
+            // Line 3: Details (only for focused task) - inline summary
+            if is_focused && y < area.y + area.height {
+                let mut details = Vec::new();
 
-impl<'a> TaskDetailWidget<'a> {
-    pub fn new(db: &'a Database) -> Self {
-        Self { db }
-    }
-}
-
-impl Widget for TaskDetailWidget<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        let tasks = self.db.tasks();
-        let cursor = self.db.cursor();
-
-        let Some(task) = tasks.get(cursor) else {
-            return;
-        };
-
-        let mut y = area.y;
-
-        // Time estimate
-        if let Some(ref time) = task.time_estimate {
-            let line = format!(" ⏱  {}", time);
-            buf.set_string(area.x, y, &line, Style::default().fg(Color::Cyan));
-            y += 1;
-        }
-
-        // Complexity
-        if let Some(ref complexity) = task.complexity {
-            let (icon, color) = match complexity.as_str() {
-                "trivial" => ("●", Color::Green),
-                "simple" => ("●●", Color::Green),
-                "moderate" => ("●●●", Color::Yellow),
-                "complex" => ("●●●●", Color::Red),
-                _ => ("?", Color::Gray),
-            };
-            let line = format!(" {}  {}", icon, complexity);
-            buf.set_string(area.x, y, &line, Style::default().fg(color));
-            y += 1;
-        }
-
-        // Affected files
-        if !task.affected_files.is_empty() {
-            buf.set_string(area.x, y, " 📁 Files:", Style::default().fg(Color::Magenta));
-            y += 1;
-
-            for file in &task.affected_files {
-                if y >= area.y + area.height {
-                    break;
+                if let Some(ref complexity) = task.complexity {
+                    let dots = match complexity.as_str() {
+                        "trivial" => "●",
+                        "simple" => "●●",
+                        "moderate" => "●●●",
+                        "complex" => "●●●●",
+                        _ => "?",
+                    };
+                    details.push(format!("{} {}", dots, complexity));
                 }
-                let line = format!("    {}", file);
-                buf.set_string(area.x, y, &line, Style::default().fg(Color::DarkGray));
-                y += 1;
+
+                if !task.affected_files.is_empty() {
+                    let files_str = if task.affected_files.len() <= 3 {
+                        task.affected_files.join(", ")
+                    } else {
+                        format!("{}, ... +{} more",
+                            task.affected_files[..2].join(", "),
+                            task.affected_files.len() - 2)
+                    };
+                    details.push(format!("📁 {}", files_str));
+                }
+
+                if !details.is_empty() {
+                    let detail_line = format!("       {}", details.join("  │  "));
+                    buf.set_string(area.x, y, &detail_line, Style::default().fg(Color::Cyan));
+                    y += 1;
+                }
             }
+        }
+
+        // Show scroll indicator if there are more tasks
+        if scroll_offset > 0 {
+            buf.set_string(
+                area.x + area.width - 5,
+                area.y,
+                "↑more",
+                Style::default().fg(Color::DarkGray),
+            );
+        }
+
+        // Check if there are more tasks below
+        let tasks_after_visible: usize = tasks.iter().enumerate().skip(scroll_offset).count();
+        let mut lines_used = 0;
+        for (i, _) in tasks.iter().enumerate().skip(scroll_offset) {
+            lines_used += if i == cursor { 3 } else { 2 };
+            if lines_used > visible_lines {
+                break;
+            }
+        }
+        if lines_used > visible_lines || scroll_offset + tasks_after_visible < tasks.len() {
+            buf.set_string(
+                area.x + area.width - 5,
+                area.y + area.height - 1,
+                "↓more",
+                Style::default().fg(Color::DarkGray),
+            );
         }
     }
 }
