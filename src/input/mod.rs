@@ -21,10 +21,10 @@ pub enum Event {
     Home,
     End,
     ToggleSelect,
-    SelectAll,
-    DeselectAll,
+    ToggleSelectAll,  // A - toggle all selected/deselected
     Execute,
     Delete,
+    ToggleExpand,  // E - toggle expanded view for focused task
     MouseClick { row: u16, col: u16 },
     MouseShiftClick { row: u16, col: u16 }, // Shift+click for range select
 }
@@ -125,12 +125,12 @@ impl InputHandler {
 
             // Selection
             (KeyCode::Char(' '), _) => Some(Event::ToggleSelect),
-            (KeyCode::Char('a'), KeyModifiers::CONTROL) => Some(Event::SelectAll),
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) => Some(Event::DeselectAll),
+            (KeyCode::Char('a'), KeyModifiers::NONE) | (KeyCode::Char('A'), _) => Some(Event::ToggleSelectAll),
 
             // Actions
             (KeyCode::Enter, _) => Some(Event::Execute),
             (KeyCode::Delete, _) | (KeyCode::Backspace, _) => Some(Event::Delete),
+            (KeyCode::Char('e'), KeyModifiers::NONE) => Some(Event::ToggleExpand),
 
             _ => None,
         }

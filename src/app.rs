@@ -33,6 +33,8 @@ pub struct App {
     pub error_message: Option<String>,
     /// Visible height of task list (for page navigation)
     pub visible_tasks: usize,
+    /// Whether to show expanded description for focused task
+    pub expanded: bool,
 }
 
 impl App {
@@ -67,6 +69,7 @@ impl App {
             ai_client,
             error_message: None,
             visible_tasks: 10, // Default, updated by UI
+            expanded: false,
         })
     }
 
@@ -140,11 +143,8 @@ impl App {
             Event::ToggleSelect => {
                 self.db.toggle_current_selection();
             }
-            Event::SelectAll => {
-                self.db.select_all();
-            }
-            Event::DeselectAll => {
-                self.db.deselect_all();
+            Event::ToggleSelectAll => {
+                self.db.toggle_select_all();
             }
             Event::Execute => {
                 if self.db.has_selection() {
@@ -159,6 +159,9 @@ impl App {
             }
             Event::Delete => {
                 self.db.delete_selected()?;
+            }
+            Event::ToggleExpand => {
+                self.expanded = !self.expanded;
             }
             Event::MouseClick { row, .. } => {
                 // Click on a task row to focus it (offset for header)

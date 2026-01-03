@@ -128,7 +128,7 @@ fn render(frame: &mut Frame, app: &mut App) {
             frame.render_widget(msg, chunks[1]);
         }
         _ => {
-            let task_widget = TaskListWidget::new(&app.db);
+            let task_widget = TaskListWidget::new(&app.db, app.expanded);
             frame.render_widget(task_widget, chunks[1]);
         }
     }
@@ -137,7 +137,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     let footer_text = if let Some(ref err) = app.error_message {
         format!(" ⚠ {}", err)
     } else {
-        " [Space] Toggle  [Shift+↑↓] Range  [Enter] Execute  [Ctrl+A] All  [PgUp/Dn] Page  [q] Quit".to_string()
+        " [Space] Toggle  [Shift+↑↓] Range  [A] All  [E] Expand  [Enter] Execute  [q] Quit".to_string()
     };
 
     let footer_style = if app.error_message.is_some() {

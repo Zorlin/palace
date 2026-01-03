@@ -211,13 +211,16 @@ impl Database {
         }
     }
 
-    pub fn select_all(&mut self) {
+    /// Toggle all selected - if any unselected, select all; otherwise deselect all
+    pub fn toggle_select_all(&mut self) {
+        let all_selected = self.tasks.iter().all(|t| t.selected);
         for task in &mut self.tasks {
-            task.selected = true;
+            task.selected = !all_selected;
         }
         let _ = self.save_all();
     }
 
+    /// Deselect all tasks
     pub fn deselect_all(&mut self) {
         for task in &mut self.tasks {
             task.selected = false;

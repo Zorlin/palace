@@ -48,7 +48,7 @@ impl GamepadHandler {
             Button::South => Some(Event::ToggleSelect),
 
             // Y button - select all toggle
-            Button::North => Some(Event::SelectAll),
+            Button::North => Some(Event::ToggleSelectAll),
 
             // X button - execute
             Button::West => Some(Event::Execute),

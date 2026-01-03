@@ -6,13 +6,52 @@ use ratatui::{
     widgets::Widget,
 };
 
+/// Wrap text to fit within max_width, breaking on word boundaries
+fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current_line = String::new();
+
+    for word in text.split_whitespace() {
+        if current_line.is_empty() {
+            if word.len() > max_width {
+                // Word too long, force break
+                let mut remaining = word;
+                while remaining.len() > max_width {
+                    lines.push(remaining[..max_width].to_string());
+                    remaining = &remaining[max_width..];
+                }
+                current_line = remaining.to_string();
+            } else {
+                current_line = word.to_string();
+            }
+        } else if current_line.len() + 1 + word.len() <= max_width {
+            current_line.push(' ');
+            current_line.push_str(word);
+        } else {
+            lines.push(current_line);
+            current_line = word.to_string();
+        }
+    }
+
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    lines
+}
+
 pub struct TaskListWidget<'a> {
     db: &'a Database,
+    expanded: bool,
 }
 
 impl<'a> TaskListWidget<'a> {
-    pub fn new(db: &'a Database) -> Self {
-        Self { db }
+    pub fn new(db: &'a Database, expanded: bool) -> Self {
+        Self { db, expanded }
     }
 }
 
@@ -96,7 +135,8 @@ impl Widget for TaskListWidget<'_> {
             buf.set_string(area.x, y, &line, label_style);
             y += 1;
 
-            // Line 2: Description (dimmed, indented)
+            // Line 2+: Description (dimmed, indented)
+            // When expanded and focused, show full wrapped description
             if y < area.y + area.height {
                 let desc_style = if is_focused {
                     Style::default().fg(Color::Gray)
@@ -104,15 +144,31 @@ impl Widget for TaskListWidget<'_> {
                     Style::default().fg(Color::DarkGray)
                 };
 
-                let desc = if task.description.len() > (area.width as usize - 8) {
-                    format!("{}...", &task.description[..(area.width as usize - 11).min(task.description.len())])
-                } else {
-                    task.description.clone()
-                };
+                let indent = "       ";
+                let max_width = (area.width as usize).saturating_sub(indent.len() + 1);
 
-                let desc_line = format!("       {}", desc);
-                buf.set_string(area.x, y, &desc_line, desc_style);
-                y += 1;
+                if is_focused && self.expanded && !task.description.is_empty() {
+                    // Wrap text for expanded view
+                    let lines = wrap_text(&task.description, max_width);
+                    for line in lines {
+                        if y >= area.y + area.height {
+                            break;
+                        }
+                        let desc_line = format!("{}{}", indent, line);
+                        buf.set_string(area.x, y, &desc_line, desc_style);
+                        y += 1;
+                    }
+                } else {
+                    // Single line truncated
+                    let desc = if task.description.len() > max_width {
+                        format!("{}...", &task.description[..(max_width.saturating_sub(3)).min(task.description.len())])
+                    } else {
+                        task.description.clone()
+                    };
+                    let desc_line = format!("{}{}", indent, desc);
+                    buf.set_string(area.x, y, &desc_line, desc_style);
+                    y += 1;
+                }
             }
 
             // Line 3: Details (only for focused task) - inline summary
