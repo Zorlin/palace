@@ -137,7 +137,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     let footer_text = if let Some(ref err) = app.error_message {
         format!(" ⚠ {}", err)
     } else {
-        " [Space] Select  [Enter] Execute  [Ctrl+A] All  [PgUp/Dn] Page  [g/G] Home/End  [q] Quit".to_string()
+        " [Space] Toggle  [Shift+↑↓] Range  [Enter] Execute  [Ctrl+A] All  [PgUp/Dn] Page  [q] Quit".to_string()
     };
 
     let footer_style = if app.error_message.is_some() {

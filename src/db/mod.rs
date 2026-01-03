@@ -156,6 +156,52 @@ impl Database {
         }
     }
 
+    /// Select current and move up (Shift+Up)
+    pub fn select_and_move_up(&mut self) {
+        if let Some(task) = self.tasks.get_mut(self.cursor) {
+            task.selected = true;
+        }
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            if let Some(task) = self.tasks.get_mut(self.cursor) {
+                task.selected = true;
+            }
+        }
+        let _ = self.save_all();
+    }
+
+    /// Select current and move down (Shift+Down)
+    pub fn select_and_move_down(&mut self) {
+        if let Some(task) = self.tasks.get_mut(self.cursor) {
+            task.selected = true;
+        }
+        if !self.tasks.is_empty() && self.cursor < self.tasks.len() - 1 {
+            self.cursor += 1;
+            if let Some(task) = self.tasks.get_mut(self.cursor) {
+                task.selected = true;
+            }
+        }
+        let _ = self.save_all();
+    }
+
+    /// Select range from current cursor to target index (Shift+click)
+    pub fn select_range_to(&mut self, target: usize) {
+        let target = target.min(self.tasks.len().saturating_sub(1));
+        let (start, end) = if self.cursor <= target {
+            (self.cursor, target)
+        } else {
+            (target, self.cursor)
+        };
+
+        for i in start..=end {
+            if let Some(task) = self.tasks.get_mut(i) {
+                task.selected = true;
+            }
+        }
+        self.cursor = target;
+        let _ = self.save_all();
+    }
+
     pub fn toggle_current_selection(&mut self) {
         if let Some(task) = self.tasks.get_mut(self.cursor) {
             task.selected = !task.selected;

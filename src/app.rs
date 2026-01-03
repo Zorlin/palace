@@ -131,6 +131,12 @@ impl App {
             Event::End => {
                 self.db.jump_to_end();
             }
+            Event::SelectUp => {
+                self.db.select_and_move_up();
+            }
+            Event::SelectDown => {
+                self.db.select_and_move_down();
+            }
             Event::ToggleSelect => {
                 self.db.toggle_current_selection();
             }
@@ -155,9 +161,17 @@ impl App {
                 self.db.delete_selected()?;
             }
             Event::MouseClick { row, .. } => {
-                // Click on a task row to select it (offset for header)
+                // Click on a task row to focus it (offset for header)
                 if row >= 3 {
-                    self.db.select_index((row - 3) as usize);
+                    let task_idx = (row - 3) as usize / 2; // 2 lines per task
+                    self.db.select_index(task_idx);
+                }
+            }
+            Event::MouseShiftClick { row, .. } => {
+                // Shift+click for range selection
+                if row >= 3 {
+                    let task_idx = (row - 3) as usize / 2;
+                    self.db.select_range_to(task_idx);
                 }
             }
         }
