@@ -2,15 +2,25 @@ package main
 
 /*
 #include <stdlib.h>
+
+// Callback type for streaming chunks
+typedef void (*stream_callback)(const char* chunk, int is_done, const char* error);
+
+// Helper to invoke the callback from Go
+static inline void invoke_callback(stream_callback cb, const char* chunk, int is_done, const char* error) {
+    cb(chunk, is_done, error);
+}
 */
 import "C"
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"unsafe"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -262,6 +272,167 @@ func callOpenAI(model, system, user string, maxTokens int64) *C.char {
 
 	jsonBytes, _ := json.Marshal(resp)
 	return C.CString(string(jsonBytes))
+}
+
+//export anthropic_message_stream
+func anthropic_message_stream(model *C.char, systemPrompt *C.char, userMessage *C.char, maxTokens C.int, callback C.stream_callback) {
+	if !clientInitialized {
+		errStr := C.CString("client not initialized, call anthropic_init first")
+		C.invoke_callback(callback, nil, 1, errStr)
+		C.free(unsafe.Pointer(errStr))
+		return
+	}
+
+	modelStr := C.GoString(model)
+	systemStr := C.GoString(systemPrompt)
+	userStr := C.GoString(userMessage)
+	tokens := int64(maxTokens)
+
+	if tokens <= 0 {
+		tokens = 4096
+	}
+
+	if currentAPIType == apiOpenAI {
+		streamOpenAI(modelStr, systemStr, userStr, tokens, callback)
+		return
+	}
+
+	// Anthropic streaming API
+	params := anthropic.MessageNewParams{
+		Model:     anthropic.Model(modelStr),
+		MaxTokens: tokens,
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(userStr)),
+		},
+	}
+
+	if systemStr != "" {
+		params.System = []anthropic.TextBlockParam{
+			{Text: systemStr},
+		}
+	}
+
+	stream := client.Messages.NewStreaming(context.Background(), params)
+
+	for stream.Next() {
+		event := stream.Current()
+
+		switch eventVariant := event.AsAny().(type) {
+		case anthropic.ContentBlockDeltaEvent:
+			switch deltaVariant := eventVariant.Delta.AsAny().(type) {
+			case anthropic.TextDelta:
+				if deltaVariant.Text != "" {
+					chunkStr := C.CString(deltaVariant.Text)
+					C.invoke_callback(callback, chunkStr, 0, nil)
+					C.free(unsafe.Pointer(chunkStr))
+				}
+			}
+		}
+	}
+
+	if stream.Err() != nil {
+		errStr := C.CString(stream.Err().Error())
+		C.invoke_callback(callback, nil, 1, errStr)
+		C.free(unsafe.Pointer(errStr))
+		return
+	}
+
+	// Signal completion
+	C.invoke_callback(callback, nil, 1, nil)
+}
+
+// OpenAI-compatible streaming API call
+func streamOpenAI(model, system, user string, maxTokens int64, callback C.stream_callback) {
+	type Message struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	type Request struct {
+		Model     string    `json:"model"`
+		Messages  []Message `json:"messages"`
+		MaxTokens int64     `json:"max_tokens"`
+		Stream    bool      `json:"stream"`
+	}
+
+	messages := []Message{}
+	if system != "" {
+		messages = append(messages, Message{Role: "system", Content: system})
+	}
+	messages = append(messages, Message{Role: "user", Content: user})
+
+	reqBody := Request{
+		Model:     model,
+		Messages:  messages,
+		MaxTokens: maxTokens,
+		Stream:    true,
+	}
+
+	jsonBody, _ := json.Marshal(reqBody)
+	req, err := http.NewRequest("POST", openaiBase+"/chat/completions", bytes.NewBuffer(jsonBody))
+	if err != nil {
+		errStr := C.CString(err.Error())
+		C.invoke_callback(callback, nil, 1, errStr)
+		C.free(unsafe.Pointer(errStr))
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+openaiKey)
+	req.Header.Set("Accept", "text/event-stream")
+
+	httpClient := &http.Client{}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		errStr := C.CString(err.Error())
+		C.invoke_callback(callback, nil, 1, errStr)
+		C.free(unsafe.Pointer(errStr))
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		errStr := C.CString(string(body))
+		C.invoke_callback(callback, nil, 1, errStr)
+		C.free(unsafe.Pointer(errStr))
+		return
+	}
+
+	// Parse SSE stream
+	type Delta struct {
+		Content string `json:"content"`
+	}
+	type Choice struct {
+		Delta Delta `json:"delta"`
+	}
+	type StreamChunk struct {
+		Choices []Choice `json:"choices"`
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "data: ") {
+			data := strings.TrimPrefix(line, "data: ")
+			if data == "[DONE]" {
+				break
+			}
+
+			var chunk StreamChunk
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				continue
+			}
+
+			if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
+				chunkStr := C.CString(chunk.Choices[0].Delta.Content)
+				C.invoke_callback(callback, chunkStr, 0, nil)
+				C.free(unsafe.Pointer(chunkStr))
+			}
+		}
+	}
+
+	// Signal completion
+	C.invoke_callback(callback, nil, 1, nil)
 }
 
 //export anthropic_free_string

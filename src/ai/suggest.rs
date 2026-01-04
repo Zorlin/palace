@@ -1,7 +1,8 @@
 use anyhow::Result;
-use anthropic_ffi::{models, Client as AnthropicClient};
+use anthropic_ffi::{models, Client as AnthropicClient, StreamEvent};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -247,6 +248,49 @@ impl SuggestionEngine {
     pub fn suggest(&self, context: &ProjectContext) -> Result<Vec<Suggestion>> {
         let prompt = self.build_prompt(context);
         let response = self.call_api(&prompt)?;
+        self.parse_suggestions(&response)
+    }
+
+    /// Generate suggestions with streaming output
+    /// Prints chunks to stdout in real-time, then parses the final result
+    pub fn suggest_streaming(&self, context: &ProjectContext) -> Result<Vec<Suggestion>> {
+        use std::sync::{Arc, Mutex};
+
+        let prompt = self.build_prompt(context);
+        let system = "You are Palace, an AI assistant that analyzes software projects and suggests actionable next steps. Always respond with valid JSON.";
+
+        let accumulated = Arc::new(Mutex::new(String::new()));
+        let accumulated_clone = accumulated.clone();
+        let mut stdout = io::stdout();
+
+        self.client.message_stream(
+            &self.model,
+            Some(system),
+            &prompt,
+            4096,
+            move |event| {
+                match event {
+                    StreamEvent::Text(chunk) => {
+                        // Print chunk immediately
+                        print!("{}", chunk);
+                        let _ = stdout.flush();
+                        // Accumulate for parsing
+                        if let Ok(mut acc) = accumulated_clone.lock() {
+                            acc.push_str(&chunk);
+                        }
+                    }
+                    StreamEvent::Done => {
+                        println!(); // Final newline
+                    }
+                    StreamEvent::Error(e) => {
+                        eprintln!("\nStream error: {}", e);
+                    }
+                }
+            },
+        )?;
+
+        // Parse accumulated response
+        let response = accumulated.lock().unwrap().clone();
         self.parse_suggestions(&response)
     }
 

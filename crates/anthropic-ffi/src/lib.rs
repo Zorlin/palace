@@ -1,7 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int};
 use std::sync::Once;
+
+/// Callback type for streaming responses
+/// chunk: text chunk (null on completion/error)
+/// is_done: 1 if streaming complete, 0 otherwise
+/// error: error message (null if no error)
+pub type StreamCallback = extern "C" fn(chunk: *const c_char, is_done: c_int, error: *const c_char);
 
 #[link(name = "anthropic")]
 extern "C" {
@@ -12,6 +18,13 @@ extern "C" {
         user_message: *const c_char,
         max_tokens: i32,
     ) -> *mut c_char;
+    fn anthropic_message_stream(
+        model: *const c_char,
+        system_prompt: *const c_char,
+        user_message: *const c_char,
+        max_tokens: i32,
+        callback: StreamCallback,
+    );
     fn anthropic_free_string(s: *mut c_char);
 }
 
@@ -142,6 +155,91 @@ impl Client {
 
         Ok(response)
     }
+
+    /// Send a streaming message to Claude
+    /// The callback is called for each text chunk, then once with is_done=true
+    pub fn message_stream<F>(
+        &self,
+        model: &str,
+        system_prompt: Option<&str>,
+        user_message: &str,
+        max_tokens: i32,
+        mut on_chunk: F,
+    ) -> Result<(), AnthropicError>
+    where
+        F: FnMut(StreamEvent) + 'static,
+    {
+        use std::sync::{Arc, Mutex};
+
+        let model_c = CString::new(model)?;
+        let system_c = CString::new(system_prompt.unwrap_or(""))?;
+        let user_c = CString::new(user_message)?;
+
+        // Store callback in thread-local storage for FFI access
+        let callback_box: Arc<Mutex<Option<Box<dyn FnMut(StreamEvent)>>>> =
+            Arc::new(Mutex::new(Some(Box::new(on_chunk))));
+
+        // Store in thread-local for the callback to access
+        STREAM_CALLBACK.with(|cell| {
+            *cell.borrow_mut() = Some(callback_box.clone());
+        });
+
+        unsafe {
+            anthropic_message_stream(
+                model_c.as_ptr(),
+                system_c.as_ptr(),
+                user_c.as_ptr(),
+                max_tokens,
+                stream_callback_handler,
+            );
+        }
+
+        // Clean up
+        STREAM_CALLBACK.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+
+        Ok(())
+    }
+}
+
+/// Stream event types
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// Text chunk received
+    Text(String),
+    /// Stream completed successfully
+    Done,
+    /// Error occurred
+    Error(String),
+}
+
+use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
+
+thread_local! {
+    static STREAM_CALLBACK: RefCell<Option<Arc<Mutex<Option<Box<dyn FnMut(StreamEvent)>>>>>> = RefCell::new(None);
+}
+
+/// FFI callback handler that forwards to the Rust closure
+extern "C" fn stream_callback_handler(chunk: *const c_char, is_done: c_int, error: *const c_char) {
+    STREAM_CALLBACK.with(|cell| {
+        if let Some(ref callback_arc) = *cell.borrow() {
+            if let Ok(mut guard) = callback_arc.lock() {
+                if let Some(ref mut callback) = *guard {
+                    if !error.is_null() {
+                        let err_str = unsafe { CStr::from_ptr(error).to_string_lossy().into_owned() };
+                        callback(StreamEvent::Error(err_str));
+                    } else if is_done != 0 {
+                        callback(StreamEvent::Done);
+                    } else if !chunk.is_null() {
+                        let chunk_str = unsafe { CStr::from_ptr(chunk).to_string_lossy().into_owned() };
+                        callback(StreamEvent::Text(chunk_str));
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Model constants

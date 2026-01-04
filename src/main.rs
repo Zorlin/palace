@@ -67,6 +67,10 @@ enum Commands {
         /// Output path for rendered screenshot (only with --format=render)
         #[arg(short, long)]
         output: Option<String>,
+
+        /// Disable streaming (wait for full response)
+        #[arg(long)]
+        no_stream: bool,
     },
 
     /// Run headless with test rendering
@@ -116,8 +120,8 @@ fn main() -> Result<()> {
             } => run_screenshot_command(count, delay, output),
             Commands::Restart => run_restart_command(),
             Commands::Display { action } => run_display_command(action),
-            Commands::Suggest { project, format, output } => {
-                run_suggest_command(project, format, output)
+            Commands::Suggest { project, format, output, no_stream } => {
+                run_suggest_command(project, format, output, !no_stream)
             }
             Commands::Headless { width, height, output, project } => {
                 run_headless_command(width, height, output, project)
@@ -344,47 +348,73 @@ fn run_restart_command() -> Result<()> {
 }
 
 /// Run the suggest command - analyze project and generate AI suggestions
-fn run_suggest_command(project: Option<String>, format: String, output: Option<String>) -> Result<()> {
+fn run_suggest_command(project: Option<String>, format: String, output: Option<String>, stream: bool) -> Result<()> {
     use crate::ai::{ProjectContext, SuggestionEngine};
+    use std::io::Write;
 
     let project_path = project
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-    println!("🔍 Analyzing project: {}", project_path.display());
+    eprintln!("🔍 Analyzing project: {}", project_path.display());
 
     let context = ProjectContext::gather(&project_path)?;
     let engine = SuggestionEngine::from_env()?;
 
-    println!("📡 Generating suggestions with Claude...\n");
+    if stream {
+        eprintln!("📡 Streaming from Claude...\n");
+        eprintln!("────────────────────────────────────────");
 
-    let suggestions = engine.suggest(&context)?;
+        // Use streaming - output goes to stdout in real-time
+        let suggestions = engine.suggest_streaming(&context)?;
 
-    match format.as_str() {
-        "json" => {
-            let json = serde_json::to_string_pretty(&suggestions)?;
-            if let Some(ref path) = output {
-                std::fs::write(path, &json)?;
-                println!("Written to: {}", path);
-            } else {
-                println!("{}", json);
+        eprintln!("────────────────────────────────────────\n");
+
+        // After streaming, show parsed results
+        match format.as_str() {
+            "json" => {
+                let json = serde_json::to_string_pretty(&suggestions)?;
+                if let Some(ref path) = output {
+                    std::fs::write(path, &json)?;
+                    eprintln!("Written to: {}", path);
+                }
+            }
+            "render" => {
+                eprintln!("Render mode not yet implemented. Use 'text' or 'json'.");
+            }
+            _ => {
+                eprintln!("💡 Parsed {} suggestions", suggestions.len());
             }
         }
-        "render" => {
-            // TODO: Implement headless rendering of suggestions
-            println!("Render mode not yet implemented. Use 'text' or 'json'.");
-        }
-        _ => {
-            // Text format (default)
-            println!("💡 Suggestions:\n");
-            for (i, s) in suggestions.iter().enumerate() {
-                println!("{}. [{}] {}", i + 1, s.category.to_uppercase(), s.title);
-                println!("   Priority: {}/5", s.priority);
-                println!("   {}", s.description);
-                if let Some(ref cmd) = s.command {
-                    println!("   Command: {}", cmd);
+    } else {
+        eprintln!("📡 Generating suggestions with Claude...\n");
+
+        let suggestions = engine.suggest(&context)?;
+
+        match format.as_str() {
+            "json" => {
+                let json = serde_json::to_string_pretty(&suggestions)?;
+                if let Some(ref path) = output {
+                    std::fs::write(path, &json)?;
+                    println!("Written to: {}", path);
+                } else {
+                    println!("{}", json);
                 }
-                println!();
+            }
+            "render" => {
+                println!("Render mode not yet implemented. Use 'text' or 'json'.");
+            }
+            _ => {
+                println!("💡 Suggestions:\n");
+                for (i, s) in suggestions.iter().enumerate() {
+                    println!("{}. [{}] {}", i + 1, s.category.to_uppercase(), s.title);
+                    println!("   Priority: {}/5", s.priority);
+                    println!("   {}", s.description);
+                    if let Some(ref cmd) = s.command {
+                        println!("   Command: {}", cmd);
+                    }
+                    println!();
+                }
             }
         }
     }
