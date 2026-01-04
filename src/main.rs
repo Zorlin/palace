@@ -363,12 +363,11 @@ fn run_suggest_command(project: Option<String>, format: String, output: Option<S
 
     if stream {
         eprintln!("📡 Streaming from Claude...\n");
-        eprintln!("────────────────────────────────────────");
 
         // Use streaming - output goes to stdout in real-time
         let suggestions = engine.suggest_streaming(&context)?;
 
-        eprintln!("────────────────────────────────────────\n");
+        eprintln!("\n");
 
         // After streaming, show parsed results
         match format.as_str() {
@@ -377,13 +376,26 @@ fn run_suggest_command(project: Option<String>, format: String, output: Option<S
                 if let Some(ref path) = output {
                     std::fs::write(path, &json)?;
                     eprintln!("Written to: {}", path);
+                } else {
+                    // Already streamed, just show count
+                    eprintln!("💡 {} suggestions (JSON shown above)", suggestions.len());
                 }
             }
             "render" => {
                 eprintln!("Render mode not yet implemented. Use 'text' or 'json'.");
             }
             _ => {
-                eprintln!("💡 Parsed {} suggestions", suggestions.len());
+                // Text format - show clean formatted suggestions
+                eprintln!("────────────────────────────────────────");
+                eprintln!("💡 {} Suggestions:\n", suggestions.len());
+                for (i, s) in suggestions.iter().enumerate() {
+                    eprintln!("  {}. [{}] {}", i + 1, s.category.to_uppercase(), s.title);
+                    eprintln!("     {}", s.description);
+                    if let Some(ref cmd) = s.command {
+                        eprintln!("     → {}", cmd);
+                    }
+                    eprintln!();
+                }
             }
         }
     } else {
