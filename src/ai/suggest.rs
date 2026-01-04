@@ -251,16 +251,12 @@ impl SuggestionEngine {
         self.parse_suggestions(&response)
     }
 
-    /// Generate suggestions with streaming output
-    /// Prints chunks to stdout in real-time, then parses the final result
-    pub fn suggest_streaming(&self, context: &ProjectContext) -> Result<Vec<Suggestion>> {
-        use std::sync::{Arc, Mutex};
+    /// Generate suggestions with streaming output in YAML format
+    /// Streams plain text directly to stdout as it arrives
+    pub fn suggest_streaming(&self, context: &ProjectContext) -> Result<()> {
+        let prompt = self.build_streaming_prompt(context);
+        let system = "You are Palace, an AI assistant that analyzes software projects and suggests actionable next steps. Output clean YAML only, no markdown fences.";
 
-        let prompt = self.build_prompt(context);
-        let system = "You are Palace, an AI assistant that analyzes software projects and suggests actionable next steps. Always respond with valid JSON.";
-
-        let accumulated = Arc::new(Mutex::new(String::new()));
-        let accumulated_clone = accumulated.clone();
         let mut stdout = io::stdout();
 
         self.client.message_stream(
@@ -271,16 +267,11 @@ impl SuggestionEngine {
             move |event| {
                 match event {
                     StreamEvent::Text(chunk) => {
-                        // Print chunk immediately
                         print!("{}", chunk);
                         let _ = stdout.flush();
-                        // Accumulate for parsing
-                        if let Ok(mut acc) = accumulated_clone.lock() {
-                            acc.push_str(&chunk);
-                        }
                     }
                     StreamEvent::Done => {
-                        println!(); // Final newline
+                        println!();
                     }
                     StreamEvent::Error(e) => {
                         eprintln!("\nStream error: {}", e);
@@ -289,9 +280,25 @@ impl SuggestionEngine {
             },
         )?;
 
-        // Parse accumulated response
-        let response = accumulated.lock().unwrap().clone();
-        self.parse_suggestions(&response)
+        Ok(())
+    }
+
+    fn build_streaming_prompt(&self, context: &ProjectContext) -> String {
+        format!(r#"Analyze this project and suggest possible next actions.
+
+{}
+
+Output YAML format (no markdown fences, just raw YAML):
+
+suggestions:
+  - title: Short action title
+    category: test|fix|build|refactor|docs
+    description: What to do
+    command: optional shell command
+
+Provide as many suggestions as make sense. Be concrete and actionable."#,
+            context.summary()
+        )
     }
 
     fn build_prompt(&self, context: &ProjectContext) -> String {
