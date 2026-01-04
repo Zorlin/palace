@@ -60,6 +60,69 @@ impl SettingsItem {
     }
 }
 
+/// UI Scale options
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiScaleOption {
+    Scale50,
+    Scale100,
+    Scale150,
+    Scale200,
+    Scale300,
+    Scale400,
+}
+
+impl UiScaleOption {
+    pub fn all() -> &'static [UiScaleOption] {
+        &[
+            UiScaleOption::Scale50,
+            UiScaleOption::Scale100,
+            UiScaleOption::Scale150,
+            UiScaleOption::Scale200,
+            UiScaleOption::Scale300,
+            UiScaleOption::Scale400,
+        ]
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            UiScaleOption::Scale50 => "50%",
+            UiScaleOption::Scale100 => "100%",
+            UiScaleOption::Scale150 => "150%",
+            UiScaleOption::Scale200 => "200%",
+            UiScaleOption::Scale300 => "300%",
+            UiScaleOption::Scale400 => "400%",
+        }
+    }
+
+    pub fn value(&self) -> f32 {
+        match self {
+            UiScaleOption::Scale50 => 0.5,
+            UiScaleOption::Scale100 => 1.0,
+            UiScaleOption::Scale150 => 1.5,
+            UiScaleOption::Scale200 => 2.0,
+            UiScaleOption::Scale300 => 3.0,
+            UiScaleOption::Scale400 => 4.0,
+        }
+    }
+
+    /// Get the option closest to a given scale value
+    pub fn from_value(scale: f32) -> Self {
+        if scale < 0.75 {
+            UiScaleOption::Scale50
+        } else if scale < 1.25 {
+            UiScaleOption::Scale100
+        } else if scale < 1.75 {
+            UiScaleOption::Scale150
+        } else if scale < 2.5 {
+            UiScaleOption::Scale200
+        } else if scale < 3.5 {
+            UiScaleOption::Scale300
+        } else {
+            UiScaleOption::Scale400
+        }
+    }
+}
+
 /// Menu actions available in ProjectView
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectAction {
@@ -177,6 +240,12 @@ pub enum AppState {
     SettingsMenu {
         selected_item: usize,
         /// Previous state (MainMenu) to return to
+        previous_state: Box<AppState>,
+    },
+    /// UI Scale submenu - opened from Settings menu
+    UiScaleMenu {
+        selected_item: usize,
+        /// Previous state (SettingsMenu) to return to
         previous_state: Box<AppState>,
     },
 }

@@ -561,6 +561,7 @@ impl Renderer {
         enum ModalType {
             MainMenu(usize),
             Settings(usize),
+            UiScale(usize),
         }
 
         let (base_state, modal_type) = match state {
@@ -574,6 +575,19 @@ impl Renderer {
                     other => other,
                 };
                 (actual_base, Some(ModalType::Settings(*selected_item)))
+            }
+            AppState::UiScaleMenu { previous_state, selected_item } => {
+                // Navigate back to find the actual base state
+                let actual_base = match previous_state.as_ref() {
+                    AppState::SettingsMenu { previous_state, .. } => {
+                        match previous_state.as_ref() {
+                            AppState::MainMenu { previous_state, .. } => previous_state.as_ref(),
+                            other => other,
+                        }
+                    }
+                    other => other,
+                };
+                (actual_base, Some(ModalType::UiScale(*selected_item)))
             }
             _ => (state, None),
         };
@@ -589,7 +603,7 @@ impl Renderer {
             AppState::PalaceLoop { cards, focused_index, .. } => {
                 self.build_suggestion_cards(cards, *focused_index)
             }
-            AppState::MainMenu { .. } | AppState::SettingsMenu { .. } => Vec::new(),
+            AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } => Vec::new(),
         };
 
         // When modal is open, render base scene then overlay + modal
@@ -633,7 +647,7 @@ impl Renderer {
                 AppState::PalaceLoop { cards, current_tool, .. } => {
                     self.queue_palace_loop_text(cards, current_tool.as_deref());
                 }
-                AppState::MainMenu { .. } | AppState::SettingsMenu { .. } => {}
+                AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } => {}
             }
 
             let mut encoder = self
@@ -678,6 +692,7 @@ impl Renderer {
             match modal {
                 ModalType::MainMenu(selected) => self.queue_main_menu_text(*selected),
                 ModalType::Settings(selected) => self.queue_settings_modal_text(*selected),
+                ModalType::UiScale(selected) => self.queue_ui_scale_modal_text(*selected),
             }
 
             // Fullscreen dark overlay card + modal cards
@@ -690,6 +705,7 @@ impl Renderer {
             match modal {
                 ModalType::MainMenu(selected) => modal_cards.extend(self.build_main_menu_cards(*selected)),
                 ModalType::Settings(selected) => modal_cards.extend(self.build_settings_modal_cards(*selected)),
+                ModalType::UiScale(selected) => modal_cards.extend(self.build_ui_scale_modal_cards(*selected)),
             }
 
             {
@@ -817,6 +833,7 @@ impl Renderer {
                 }
                 AppState::MainMenu { .. } => {}
                 AppState::SettingsMenu { .. } => {}
+                AppState::UiScaleMenu { .. } => {}
             }
 
             let screenshot_texture = self.screenshot_texture.as_ref().unwrap();
@@ -923,6 +940,7 @@ impl Renderer {
                 }
                 AppState::MainMenu { .. } => {}
                 AppState::SettingsMenu { .. } => {}
+                AppState::UiScaleMenu { .. } => {}
             }
 
             let mut encoder = self
@@ -1331,6 +1349,136 @@ impl Renderer {
                     .with_screen_position((modal_x + modal_width - inner_padding - self.ui_scale.px(60.0), y))
                     .with_layout(Layout::default()),
             );
+        }
+
+        let _ = self.text_brush.queue(&self.device, &self.queue, sections);
+    }
+
+    fn build_ui_scale_modal_cards(&self, selected: usize) -> Vec<CardInstance> {
+        use crate::state::UiScaleOption;
+        let items = UiScaleOption::all();
+
+        // Modal dimensions - centered on screen
+        let modal_width = self.ui_scale.px(400.0).min(self.size.width as f32 - 40.0);
+        let item_count = items.len() as f32;
+        let card_height = self.ui_scale.px(50.0);
+        let card_gap = self.ui_scale.px(8.0);
+        let inner_padding = self.ui_scale.px(20.0);
+        let title_height = self.ui_scale.px(50.0);
+        let modal_height = title_height + inner_padding + item_count * (card_height + card_gap);
+        let modal_x = (self.size.width as f32 - modal_width) / 2.0;
+        let modal_y = (self.size.height as f32 - modal_height) / 2.0;
+
+        let mut cards = Vec::new();
+
+        // Modal background card - OLED black with subtle border
+        cards.push(
+            CardInstance::new(modal_x, modal_y, modal_width, modal_height, [0.0, 0.0, 0.0, 1.0])
+                .with_border_width(self.ui_scale.px(1.5))
+                .with_corner_radius(self.ui_scale.px(16.0))
+        );
+
+        // Scale option cards
+        let scale_color = [0.5, 0.3, 0.7, 1.0]; // Purple for scale options
+        let card_start_y = modal_y + title_height;
+        let card_width = modal_width - inner_padding * 2.0;
+
+        for (i, _item) in items.iter().enumerate() {
+            let y = card_start_y + i as f32 * (card_height + card_gap);
+            let is_selected = i == selected;
+
+            let mut card = CardInstance::new(
+                modal_x + inner_padding,
+                y,
+                card_width,
+                card_height,
+                scale_color
+            )
+                .with_border_width(self.ui_scale.px(if is_selected { 3.0 } else { 1.5 }))
+                .with_corner_radius(self.ui_scale.px(10.0));
+
+            if is_selected {
+                card = card.selected();
+            }
+
+            cards.push(card);
+        }
+
+        cards
+    }
+
+    fn queue_ui_scale_modal_text(&mut self, selected: usize) {
+        use crate::state::UiScaleOption;
+        use wgpu_text::glyph_brush::{Layout, Section, Text};
+
+        let items = UiScaleOption::all();
+
+        // Must match modal dimensions from build_ui_scale_modal_cards
+        let modal_width = self.ui_scale.px(400.0).min(self.size.width as f32 - 40.0);
+        let item_count = items.len() as f32;
+        let card_height = self.ui_scale.px(50.0);
+        let card_gap = self.ui_scale.px(8.0);
+        let inner_padding = self.ui_scale.px(20.0);
+        let title_height = self.ui_scale.px(50.0);
+        let modal_height = title_height + inner_padding + item_count * (card_height + card_gap);
+        let modal_x = (self.size.width as f32 - modal_width) / 2.0;
+        let modal_y = (self.size.height as f32 - modal_height) / 2.0;
+
+        let scale = self.ui_scale.px(22.0);
+        let title_scale = self.ui_scale.px(28.0);
+        let text_padding = self.ui_scale.px(14.0);
+        let card_start_y = modal_y + title_height;
+
+        let mut sections = Vec::new();
+
+        // Modal title
+        sections.push(
+            Section::default()
+                .add_text(
+                    Text::new("UI Scale")
+                        .with_scale(title_scale)
+                        .with_color([0.8, 0.9, 1.0, 1.0]),
+                )
+                .with_screen_position((modal_x + inner_padding, modal_y + self.ui_scale.px(12.0)))
+                .with_layout(Layout::default()),
+        );
+
+        // Scale options
+        for (i, item) in items.iter().enumerate() {
+            let y = card_start_y + i as f32 * (card_height + card_gap) + text_padding;
+            let is_selected = i == selected;
+
+            let label_color = if is_selected {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                [0.8, 0.8, 0.9, 1.0]
+            };
+
+            // Option label
+            sections.push(
+                Section::default()
+                    .add_text(
+                        Text::new(item.label())
+                            .with_scale(scale)
+                            .with_color(label_color),
+                    )
+                    .with_screen_position((modal_x + inner_padding + self.ui_scale.px(15.0), y))
+                    .with_layout(Layout::default()),
+            );
+
+            // Show current indicator if this is the current scale
+            if item.value() == self.ui_scale.dpi_scale {
+                sections.push(
+                    Section::default()
+                        .add_text(
+                            Text::new("(current)")
+                                .with_scale(scale * 0.7)
+                                .with_color([0.5, 0.7, 0.5, 1.0]),
+                        )
+                        .with_screen_position((modal_x + modal_width - inner_padding - self.ui_scale.px(80.0), y))
+                        .with_layout(Layout::default()),
+                );
+            }
         }
 
         let _ = self.text_brush.queue(&self.device, &self.queue, sections);
@@ -1855,7 +2003,7 @@ impl Renderer {
                     XboxButton::B,
                 ));
             }
-            AppState::MainMenu { .. } | AppState::SettingsMenu { .. } => {
+            AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } => {
                 let help_y = self.size.height as f32 - self.ui_scale.px(40.0) - glyph_size * 0.25;
 
                 // D-Pad for navigation

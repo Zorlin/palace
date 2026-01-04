@@ -2,7 +2,7 @@ use crate::debug::{DebugCommand, DebugResponse, ScreenshotCapture};
 use crate::display::DisplayScaling;
 use crate::projects::ProjectsConfig;
 use crate::renderer::Renderer;
-use crate::state::{AppState, SuggestionCard};
+use crate::state::{AppState, MainMenuItem, SettingsItem, SuggestionCard, UiScaleOption};
 use gilrs::Button;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -94,6 +94,51 @@ impl App {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    /// Open the main menu (Start menu)
+    fn open_main_menu(&mut self) {
+        // Don't open menu if we're already in one
+        match &self.state {
+            AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } => {
+                // Already in a menu, go back instead
+                self.go_back_from_menu();
+            }
+            _ => {
+                tracing::info!("Opening main menu");
+                self.state = AppState::MainMenu {
+                    selected_item: 0,
+                    previous_state: Box::new(self.state.clone()),
+                };
+            }
+        }
+    }
+
+    /// Go back from current menu state
+    fn go_back_from_menu(&mut self) {
+        match &self.state {
+            AppState::MainMenu { previous_state, .. } => {
+                self.state = *previous_state.clone();
+            }
+            AppState::SettingsMenu { previous_state, .. } => {
+                self.state = *previous_state.clone();
+            }
+            AppState::UiScaleMenu { previous_state, .. } => {
+                self.state = *previous_state.clone();
+            }
+            _ => {}
+        }
+    }
+
+    /// Get the index of the current UI scale in UiScaleOption::all()
+    fn get_current_scale_index(&self) -> usize {
+        let current_scale = self.renderer.as_ref()
+            .map(|r| r.ui_scale())
+            .unwrap_or(1.0);
+        let current_option = UiScaleOption::from_value(current_scale);
+        UiScaleOption::all().iter()
+            .position(|o| *o == current_option)
+            .unwrap_or(1) // Default to 100% (index 1)
     }
 
     fn handle_gamepad_button_pressed(&mut self, button: Button) {
@@ -457,13 +502,55 @@ impl App {
                                 }
                             }
                             SettingsItem::UiScale => {
-                                // TODO: Cycle through scale options
-                                tracing::info!("UI Scale toggle (not implemented)");
+                                // Open UI Scale submenu
+                                self.state = AppState::UiScaleMenu {
+                                    selected_item: self.get_current_scale_index(),
+                                    previous_state: Box::new(self.state.clone()),
+                                };
                             }
                         }
                     }
                     KeyCode::Backspace | KeyCode::Escape => {
                         // Go back to main menu
+                        self.state = *previous_state.clone();
+                    }
+                    _ => {}
+                }
+            }
+            AppState::UiScaleMenu {
+                selected_item,
+                previous_state,
+            } => {
+                let scale_count = UiScaleOption::all().len();
+
+                match key {
+                    KeyCode::ArrowUp | KeyCode::KeyW => {
+                        if *selected_item > 0 {
+                            *selected_item -= 1;
+                        } else {
+                            *selected_item = scale_count - 1;
+                        }
+                    }
+                    KeyCode::ArrowDown | KeyCode::KeyS => {
+                        if *selected_item < scale_count - 1 {
+                            *selected_item += 1;
+                        } else {
+                            *selected_item = 0;
+                        }
+                    }
+                    KeyCode::Enter | KeyCode::Space => {
+                        // Apply the selected scale
+                        let scale_option = UiScaleOption::all()[*selected_item];
+                        let scale_value = scale_option.value();
+                        tracing::info!("Setting UI scale to {}", scale_option.label());
+                        if let Some(renderer) = &mut self.renderer {
+                            renderer.set_ui_scale(scale_value);
+                        }
+                        // Go back to settings menu
+                        self.state = *previous_state.clone();
+                    }
+                    KeyCode::Backspace | KeyCode::Escape => {
+                        // Go back to settings menu
                         self.state = *previous_state.clone();
                     }
                     _ => {}
@@ -694,6 +781,33 @@ impl App {
                     }
                 }
             }
+            AppState::UiScaleMenu { selected_item, .. } => {
+                // Tap on scale option items
+                let modal_width = 400.0f32.min(size.width as f32 - 40.0);
+                let item_count = UiScaleOption::all().len() as f32;
+                let card_height = 50.0;
+                let card_gap = 8.0;
+                let inner_padding = 20.0;
+                let title_height = 50.0;
+                let modal_height = title_height + inner_padding + item_count * (card_height + card_gap);
+                let modal_x = (size.width as f32 - modal_width) / 2.0;
+                let modal_y = (size.height as f32 - modal_height) / 2.0;
+
+                let items = UiScaleOption::all();
+                for (i, _item) in items.iter().enumerate() {
+                    let card_y = modal_y + title_height + i as f32 * (card_height + card_gap);
+                    let card_width = modal_width - inner_padding * 2.0;
+                    let card_x = modal_x + inner_padding;
+
+                    if x >= card_x && x <= card_x + card_width
+                       && y >= card_y && y <= card_y + card_height {
+                        tracing::info!("Tapped scale option {}", i);
+                        *selected_item = i;
+                        self.handle_input(KeyCode::Enter);
+                        return;
+                    }
+                }
+            }
         }
     }
 
@@ -825,9 +939,10 @@ impl ApplicationHandler<AppEvent> for App {
                     },
                 ..
             } => {
+                // Escape opens the main menu (instead of exiting)
                 if key == KeyCode::Escape {
-                    tracing::info!("Escape pressed, exiting...");
-                    event_loop.exit();
+                    self.open_main_menu();
+                    self.request_redraw();
                 } else {
                     self.handle_input(key);
                     self.request_redraw();
@@ -1104,6 +1219,16 @@ impl App {
                     "view": "palace_loop",
                     "project_path": project_path.to_string_lossy(),
                     "focused": focused_index
+                })
+            }
+            AppState::UiScaleMenu {
+                selected_item,
+                ..
+            } => {
+                // For UI scale menu, just return a simple state - we'll go back to settings on restart
+                serde_json::json!({
+                    "view": "ui_scale",
+                    "selected": selected_item
                 })
             }
         }
