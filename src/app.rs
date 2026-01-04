@@ -1,9 +1,11 @@
 use crate::debug::{DebugCommand, DebugResponse, ScreenshotCapture};
+use crate::display::DisplayScaling;
 use crate::projects::ProjectsConfig;
 use crate::renderer::Renderer;
-use crate::state::AppState;
+use crate::state::{AppState, SuggestionCard};
 use gilrs::Button;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, Touch, TouchPhase, WindowEvent};
@@ -28,6 +30,18 @@ pub enum AppEvent {
     GetState(tokio::sync::oneshot::Sender<String>),
     /// Shutdown the application
     Shutdown,
+    /// AI is exploring with a tool
+    AiToolCall(String),
+    /// New suggestion card started
+    SuggestionStart { id: usize },
+    /// Suggestion field updated (title, category, description, command)
+    SuggestionUpdate { id: usize, field: String, value: String },
+    /// Suggestion card complete
+    SuggestionComplete { id: usize },
+    /// All suggestions done
+    SuggestionsDone,
+    /// AI error
+    AiError(String),
 }
 
 pub struct App {
@@ -50,10 +64,12 @@ pub struct App {
     /// Track held buttons for combos (L3, R3)
     l3_held: bool,
     r3_held: bool,
+    /// Event loop proxy for sending events from background threads
+    event_proxy: Arc<EventLoopProxy<AppEvent>>,
 }
 
 impl App {
-    pub fn new(initial_state: AppState, projects: ProjectsConfig) -> Self {
+    pub fn new(initial_state: AppState, projects: ProjectsConfig, event_proxy: EventLoopProxy<AppEvent>) -> Self {
         Self {
             window: None,
             renderer: None,
@@ -68,6 +84,7 @@ impl App {
             gamepad_passthrough: false,
             l3_held: false,
             r3_held: false,
+            event_proxy: Arc::new(event_proxy),
         }
     }
 
@@ -297,8 +314,9 @@ impl App {
                     _ => {}
                 }
             }
-            AppState::ProjectView { selected_action, .. } => {
+            AppState::ProjectView { project_path, selected_action } => {
                 let action_count = crate::state::ProjectAction::all().len();
+                let project_path = project_path.clone();
 
                 match key {
                     KeyCode::ArrowUp | KeyCode::KeyW => {
@@ -316,9 +334,38 @@ impl App {
                         }
                     }
                     KeyCode::Enter | KeyCode::Space => {
-                        let action = crate::state::ProjectAction::all()[*selected_action];
+                        use crate::state::ProjectAction;
+                        let action = ProjectAction::all()[*selected_action];
                         tracing::info!("Selected action: {:?}", action);
-                        // TODO: Execute action
+
+                        match action {
+                            ProjectAction::StartPalaceLoop => {
+                                // Transition to Palace Loop state
+                                self.state = AppState::PalaceLoop {
+                                    project_path: project_path.clone(),
+                                    cards: Vec::new(),
+                                    focused_index: 0,
+                                    generating: true,
+                                    current_tool: None,
+                                };
+
+                                // Spawn AI suggestion thread
+                                let proxy = self.event_proxy.clone();
+                                let path = project_path.clone();
+                                std::thread::spawn(move || {
+                                    Self::run_ai_suggestions(path, proxy);
+                                });
+                            }
+                            ProjectAction::Build => {
+                                tracing::info!("Build action not yet implemented");
+                            }
+                            ProjectAction::Run => {
+                                tracing::info!("Run action not yet implemented");
+                            }
+                            ProjectAction::ViewGitHistory => {
+                                tracing::info!("Git history action not yet implemented");
+                            }
+                        }
                     }
                     KeyCode::Backspace => {
                         // Go back to project chooser
@@ -418,6 +465,52 @@ impl App {
                     KeyCode::Backspace | KeyCode::Escape => {
                         // Go back to main menu
                         self.state = *previous_state.clone();
+                    }
+                    _ => {}
+                }
+            }
+            AppState::PalaceLoop {
+                cards,
+                focused_index,
+                generating,
+                ..
+            } => {
+                let card_count = cards.len();
+
+                match key {
+                    KeyCode::ArrowUp | KeyCode::KeyW => {
+                        if *focused_index > 0 {
+                            *focused_index -= 1;
+                        }
+                    }
+                    KeyCode::ArrowDown | KeyCode::KeyS => {
+                        if card_count > 0 && *focused_index < card_count - 1 {
+                            *focused_index += 1;
+                        }
+                    }
+                    KeyCode::Enter | KeyCode::Space => {
+                        // Toggle selection on focused card
+                        if let Some(card) = cards.get_mut(*focused_index) {
+                            card.selected = !card.selected;
+                            tracing::info!("Card {} selected: {}", card.id, card.selected);
+                        }
+                    }
+                    KeyCode::Backspace | KeyCode::Escape => {
+                        // Go back to project view
+                        if let AppState::PalaceLoop { project_path, .. } = &self.state {
+                            self.state = AppState::project_view(project_path.clone());
+                        }
+                    }
+                    KeyCode::KeyX => {
+                        // Execute selected cards (only when done generating)
+                        if !*generating {
+                            let selected: Vec<_> = cards.iter()
+                                .filter(|c| c.selected)
+                                .map(|c| c.title.clone())
+                                .collect();
+                            tracing::info!("Execute selected: {:?}", selected);
+                            // TODO: Execute selected actions
+                        }
                     }
                     _ => {}
                 }
@@ -573,6 +666,34 @@ impl App {
                     }
                 }
             }
+            AppState::PalaceLoop {
+                cards,
+                focused_index,
+                ..
+            } => {
+                // Tap on suggestion cards to toggle selection
+                let margin = 72.0;
+                let card_height = 100.0;
+                let card_gap = 16.0;
+                let top_offset = 140.0;
+
+                for (i, _card) in cards.iter().enumerate() {
+                    let card_y = top_offset + i as f32 * (card_height + card_gap);
+                    let card_width = size.width as f32 - margin * 2.0;
+
+                    if x >= margin && x <= margin + card_width
+                       && y >= card_y && y <= card_y + card_height {
+                        tracing::info!("Tapped suggestion card {}", i);
+                        *focused_index = i;
+                        // Toggle selection
+                        if let Some(card) = cards.get_mut(i) {
+                            card.selected = !card.selected;
+                        }
+                        self.request_redraw();
+                        return;
+                    }
+                }
+            }
         }
     }
 
@@ -653,6 +774,21 @@ impl ApplicationHandler<AppEvent> for App {
                 match pollster::block_on(Renderer::new(&window)) {
                     Ok(mut renderer) => {
                         tracing::info!("Renderer initialized");
+
+                        // Detect and apply display scaling
+                        let size = window.inner_size();
+                        let display_name = window.current_monitor()
+                            .and_then(|m| m.name())
+                            .unwrap_or_else(|| "unknown".to_string());
+
+                        let scaling_config = DisplayScaling::load();
+                        let scale = scaling_config.get_scale_for_display(
+                            &display_name,
+                            size.width,
+                            size.height,
+                        );
+                        renderer.set_ui_scale(scale);
+
                         // Set initial gamepad connection state
                         renderer.set_gamepad_connected(self.gamepad_connected);
                         self.renderer = Some(renderer);
@@ -819,6 +955,60 @@ impl ApplicationHandler<AppEvent> for App {
                 tracing::info!("Shutdown requested via debug command");
                 event_loop.exit();
             }
+            AppEvent::AiToolCall(description) => {
+                // Update current tool display in PalaceLoop
+                if let AppState::PalaceLoop { current_tool, .. } = &mut self.state {
+                    *current_tool = Some(description);
+                    self.request_redraw();
+                }
+            }
+            AppEvent::SuggestionStart { id } => {
+                // Add new card
+                if let AppState::PalaceLoop { cards, .. } = &mut self.state {
+                    cards.push(SuggestionCard::new(id));
+                    self.request_redraw();
+                }
+            }
+            AppEvent::SuggestionUpdate { id, field, value } => {
+                // Update card field
+                if let AppState::PalaceLoop { cards, .. } = &mut self.state {
+                    if let Some(card) = cards.iter_mut().find(|c| c.id == id) {
+                        match field.as_str() {
+                            "title" => card.title = value,
+                            "category" => card.category = value,
+                            "description" => card.description = value,
+                            "command" => card.command = Some(value),
+                            _ => {}
+                        }
+                        self.request_redraw();
+                    }
+                }
+            }
+            AppEvent::SuggestionComplete { id } => {
+                // Mark card as complete (not streaming)
+                if let AppState::PalaceLoop { cards, .. } = &mut self.state {
+                    if let Some(card) = cards.iter_mut().find(|c| c.id == id) {
+                        card.streaming = false;
+                        self.request_redraw();
+                    }
+                }
+            }
+            AppEvent::SuggestionsDone => {
+                // Mark generation as complete
+                if let AppState::PalaceLoop { generating, current_tool, .. } = &mut self.state {
+                    *generating = false;
+                    *current_tool = None;
+                    self.request_redraw();
+                }
+            }
+            AppEvent::AiError(error) => {
+                tracing::error!("AI Error: {}", error);
+                if let AppState::PalaceLoop { generating, current_tool, .. } = &mut self.state {
+                    *generating = false;
+                    *current_tool = Some(format!("Error: {}", error));
+                    self.request_redraw();
+                }
+            }
         }
     }
 }
@@ -905,8 +1095,73 @@ impl App {
                     "previous": prev
                 })
             }
+            AppState::PalaceLoop {
+                project_path,
+                focused_index,
+                ..
+            } => {
+                serde_json::json!({
+                    "view": "palace_loop",
+                    "project_path": project_path.to_string_lossy(),
+                    "focused": focused_index
+                })
+            }
         }
         .to_string()
+    }
+
+    /// Run AI suggestion generation in a background thread
+    fn run_ai_suggestions(project_path: PathBuf, proxy: Arc<EventLoopProxy<AppEvent>>) {
+        use crate::ai::{ProjectContext, SuggestionEngine, SuggestionEvent};
+
+        tracing::info!("Starting AI suggestions for {:?}", project_path);
+
+        // Gather project context
+        let context = match ProjectContext::gather(&project_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("Failed to gather project context: {}", e);
+                let _ = proxy.send_event(AppEvent::AiError(format!("Failed to gather context: {}", e)));
+                return;
+            }
+        };
+
+        // Create suggestion engine
+        let engine = match SuggestionEngine::new(None, None) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("Failed to create suggestion engine: {}", e);
+                let _ = proxy.send_event(AppEvent::AiError(format!("Failed to create engine: {}", e)));
+                return;
+            }
+        };
+
+        // Define callback that sends events to the main thread
+        let callback = {
+            let proxy = proxy.clone();
+            move |event: SuggestionEvent| {
+                let app_event = match event {
+                    SuggestionEvent::ToolCall(desc) => AppEvent::AiToolCall(desc),
+                    SuggestionEvent::CardStart { id } => AppEvent::SuggestionStart { id },
+                    SuggestionEvent::CardUpdate { id, field, value } => {
+                        AppEvent::SuggestionUpdate { id, field, value }
+                    }
+                    SuggestionEvent::CardComplete { id } => AppEvent::SuggestionComplete { id },
+                    SuggestionEvent::Done => AppEvent::SuggestionsDone,
+                    SuggestionEvent::Error(e) => AppEvent::AiError(e),
+                };
+                let _ = proxy.send_event(app_event);
+            }
+        };
+
+        // Run streaming suggestions
+        if let Err(e) = engine.stream_to_gui(&context, callback) {
+            tracing::error!("AI suggestion error: {}", e);
+            let _ = proxy.send_event(AppEvent::AiError(e.to_string()));
+        }
+
+        // Signal completion
+        let _ = proxy.send_event(AppEvent::SuggestionsDone);
     }
 }
 

@@ -3,11 +3,24 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::sync::Once;
 
-/// Callback type for streaming responses
-/// chunk: text chunk (null on completion/error)
-/// is_done: 1 if streaming complete, 0 otherwise
-/// error: error message (null if no error)
-pub type StreamCallback = extern "C" fn(chunk: *const c_char, is_done: c_int, error: *const c_char);
+/// Event type constants (must match Go side)
+pub const EVENT_TEXT: c_int = 0;
+pub const EVENT_TOOL_USE_START: c_int = 1;
+pub const EVENT_TOOL_USE_INPUT: c_int = 2;
+pub const EVENT_TOOL_USE_END: c_int = 3;
+pub const EVENT_THINKING: c_int = 4;
+pub const EVENT_DONE: c_int = 5;
+pub const EVENT_ERROR: c_int = 6;
+pub const EVENT_TOOL_RESULT: c_int = 7;
+
+/// Callback type for streaming events
+/// event_type: one of EVENT_* constants
+/// data: event-specific data (text chunk, tool name, JSON input, etc.)
+pub type StreamCallback = extern "C" fn(event_type: c_int, data: *const c_char);
+
+/// Callback type for tool execution
+/// Returns a C string with the tool result (caller must free)
+pub type ToolExecutor = extern "C" fn(tool_name: *const c_char, tool_input: *const c_char) -> *mut c_char;
 
 #[link(name = "anthropic")]
 extern "C" {
@@ -24,6 +37,15 @@ extern "C" {
         user_message: *const c_char,
         max_tokens: i32,
         callback: StreamCallback,
+    );
+    fn anthropic_agentic_loop(
+        model: *const c_char,
+        system_prompt: *const c_char,
+        user_message: *const c_char,
+        max_tokens: i32,
+        tools_json: *const c_char,
+        callback: StreamCallback,
+        tool_executor: ToolExecutor,
     );
     fn anthropic_free_string(s: *mut c_char);
 }
@@ -201,6 +223,63 @@ impl Client {
 
         Ok(())
     }
+
+    /// Run an agentic loop with tool execution
+    /// The tool_executor is called for each tool use, returns the result
+    pub fn agentic_loop<F, T>(
+        &self,
+        model: &str,
+        system_prompt: Option<&str>,
+        user_message: &str,
+        max_tokens: i32,
+        tools_json: &str,
+        on_event: F,
+        tool_executor: T,
+    ) -> Result<(), AnthropicError>
+    where
+        F: FnMut(StreamEvent) + 'static,
+        T: Fn(&str, &str) -> String + 'static,
+    {
+        let model_c = CString::new(model)?;
+        let system_c = CString::new(system_prompt.unwrap_or(""))?;
+        let user_c = CString::new(user_message)?;
+        let tools_c = CString::new(tools_json)?;
+
+        // Store callbacks in thread-local storage
+        let event_box: Arc<Mutex<Option<Box<dyn FnMut(StreamEvent)>>>> =
+            Arc::new(Mutex::new(Some(Box::new(on_event))));
+        let tool_box: Arc<Mutex<Option<Box<dyn Fn(&str, &str) -> String>>>> =
+            Arc::new(Mutex::new(Some(Box::new(tool_executor))));
+
+        STREAM_CALLBACK.with(|cell| {
+            *cell.borrow_mut() = Some(event_box.clone());
+        });
+        TOOL_EXECUTOR.with(|cell| {
+            *cell.borrow_mut() = Some(tool_box.clone());
+        });
+
+        unsafe {
+            anthropic_agentic_loop(
+                model_c.as_ptr(),
+                system_c.as_ptr(),
+                user_c.as_ptr(),
+                max_tokens,
+                tools_c.as_ptr(),
+                stream_callback_handler,
+                tool_executor_handler,
+            );
+        }
+
+        // Clean up
+        STREAM_CALLBACK.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+        TOOL_EXECUTOR.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+
+        Ok(())
+    }
 }
 
 /// Stream event types
@@ -208,10 +287,20 @@ impl Client {
 pub enum StreamEvent {
     /// Text chunk received
     Text(String),
+    /// Tool use started (contains "id:name" or just "name")
+    ToolUseStart(String),
+    /// Tool input JSON chunk
+    ToolUseInput(String),
+    /// Tool use ended
+    ToolUseEnd,
+    /// Thinking text
+    Thinking(String),
     /// Stream completed successfully
     Done,
     /// Error occurred
     Error(String),
+    /// Tool result (truncated preview)
+    ToolResult(String),
 }
 
 use std::cell::RefCell;
@@ -219,23 +308,63 @@ use std::sync::{Arc, Mutex};
 
 thread_local! {
     static STREAM_CALLBACK: RefCell<Option<Arc<Mutex<Option<Box<dyn FnMut(StreamEvent)>>>>>> = RefCell::new(None);
+    static TOOL_EXECUTOR: RefCell<Option<Arc<Mutex<Option<Box<dyn Fn(&str, &str) -> String>>>>>> = RefCell::new(None);
+}
+
+/// FFI callback handler for tool execution
+extern "C" fn tool_executor_handler(tool_name: *const c_char, tool_input: *const c_char) -> *mut c_char {
+    let name = if !tool_name.is_null() {
+        unsafe { CStr::from_ptr(tool_name).to_string_lossy().into_owned() }
+    } else {
+        return std::ptr::null_mut();
+    };
+
+    let input = if !tool_input.is_null() {
+        unsafe { CStr::from_ptr(tool_input).to_string_lossy().into_owned() }
+    } else {
+        String::new()
+    };
+
+    let result = TOOL_EXECUTOR.with(|cell| {
+        if let Some(ref executor_arc) = *cell.borrow() {
+            if let Ok(guard) = executor_arc.lock() {
+                if let Some(ref executor) = *guard {
+                    return executor(&name, &input);
+                }
+            }
+        }
+        format!("Error: Tool executor not available")
+    });
+
+    // Return as C string (Go will free it)
+    CString::new(result).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
 /// FFI callback handler that forwards to the Rust closure
-extern "C" fn stream_callback_handler(chunk: *const c_char, is_done: c_int, error: *const c_char) {
+extern "C" fn stream_callback_handler(event_type: c_int, data: *const c_char) {
     STREAM_CALLBACK.with(|cell| {
         if let Some(ref callback_arc) = *cell.borrow() {
             if let Ok(mut guard) = callback_arc.lock() {
                 if let Some(ref mut callback) = *guard {
-                    if !error.is_null() {
-                        let err_str = unsafe { CStr::from_ptr(error).to_string_lossy().into_owned() };
-                        callback(StreamEvent::Error(err_str));
-                    } else if is_done != 0 {
-                        callback(StreamEvent::Done);
-                    } else if !chunk.is_null() {
-                        let chunk_str = unsafe { CStr::from_ptr(chunk).to_string_lossy().into_owned() };
-                        callback(StreamEvent::Text(chunk_str));
-                    }
+                    let data_str = if !data.is_null() {
+                        unsafe { CStr::from_ptr(data).to_string_lossy().into_owned() }
+                    } else {
+                        String::new()
+                    };
+
+                    let event = match event_type {
+                        EVENT_TEXT => StreamEvent::Text(data_str),
+                        EVENT_TOOL_USE_START => StreamEvent::ToolUseStart(data_str),
+                        EVENT_TOOL_USE_INPUT => StreamEvent::ToolUseInput(data_str),
+                        EVENT_TOOL_USE_END => StreamEvent::ToolUseEnd,
+                        EVENT_THINKING => StreamEvent::Thinking(data_str),
+                        EVENT_DONE => StreamEvent::Done,
+                        EVENT_ERROR => StreamEvent::Error(data_str),
+                        EVENT_TOOL_RESULT => StreamEvent::ToolResult(data_str),
+                        _ => return, // Unknown event type
+                    };
+
+                    callback(event);
                 }
             }
         }

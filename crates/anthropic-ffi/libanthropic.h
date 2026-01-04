@@ -23,12 +23,34 @@ typedef struct { const char *p; ptrdiff_t n; } _GoString_;
 
 #include <stdlib.h>
 
-// Callback type for streaming chunks
-typedef void (*stream_callback)(const char* chunk, int is_done, const char* error);
+// Event types for streaming
+#define EVENT_TEXT 0
+#define EVENT_TOOL_USE_START 1
+#define EVENT_TOOL_USE_INPUT 2
+#define EVENT_TOOL_USE_END 3
+#define EVENT_THINKING 4
+#define EVENT_DONE 5
+#define EVENT_ERROR 6
+#define EVENT_TOOL_RESULT 7
+
+// Callback type for streaming events
+// event_type: one of EVENT_* constants
+// data: event-specific data (text chunk, tool name, JSON input, etc.)
+typedef void (*stream_callback)(int event_type, const char* data);
+
+// Tool executor callback - returns tool result as C string (caller must free)
+// tool_name: name of tool to execute
+// tool_input: JSON input for the tool
+typedef char* (*tool_executor)(const char* tool_name, const char* tool_input);
 
 // Helper to invoke the callback from Go
-static inline void invoke_callback(stream_callback cb, const char* chunk, int is_done, const char* error) {
-    cb(chunk, is_done, error);
+static inline void invoke_callback(stream_callback cb, int event_type, const char* data) {
+    cb(event_type, data);
+}
+
+// Helper to invoke tool executor from Go
+static inline char* invoke_tool(tool_executor exec, const char* name, const char* input) {
+    return exec(name, input);
 }
 
 #line 1 "cgo-generated-wrapper"
@@ -91,6 +113,8 @@ extern int anthropic_init(char* apiKey);
 extern int anthropic_init_with_base(char* apiKey, char* baseURL);
 extern char* anthropic_message(char* model, char* systemPrompt, char* userMessage, int maxTokens);
 extern void anthropic_message_stream(char* model, char* systemPrompt, char* userMessage, int maxTokens, stream_callback callback);
+extern void anthropic_message_stream_with_tools(char* model, char* systemPrompt, char* userMessage, int maxTokens, char* toolsJSON, stream_callback callback);
+extern void anthropic_agentic_loop(char* model, char* systemPrompt, char* userMessage, int maxTokens, char* toolsJSON, stream_callback callback, tool_executor toolExecutor);
 extern void anthropic_free_string(char* s);
 
 #ifdef __cplusplus

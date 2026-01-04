@@ -1,3 +1,3 @@
 mod suggest;
 
-pub use suggest::{ProjectContext, Suggestion, SuggestionEngine};
+pub use suggest::{ProjectContext, Suggestion, SuggestionEngine, SuggestionEvent};

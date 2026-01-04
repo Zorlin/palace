@@ -1,6 +1,7 @@
 mod ai;
 mod app;
 mod debug;
+mod display;
 mod projects;
 mod renderer;
 mod state;
@@ -362,10 +363,10 @@ fn run_suggest_command(project: Option<String>, format: String, output: Option<S
     let engine = SuggestionEngine::from_env()?;
 
     if stream {
-        eprintln!("📡 Streaming from Claude...\n");
+        eprintln!("📡 Exploring project with Claude...\n");
 
-        // Stream YAML directly to stdout
-        engine.suggest_streaming(&context)?;
+        // Use agentic exploration with tool calls
+        engine.suggest_with_exploration(&context)?;
 
         eprintln!();
     } else {
@@ -759,7 +760,8 @@ fn run_app(restore_path: Option<String>) -> Result<()> {
     };
 
     // Create and run application
-    let mut app = app::App::new(initial_state, projects_config);
+    let app_proxy = proxy.clone();
+    let mut app = app::App::new(initial_state, projects_config, app_proxy);
 
     event_loop.run_app(&mut app)?;
 

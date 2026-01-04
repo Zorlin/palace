@@ -40,6 +40,11 @@ impl CardInstance {
         self.corner_radius = radius;
         self
     }
+
+    pub fn with_border_color(mut self, color: [f32; 4]) -> Self {
+        self.border_color = color;
+        self
+    }
 }
 
 /// Project status determines card border color

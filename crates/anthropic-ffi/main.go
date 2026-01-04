@@ -3,12 +3,34 @@ package main
 /*
 #include <stdlib.h>
 
-// Callback type for streaming chunks
-typedef void (*stream_callback)(const char* chunk, int is_done, const char* error);
+// Event types for streaming
+#define EVENT_TEXT 0
+#define EVENT_TOOL_USE_START 1
+#define EVENT_TOOL_USE_INPUT 2
+#define EVENT_TOOL_USE_END 3
+#define EVENT_THINKING 4
+#define EVENT_DONE 5
+#define EVENT_ERROR 6
+#define EVENT_TOOL_RESULT 7
+
+// Callback type for streaming events
+// event_type: one of EVENT_* constants
+// data: event-specific data (text chunk, tool name, JSON input, etc.)
+typedef void (*stream_callback)(int event_type, const char* data);
+
+// Tool executor callback - returns tool result as C string (caller must free)
+// tool_name: name of tool to execute
+// tool_input: JSON input for the tool
+typedef char* (*tool_executor)(const char* tool_name, const char* tool_input);
 
 // Helper to invoke the callback from Go
-static inline void invoke_callback(stream_callback cb, const char* chunk, int is_done, const char* error) {
-    cb(chunk, is_done, error);
+static inline void invoke_callback(stream_callback cb, int event_type, const char* data) {
+    cb(event_type, data);
+}
+
+// Helper to invoke tool executor from Go
+static inline char* invoke_tool(tool_executor exec, const char* name, const char* input) {
+    return exec(name, input);
 }
 */
 import "C"
@@ -276,9 +298,14 @@ func callOpenAI(model, system, user string, maxTokens int64) *C.char {
 
 //export anthropic_message_stream
 func anthropic_message_stream(model *C.char, systemPrompt *C.char, userMessage *C.char, maxTokens C.int, callback C.stream_callback) {
+	anthropic_message_stream_with_tools(model, systemPrompt, userMessage, maxTokens, nil, callback)
+}
+
+//export anthropic_message_stream_with_tools
+func anthropic_message_stream_with_tools(model *C.char, systemPrompt *C.char, userMessage *C.char, maxTokens C.int, toolsJSON *C.char, callback C.stream_callback) {
 	if !clientInitialized {
 		errStr := C.CString("client not initialized, call anthropic_init first")
-		C.invoke_callback(callback, nil, 1, errStr)
+		C.invoke_callback(callback, C.EVENT_ERROR, errStr)
 		C.free(unsafe.Pointer(errStr))
 		return
 	}
@@ -312,33 +339,83 @@ func anthropic_message_stream(model *C.char, systemPrompt *C.char, userMessage *
 		}
 	}
 
+	// Add tools if provided
+	if toolsJSON != nil {
+		toolsStr := C.GoString(toolsJSON)
+		if toolsStr != "" {
+			var tools []anthropic.ToolUnionParam
+			if err := json.Unmarshal([]byte(toolsStr), &tools); err == nil {
+				params.Tools = tools
+			}
+		}
+	}
+
 	stream := client.Messages.NewStreaming(context.Background(), params)
 
 	for stream.Next() {
 		event := stream.Current()
 
 		switch eventVariant := event.AsAny().(type) {
+		case anthropic.ContentBlockStartEvent:
+			// Detect tool use or thinking block starting
+			switch blockVariant := eventVariant.ContentBlock.AsAny().(type) {
+			case anthropic.ToolUseBlock:
+				// Tool use starting - emit tool name
+				toolInfo := blockVariant.Name
+				if blockVariant.ID != "" {
+					toolInfo = blockVariant.ID + ":" + blockVariant.Name
+				}
+				infoStr := C.CString(toolInfo)
+				C.invoke_callback(callback, C.EVENT_TOOL_USE_START, infoStr)
+				C.free(unsafe.Pointer(infoStr))
+			case anthropic.ThinkingBlock:
+				// Thinking block starting
+				if blockVariant.Thinking != "" {
+					thinkStr := C.CString(blockVariant.Thinking)
+					C.invoke_callback(callback, C.EVENT_THINKING, thinkStr)
+					C.free(unsafe.Pointer(thinkStr))
+				}
+			}
+
 		case anthropic.ContentBlockDeltaEvent:
 			switch deltaVariant := eventVariant.Delta.AsAny().(type) {
 			case anthropic.TextDelta:
 				if deltaVariant.Text != "" {
 					chunkStr := C.CString(deltaVariant.Text)
-					C.invoke_callback(callback, chunkStr, 0, nil)
+					C.invoke_callback(callback, C.EVENT_TEXT, chunkStr)
 					C.free(unsafe.Pointer(chunkStr))
 				}
+			case anthropic.InputJSONDelta:
+				// Tool input JSON streaming
+				if deltaVariant.PartialJSON != "" {
+					jsonStr := C.CString(deltaVariant.PartialJSON)
+					C.invoke_callback(callback, C.EVENT_TOOL_USE_INPUT, jsonStr)
+					C.free(unsafe.Pointer(jsonStr))
+				}
+			case anthropic.ThinkingDelta:
+				// Thinking text streaming
+				if deltaVariant.Thinking != "" {
+					thinkStr := C.CString(deltaVariant.Thinking)
+					C.invoke_callback(callback, C.EVENT_THINKING, thinkStr)
+					C.free(unsafe.Pointer(thinkStr))
+				}
 			}
+
+		case anthropic.ContentBlockStopEvent:
+			// Content block ended - could signal tool use end
+			C.invoke_callback(callback, C.EVENT_TOOL_USE_END, nil)
 		}
 	}
 
 	if stream.Err() != nil {
 		errStr := C.CString(stream.Err().Error())
-		C.invoke_callback(callback, nil, 1, errStr)
+		C.invoke_callback(callback, C.EVENT_ERROR, errStr)
 		C.free(unsafe.Pointer(errStr))
 		return
 	}
 
 	// Signal completion
-	C.invoke_callback(callback, nil, 1, nil)
+	C.invoke_callback(callback, C.EVENT_DONE, nil)
 }
 
 // OpenAI-compatible streaming API call
@@ -371,7 +448,7 @@ func streamOpenAI(model, system, user string, maxTokens int64, callback C.stream
 	req, err := http.NewRequest("POST", openaiBase+"/chat/completions", bytes.NewBuffer(jsonBody))
 	if err != nil {
 		errStr := C.CString(err.Error())
-		C.invoke_callback(callback, nil, 1, errStr)
+		C.invoke_callback(callback, C.EVENT_ERROR, errStr)
 		C.free(unsafe.Pointer(errStr))
 		return
 	}
@@ -384,7 +461,7 @@ func streamOpenAI(model, system, user string, maxTokens int64, callback C.stream
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		errStr := C.CString(err.Error())
-		C.invoke_callback(callback, nil, 1, errStr)
+		C.invoke_callback(callback, C.EVENT_ERROR, errStr)
 		C.free(unsafe.Pointer(errStr))
 		return
 	}
@@ -393,7 +470,7 @@ func streamOpenAI(model, system, user string, maxTokens int64, callback C.stream
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
 		errStr := C.CString(string(body))
-		C.invoke_callback(callback, nil, 1, errStr)
+		C.invoke_callback(callback, C.EVENT_ERROR, errStr)
 		C.free(unsafe.Pointer(errStr))
 		return
 	}
@@ -425,14 +502,185 @@ func streamOpenAI(model, system, user string, maxTokens int64, callback C.stream
 
 			if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
 				chunkStr := C.CString(chunk.Choices[0].Delta.Content)
-				C.invoke_callback(callback, chunkStr, 0, nil)
+				C.invoke_callback(callback, C.EVENT_TEXT, chunkStr)
 				C.free(unsafe.Pointer(chunkStr))
 			}
 		}
 	}
 
 	// Signal completion
-	C.invoke_callback(callback, nil, 1, nil)
+	C.invoke_callback(callback, C.EVENT_DONE, nil)
+}
+
+//export anthropic_agentic_loop
+func anthropic_agentic_loop(model *C.char, systemPrompt *C.char, userMessage *C.char, maxTokens C.int, toolsJSON *C.char, callback C.stream_callback, toolExecutor C.tool_executor) {
+	if !clientInitialized {
+		errStr := C.CString("client not initialized")
+		C.invoke_callback(callback, C.EVENT_ERROR, errStr)
+		C.free(unsafe.Pointer(errStr))
+		return
+	}
+
+	modelStr := C.GoString(model)
+	systemStr := C.GoString(systemPrompt)
+	userStr := C.GoString(userMessage)
+	tokens := int64(maxTokens)
+	if tokens <= 0 {
+		tokens = 8192
+	}
+
+	// Parse tools
+	var tools []anthropic.ToolUnionParam
+	if toolsJSON != nil {
+		toolsStr := C.GoString(toolsJSON)
+		if toolsStr != "" {
+			json.Unmarshal([]byte(toolsStr), &tools)
+		}
+	}
+
+	// Build initial messages
+	messages := []anthropic.MessageParam{
+		anthropic.NewUserMessage(anthropic.NewTextBlock(userStr)),
+	}
+
+	// Agentic loop - continue until no more tool calls
+	for {
+		params := anthropic.MessageNewParams{
+			Model:     anthropic.Model(modelStr),
+			MaxTokens: tokens,
+			Messages:  messages,
+		}
+		if systemStr != "" {
+			params.System = []anthropic.TextBlockParam{{Text: systemStr}}
+		}
+		if len(tools) > 0 {
+			params.Tools = tools
+		}
+
+		// Stream this turn
+		stream := client.Messages.NewStreaming(context.Background(), params)
+
+		var toolCalls []struct {
+			ID    string
+			Name  string
+			Input string
+		}
+		var currentToolID, currentToolName string
+		var currentToolInput strings.Builder
+		var textContent strings.Builder
+
+		for stream.Next() {
+			event := stream.Current()
+
+			switch ev := event.AsAny().(type) {
+			case anthropic.ContentBlockStartEvent:
+				switch block := ev.ContentBlock.AsAny().(type) {
+				case anthropic.ToolUseBlock:
+					currentToolID = block.ID
+					currentToolName = block.Name
+					currentToolInput.Reset()
+					// Emit tool start
+					info := C.CString(currentToolID + ":" + currentToolName)
+					C.invoke_callback(callback, C.EVENT_TOOL_USE_START, info)
+					C.free(unsafe.Pointer(info))
+				}
+
+			case anthropic.ContentBlockDeltaEvent:
+				switch delta := ev.Delta.AsAny().(type) {
+				case anthropic.TextDelta:
+					if delta.Text != "" {
+						textContent.WriteString(delta.Text)
+						chunk := C.CString(delta.Text)
+						C.invoke_callback(callback, C.EVENT_TEXT, chunk)
+						C.free(unsafe.Pointer(chunk))
+					}
+				case anthropic.InputJSONDelta:
+					if delta.PartialJSON != "" {
+						currentToolInput.WriteString(delta.PartialJSON)
+						chunk := C.CString(delta.PartialJSON)
+						C.invoke_callback(callback, C.EVENT_TOOL_USE_INPUT, chunk)
+						C.free(unsafe.Pointer(chunk))
+					}
+				case anthropic.ThinkingDelta:
+					if delta.Thinking != "" {
+						chunk := C.CString(delta.Thinking)
+						C.invoke_callback(callback, C.EVENT_THINKING, chunk)
+						C.free(unsafe.Pointer(chunk))
+					}
+				}
+
+			case anthropic.ContentBlockStopEvent:
+				if currentToolName != "" {
+					// Tool block complete - save it
+					toolCalls = append(toolCalls, struct {
+						ID    string
+						Name  string
+						Input string
+					}{currentToolID, currentToolName, currentToolInput.String()})
+					C.invoke_callback(callback, C.EVENT_TOOL_USE_END, nil)
+					currentToolName = ""
+				}
+			}
+		}
+
+		if stream.Err() != nil {
+			errStr := C.CString(stream.Err().Error())
+			C.invoke_callback(callback, C.EVENT_ERROR, errStr)
+			C.free(unsafe.Pointer(errStr))
+			return
+		}
+
+		// If no tool calls, we're done
+		if len(toolCalls) == 0 {
+			C.invoke_callback(callback, C.EVENT_DONE, nil)
+			return
+		}
+
+		// Execute tools and build assistant + user messages
+		var assistantContent []anthropic.ContentBlockParamUnion
+		var toolResults []anthropic.ContentBlockParamUnion
+
+		// Add text if any
+		if textContent.Len() > 0 {
+			assistantContent = append(assistantContent, anthropic.NewTextBlock(textContent.String()))
+		}
+
+		// Add tool uses and execute them
+		for _, tc := range toolCalls {
+			// Add tool use to assistant message
+			var inputJSON map[string]interface{}
+			json.Unmarshal([]byte(tc.Input), &inputJSON)
+			assistantContent = append(assistantContent, anthropic.NewToolUseBlock(tc.ID, inputJSON, tc.Name))
+
+			// Execute tool via callback
+			nameC := C.CString(tc.Name)
+			inputC := C.CString(tc.Input)
+			resultC := C.invoke_tool(toolExecutor, nameC, inputC)
+			C.free(unsafe.Pointer(nameC))
+			C.free(unsafe.Pointer(inputC))
+
+			result := ""
+			if resultC != nil {
+				result = C.GoString(resultC)
+				C.free(unsafe.Pointer(resultC))
+			}
+
+			// Emit tool result
+			resultInfo := C.CString(tc.Name + ": " + result[:min(100, len(result))])
+			C.invoke_callback(callback, C.EVENT_TOOL_RESULT, resultInfo)
+			C.free(unsafe.Pointer(resultInfo))
+
+			// Add tool result
+			toolResults = append(toolResults, anthropic.NewToolResultBlock(tc.ID, result, false))
+		}
+
+		// Add messages for next turn
+		messages = append(messages, anthropic.MessageParam{
+			Role:    "assistant",
+			Content: assistantContent,
+		})
+		messages = append(messages, anthropic.NewUserMessage(toolResults...))
+	}
 }
 
 //export anthropic_free_string

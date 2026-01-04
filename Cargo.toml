@@ -60,6 +60,9 @@ anthropic-ffi = { path = "crates/anthropic-ffi" }
 # Environment file loading
 dotenvy = "0.15"
 
+# File globbing
+glob = "0.3"
+
 [profile.release]
 lto = true
 codegen-units = 1

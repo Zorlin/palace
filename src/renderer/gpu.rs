@@ -1,7 +1,7 @@
 use crate::projects::ProjectsConfig;
 use crate::renderer::cards::{CardInstance, CardRenderer};
 use crate::renderer::sprites::{SpriteInstance, SpriteRenderer, XboxButton};
-use crate::state::AppState;
+use crate::state::{AppState, SuggestionCard};
 use anyhow::{Context, Result};
 use wgpu_text::glyph_brush::{ab_glyph::FontRef, Layout, Section, Text};
 use wgpu_text::BrushBuilder;
@@ -86,7 +86,7 @@ struct CardGrid {
 
 impl CardGrid {
     fn new(screen_width: f32, _screen_height: f32, scale: &UiScale) -> Self {
-        // Target 3-4 columns on 1920px, scale down for smaller screens
+        // Default grid for project chooser - original sizing
         let base_card_width = 320.0;
         let base_card_height = 180.0;
         let base_gap = 24.0;
@@ -102,6 +102,33 @@ impl CardGrid {
         let available_width = screen_width - margin_x * 2.0;
         let columns = ((available_width + gap) / (card_width + gap)).floor() as usize;
         let columns = columns.max(1);
+
+        Self {
+            card_width,
+            card_height,
+            gap,
+            columns,
+            margin_x,
+            margin_y,
+        }
+    }
+
+    /// Grid specifically for PalaceLoop - targets 5 columns
+    fn for_palace_loop(screen_width: f32, _screen_height: f32, scale: &UiScale) -> Self {
+        let target_columns = 5;
+        let base_gap = 16.0;
+        let base_margin = 40.0;
+
+        let gap = scale.px(base_gap);
+        let margin_x = scale.px(base_margin);
+        let margin_y = scale.px(base_margin + 80.0); // Extra space for title + subtitle
+
+        // Calculate card width to fit exactly 5 columns
+        let available_width = screen_width - margin_x * 2.0;
+        let card_width = (available_width - gap * (target_columns - 1) as f32) / target_columns as f32;
+        let card_height = card_width * 0.6; // Maintain aspect ratio
+
+        let columns = target_columns;
 
         Self {
             card_width,
@@ -392,18 +419,10 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        // Calculate DPI-based scale (GPD Win 4 is 1920x1080 on ~6" = ~367 PPI)
-        // Base target is ~96 DPI, so scale up for high DPI
-        let dpi_scale = if size.width >= 1920 && size.height <= 1200 {
-            // Likely a high-DPI handheld like GPD Win 4
-            1.2
-        } else {
-            1.0
-        };
-
+        // Initialize with default scale - will be updated by App once display info is available
         let ui_scale = UiScale {
             base: 1.0,
-            dpi_scale,
+            dpi_scale: 1.0,
         };
 
         Ok(Self {
@@ -436,6 +455,17 @@ impl Renderer {
 
     pub fn dark_mode(&self) -> bool {
         self.dark_mode
+    }
+
+    /// Set UI scale factor (e.g., 1.5 for 150% scaling)
+    pub fn set_ui_scale(&mut self, scale: f32) {
+        self.ui_scale.dpi_scale = scale;
+        tracing::info!("UI scale set to {}", scale);
+    }
+
+    /// Get current UI scale factor
+    pub fn ui_scale(&self) -> f32 {
+        self.ui_scale.dpi_scale
     }
 
     pub fn set_gamepad_connected(&mut self, connected: bool) {
@@ -556,6 +586,9 @@ impl Renderer {
             AppState::ProjectView { selected_action, .. } => {
                 self.build_action_cards(*selected_action)
             }
+            AppState::PalaceLoop { cards, focused_index, .. } => {
+                self.build_suggestion_cards(cards, *focused_index)
+            }
             AppState::MainMenu { .. } | AppState::SettingsMenu { .. } => Vec::new(),
         };
 
@@ -596,6 +629,9 @@ impl Renderer {
                 }
                 AppState::ProjectView { project_path, selected_action } => {
                     self.queue_project_view_text(project_path, *selected_action);
+                }
+                AppState::PalaceLoop { cards, current_tool, .. } => {
+                    self.queue_palace_loop_text(cards, current_tool.as_deref());
                 }
                 AppState::MainMenu { .. } | AppState::SettingsMenu { .. } => {}
             }
@@ -776,6 +812,9 @@ impl Renderer {
                 AppState::ProjectView { project_path, selected_action } => {
                     self.queue_project_view_text(project_path, *selected_action);
                 }
+                AppState::PalaceLoop { cards, current_tool, .. } => {
+                    self.queue_palace_loop_text(cards, current_tool.as_deref());
+                }
                 AppState::MainMenu { .. } => {}
                 AppState::SettingsMenu { .. } => {}
             }
@@ -878,6 +917,9 @@ impl Renderer {
                 }
                 AppState::ProjectView { project_path, selected_action } => {
                     self.queue_project_view_text(project_path, *selected_action);
+                }
+                AppState::PalaceLoop { cards, current_tool, .. } => {
+                    self.queue_palace_loop_text(cards, current_tool.as_deref());
                 }
                 AppState::MainMenu { .. } => {}
                 AppState::SettingsMenu { .. } => {}
@@ -1019,6 +1061,42 @@ impl Renderer {
                 }
 
                 card
+            })
+            .collect()
+    }
+
+    fn build_suggestion_cards(&self, cards: &[SuggestionCard], focused: usize) -> Vec<CardInstance> {
+        let grid = CardGrid::for_palace_loop(
+            self.size.width as f32,
+            self.size.height as f32,
+            &self.ui_scale,
+        );
+
+        cards
+            .iter()
+            .enumerate()
+            .map(|(i, card)| {
+                let (x, y) = grid.card_position(i);
+                let is_focused = i == focused;
+
+                // Use card's category color for BORDER only (alpha < 1.0 = OLED mode = black fill)
+                let mut color = card.color();
+                color[3] = 0.95; // OLED mode: colored border, black background
+
+                let mut instance = CardInstance::new(x, y, grid.card_width, grid.card_height, color)
+                    .with_border_width(self.ui_scale.px(if is_focused { 4.0 } else { 2.0 }))
+                    .with_corner_radius(self.ui_scale.px(12.0));
+
+                if is_focused {
+                    instance = instance.selected();
+                }
+
+                // If selected for execution, use green border
+                if card.selected {
+                    instance = instance.with_border_color([0.2, 1.0, 0.4, 0.95]);
+                }
+
+                instance
             })
             .collect()
     }
@@ -1554,6 +1632,179 @@ impl Renderer {
         let _ = self.text_brush.queue(&self.device, &self.queue, sections);
     }
 
+    fn queue_palace_loop_text(&mut self, cards: &[SuggestionCard], current_tool: Option<&str>) {
+        let title_scale = self.ui_scale.px(42.0);
+        let left_margin = self.ui_scale.px(60.0);
+        let top_margin = self.ui_scale.px(40.0);
+        let help_y = self.size.height as f32 - self.ui_scale.px(40.0);
+
+        let grid = CardGrid::for_palace_loop(
+            self.size.width as f32,
+            self.size.height as f32,
+            &self.ui_scale,
+        );
+
+        let mut sections = Vec::new();
+
+        // Title
+        sections.push(
+            Section::default()
+                .add_text(
+                    Text::new("PALACE LOOP")
+                        .with_scale(title_scale)
+                        .with_color([0.8, 0.6, 1.0, 1.0]),
+                )
+                .with_screen_position((left_margin, top_margin))
+                .with_layout(Layout::default()),
+        );
+
+        // Subtitle with current tool if any
+        let subtitle = if let Some(tool) = current_tool {
+            format!("Analyzing... {}", tool)
+        } else if cards.is_empty() {
+            "Gathering suggestions...".to_string()
+        } else {
+            format!("{} suggestions", cards.len())
+        };
+        sections.push(
+            Section::default()
+                .add_text(
+                    Text::new(&subtitle)
+                        .with_scale(self.ui_scale.px(18.0))
+                        .with_color(self.text_color_dim()),
+                )
+                .with_screen_position((left_margin, top_margin + title_scale + 8.0))
+                .with_layout(Layout::default()),
+        );
+
+        // Pre-collect strings that need to outlive the loop
+        let card_strings: Vec<_> = cards.iter().map(|card| {
+            let category_upper = card.category.to_uppercase();
+            let display_cmd = card.command.as_ref().map(|cmd| {
+                if cmd.len() > 40 {
+                    format!("$ {}...", &cmd[..37])
+                } else {
+                    format!("$ {}", cmd)
+                }
+            });
+            (category_upper, display_cmd)
+        }).collect();
+
+        // Card text
+        let text_margin = self.ui_scale.px(16.0);
+        for (i, card) in cards.iter().enumerate() {
+            let (x, y) = grid.card_position(i);
+            let (category_upper, display_cmd) = &card_strings[i];
+
+            // Category badge (bottom right, near border)
+            if !card.category.is_empty() {
+                sections.push(
+                    Section::default()
+                        .add_text(
+                            Text::new(category_upper)
+                                .with_scale(self.ui_scale.px(10.0))
+                                .with_color(card.color()),
+                        )
+                        .with_screen_position((
+                            x + grid.card_width - text_margin - self.ui_scale.px(40.0),
+                            y + grid.card_height - text_margin - self.ui_scale.px(12.0),
+                        ))
+                        .with_layout(Layout::default()),
+                );
+            }
+
+            // Title
+            let title_color = if card.streaming {
+                [0.85, 0.85, 0.9, 1.0]
+            } else {
+                self.text_color()
+            };
+            let display_title = if card.title.is_empty() {
+                if card.streaming { "..." } else { "Untitled" }
+            } else {
+                &card.title
+            };
+            sections.push(
+                Section::default()
+                    .add_text(
+                        Text::new(display_title)
+                            .with_scale(self.ui_scale.px(20.0))
+                            .with_color(title_color),
+                    )
+                    .with_screen_position((x + text_margin, y + text_margin))
+                    .with_bounds((grid.card_width - text_margin * 2.0, grid.card_height))
+                    .with_layout(Layout::default()),
+            );
+
+            // Description
+            if !card.description.is_empty() {
+                let desc_y = y + text_margin + self.ui_scale.px(28.0);
+                sections.push(
+                    Section::default()
+                        .add_text(
+                            Text::new(&card.description)
+                                .with_scale(self.ui_scale.px(12.0))
+                                .with_color(self.text_color_dim()),
+                        )
+                        .with_screen_position((x + text_margin, desc_y))
+                        .with_bounds((grid.card_width - text_margin * 2.0, self.ui_scale.px(60.0)))
+                        .with_layout(Layout::default()),
+                );
+            }
+
+            // Command at bottom if present
+            if let Some(ref cmd) = display_cmd {
+                let cmd_y = y + grid.card_height - text_margin - self.ui_scale.px(16.0);
+                sections.push(
+                    Section::default()
+                        .add_text(
+                            Text::new(cmd)
+                                .with_scale(self.ui_scale.px(11.0))
+                                .with_color([0.4, 0.8, 0.5, 1.0]), // Green for commands
+                        )
+                        .with_screen_position((x + text_margin, cmd_y))
+                        .with_layout(Layout::default()),
+                );
+            }
+
+            // Selected indicator (checkmark)
+            if card.selected {
+                sections.push(
+                    Section::default()
+                        .add_text(
+                            Text::new("✓")
+                                .with_scale(self.ui_scale.px(24.0))
+                                .with_color([0.2, 1.0, 0.4, 1.0]),
+                        )
+                        .with_screen_position((
+                            x + grid.card_width - text_margin - self.ui_scale.px(24.0),
+                            y + grid.card_height - text_margin - self.ui_scale.px(24.0),
+                        ))
+                        .with_layout(Layout::default()),
+                );
+            }
+        }
+
+        // Help text
+        let help_text = if self.gamepad_connected {
+            "  Navigate      Toggle       Execute      Back"
+        } else {
+            "[Arrows] Navigate  [Space] Toggle  [Enter] Execute  [Esc] Back"
+        };
+        sections.push(
+            Section::default()
+                .add_text(
+                    Text::new(help_text)
+                        .with_scale(self.ui_scale.px(16.0))
+                        .with_color([0.35, 0.35, 0.4, 1.0]),
+                )
+                .with_screen_position((left_margin, help_y))
+                .with_layout(Layout::default()),
+        );
+
+        let _ = self.text_brush.queue(&self.device, &self.queue, sections);
+    }
+
     fn build_help_sprites(&self, state: &AppState) -> Vec<SpriteInstance> {
         let mut sprites = Vec::new();
         let glyph_size = self.ui_scale.px(24.0);
@@ -1626,6 +1877,36 @@ impl Renderer {
                     XboxButton::B,
                 ));
             }
+            AppState::PalaceLoop { .. } => {
+                let help_y = self.size.height as f32 - self.ui_scale.px(40.0) - glyph_size * 0.25;
+
+                // D-Pad for navigation
+                sprites.push(SpriteInstance::new(left_margin, help_y, glyph_size, XboxButton::DPad));
+
+                // A button for toggle selection
+                sprites.push(SpriteInstance::new(
+                    left_margin + self.ui_scale.px(130.0),
+                    help_y,
+                    glyph_size,
+                    XboxButton::A,
+                ));
+
+                // X button for execute
+                sprites.push(SpriteInstance::new(
+                    left_margin + self.ui_scale.px(220.0),
+                    help_y,
+                    glyph_size,
+                    XboxButton::X,
+                ));
+
+                // B button for back
+                sprites.push(SpriteInstance::new(
+                    left_margin + self.ui_scale.px(320.0),
+                    help_y,
+                    glyph_size,
+                    XboxButton::B,
+                ));
+            }
         }
 
         sprites
@@ -1647,10 +1928,6 @@ impl Renderer {
     }
 
     #[allow(dead_code)]
-    pub fn set_ui_scale(&mut self, scale: f32) {
-        self.ui_scale.base = scale.clamp(0.5, 2.0);
-    }
-
     /// Start a non-blocking screenshot capture of the last rendered frame
     /// The capture will complete asynchronously over the next few frames
     pub fn start_screenshot(
