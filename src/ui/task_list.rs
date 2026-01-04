@@ -60,7 +60,13 @@ impl Widget for TaskListWidget<'_> {
         let tasks = self.db.tasks();
 
         if tasks.is_empty() {
-            let msg = "No tasks. Waiting for Claude to suggest tasks...";
+            let msg = if self.db.showing_history() {
+                "No historical tasks. Press [H] to view fresh tasks."
+            } else if self.db.history_count() > 0 {
+                "No fresh tasks. Press [H] to view history."
+            } else {
+                "No tasks. Waiting for Claude to suggest tasks..."
+            };
             let x = area.x + 2;
             let y = area.y + area.height / 2;
             buf.set_string(x, y, msg, Style::default().fg(Color::DarkGray));

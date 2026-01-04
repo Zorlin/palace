@@ -50,5 +50,8 @@ dirs = "6"
 # Environment
 dotenvy = "0.15"
 
+# Find executables
+which = "7"
+
 [dev-dependencies]
 tempfile = "3"

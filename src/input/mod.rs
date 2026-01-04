@@ -24,9 +24,22 @@ pub enum Event {
     ToggleSelectAll,  // A - toggle all selected/deselected
     Execute,
     Delete,
-    ToggleExpand,  // E - toggle expanded view for focused task
+    ToggleExpand,   // E - toggle expanded view for focused task
+    ToggleHistory,  // H - toggle between fresh tasks and history
     MouseClick { row: u16, col: u16 },
     MouseShiftClick { row: u16, col: u16 }, // Shift+click for range select
+
+    // Dialogue events (BG3/Skyrim style)
+    DialogueUp,          // Navigate dialogue options
+    DialogueDown,
+    DialogueAccept,      // A button - accept/allow
+    DialogueAlwaysAllow, // X button - always allow this type
+    DialogueDeny,        // B button - deny/cancel
+    DialogueToggle,      // Space - toggle multi-select option
+    DialogueConfirm,     // Enter - confirm selection
+
+    // Special combo: RT+LT intervention (interrupt and suggest alternatives)
+    Intervention,
 }
 
 /// Handles input from all sources: keyboard, mouse, gamepad
@@ -95,7 +108,8 @@ impl InputHandler {
 
     fn handle_key(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<Event> {
         match (code, modifiers) {
-            // Quit
+            // Quit - Ctrl+C, q, or Esc
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(Event::Quit),
             (KeyCode::Char('q'), KeyModifiers::NONE) => Some(Event::Quit),
             (KeyCode::Esc, _) => Some(Event::Quit),
 
@@ -131,8 +145,73 @@ impl InputHandler {
             (KeyCode::Enter, _) => Some(Event::Execute),
             (KeyCode::Delete, _) | (KeyCode::Backspace, _) => Some(Event::Delete),
             (KeyCode::Char('e'), KeyModifiers::NONE) => Some(Event::ToggleExpand),
+            (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Char('H'), _) => Some(Event::ToggleHistory),
+
+            // Intervention: Ctrl+I or Ctrl+Shift+I
+            (KeyCode::Char('i'), KeyModifiers::CONTROL) => Some(Event::Intervention),
 
             _ => None,
         }
+    }
+
+    /// Handle keys when in dialogue mode (permission prompts, surveys)
+    fn handle_dialogue_key(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<Event> {
+        match (code, modifiers) {
+            // Quit - Ctrl+C always works
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(Event::Quit),
+
+            // Navigation
+            (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                Some(Event::DialogueUp)
+            }
+            (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                Some(Event::DialogueDown)
+            }
+
+            // Accept (A button)
+            (KeyCode::Char('a'), KeyModifiers::NONE) | (KeyCode::Char('A'), _) => {
+                Some(Event::DialogueAccept)
+            }
+
+            // Always allow (X button)
+            (KeyCode::Char('x'), KeyModifiers::NONE) | (KeyCode::Char('X'), _) => {
+                Some(Event::DialogueAlwaysAllow)
+            }
+
+            // Deny/cancel (B button)
+            (KeyCode::Char('b'), KeyModifiers::NONE) | (KeyCode::Char('B'), _) => {
+                Some(Event::DialogueDeny)
+            }
+            (KeyCode::Esc, _) => Some(Event::DialogueDeny),
+
+            // Toggle option in multi-select
+            (KeyCode::Char(' '), _) => Some(Event::DialogueToggle),
+
+            // Confirm selection
+            (KeyCode::Enter, _) => Some(Event::DialogueConfirm),
+
+            // Intervention also works in dialogue mode
+            (KeyCode::Char('i'), KeyModifiers::CONTROL) => Some(Event::Intervention),
+
+            _ => None,
+        }
+    }
+
+    /// Get next event in dialogue mode
+    pub async fn next_dialogue_event(&mut self) -> Result<Option<Event>> {
+        if event::poll(Duration::from_millis(16))? {
+            if let CrosstermEvent::Key(key) = event::read()? {
+                return Ok(self.handle_dialogue_key(key.code, key.modifiers));
+            }
+        }
+
+        // Poll gamepad in dialogue mode
+        if let Some(ref mut gamepad) = self.gamepad {
+            if let Some(event) = gamepad.poll_dialogue()? {
+                return Ok(Some(event));
+            }
+        }
+
+        Ok(None)
     }
 }

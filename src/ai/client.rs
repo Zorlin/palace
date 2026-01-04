@@ -1,38 +1,40 @@
 use anyhow::{anyhow, Result};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 
-/// Anthropic API client
+/// Anthropic API client (via Go SDK)
 pub struct AnthropicClient {
-    client: Client,
     base_url: String,
-    api_key: String,
     model: String,
 }
 
+/// Request to Go SDK
 #[derive(Debug, Serialize)]
-struct Message {
-    role: String,
-    content: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatRequest {
-    model: String,
-    max_tokens: u32,
-    messages: Vec<Message>,
+struct SdkRequest {
+    prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    work_dir: Option<String>,
+    enable_tools: bool,
 }
 
+/// Event from Go SDK
 #[derive(Debug, Deserialize)]
-struct ChatResponse {
-    content: Vec<ContentBlock>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ContentBlock {
+struct SdkEvent {
+    #[serde(rename = "type")]
+    event_type: String,
     text: Option<String>,
+    error: Option<String>,
+    tool: Option<String>,
+    detail: Option<String>,
 }
 
 /// Parsed task suggestion from Claude
@@ -47,178 +49,201 @@ pub struct TaskSuggestion {
 
 impl AnthropicClient {
     pub fn new(base_url: &str, model: &str) -> Result<Self> {
-        // Try ZAI_API_KEY first (for z.ai), fall back to ANTHROPIC_API_KEY
-        let api_key = std::env::var("ZAI_API_KEY")
-            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-            .map_err(|_| anyhow!("ZAI_API_KEY or ANTHROPIC_API_KEY environment variable not set"))?;
+        // Verify API key exists
+        if std::env::var("ZAI_API_KEY").is_err() && std::env::var("ANTHROPIC_API_KEY").is_err() {
+            return Err(anyhow!("ZAI_API_KEY or ANTHROPIC_API_KEY environment variable not set"));
+        }
 
         Ok(Self {
-            client: Client::new(),
-            base_url: base_url.trim_end_matches('/').to_string(),
-            api_key,
+            base_url: base_url.to_string(),
             model: model.to_string(),
         })
     }
 
-    /// Ask Claude what tasks to work on
+    /// Ask Claude what tasks to work on (uses SDK with tools for codebase exploration)
     pub async fn generate_tasks(&self, project_path: &Path) -> Result<Vec<TaskSuggestion>> {
-        // Gather context
-        let context = self.gather_context(project_path).await?;
-
         let system = r#"You are analyzing a codebase to suggest actionable tasks.
-Respond ONLY with a YAML list of suggested actions. No other text.
 
-Format:
+Use the available tools to explore the codebase:
+- file_tree: Get project structure overview
+- read_file: Read specific files
+- list_files: List files in directories
+- grep: Search for patterns
+
+After exploring, respond with a YAML list of suggested actions:
+
 ```yaml
 actions:
   - label: Short action title (under 60 chars)
-    description: Detailed description of what this involves and why it matters
-    time_estimate: "15 min"  # estimated time: "5 min", "30 min", "1 hour", "2 hours", etc.
-    complexity: simple  # one of: trivial, simple, moderate, complex
+    description: Detailed description of what this involves
+    time_estimate: "15 min"
+    complexity: simple
     affected_files:
       - src/main.rs
-      - src/lib.rs
-  - label: Another action
-    description: Full details about this task
-    time_estimate: "1 hour"
-    complexity: moderate
-    affected_files:
-      - src/api/client.rs
 ```
 
 RULES:
+- Explore the codebase FIRST using tools
 - label: Required, keep under 60 chars
-- description: Required, be detailed (up to 1000 chars) - this provides context for execution
-- time_estimate: Optional but helpful
-- complexity: Optional, one of trivial/simple/moderate/complex
-- affected_files: Optional, list files this task will likely touch
-- Suggest as many tasks as make sense - no artificial limits
-- Be specific and actionable"#;
+- description: Required, be detailed
+- Focus on gamepad-related features and improvements
+- Suggest concrete actions Claude can execute"#;
 
         let prompt = format!(
-            "Here's the current state of the project at {}:\n\n{}\n\nWhat tasks should I work on next?",
-            project_path.display(),
-            context
+            "Analyze this project at {} and suggest what I should work on next. Start by exploring the codebase structure.",
+            project_path.display()
         );
 
-        let response = self.chat(&prompt, Some(system)).await?;
+        let response = self.call_sdk(&prompt, Some(system), Some(project_path), true).await?;
         self.parse_yaml_tasks(&response)
     }
 
     /// Execute a task by sending it to Claude
+    #[allow(dead_code)]
     pub async fn execute_task(&self, task: &TaskSuggestion, project_path: &Path) -> Result<String> {
-        let context = self.gather_context(project_path).await?;
-
         let system = r#"You are a coding assistant executing a task.
-Analyze the codebase and perform the requested task.
+Use the available tools to explore and modify the codebase.
 Be thorough but concise. Show what you're doing."#;
 
         let prompt = format!(
-            "Project: {}\n\nContext:\n{}\n\nTask: {}\nDescription: {}\n\nExecute this task.",
-            project_path.display(),
-            context,
+            "Task: {}\nDescription: {}\n\nExecute this task.",
             task.label,
             task.description
         );
 
-        self.chat(&prompt, Some(system)).await
+        self.call_sdk(&prompt, Some(system), Some(project_path), true).await
     }
 
-    async fn chat(&self, prompt: &str, system: Option<&str>) -> Result<String> {
-        let request = ChatRequest {
-            model: self.model.clone(),
-            max_tokens: 8192,
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: prompt.to_string(),
-            }],
+    /// Raw chat without tools
+    pub async fn chat_raw(&self, prompt: &str, system: Option<&str>) -> Result<String> {
+        self.call_sdk(prompt, system, None, false).await
+    }
+
+    /// Call the Go SDK binary
+    async fn call_sdk(
+        &self,
+        prompt: &str,
+        system: Option<&str>,
+        work_dir: Option<&Path>,
+        enable_tools: bool,
+    ) -> Result<String> {
+        let sdk_path = self.find_sdk_binary()?;
+
+        let mut cmd = Command::new(&sdk_path);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // Pass through API keys
+        if let Ok(key) = std::env::var("ZAI_API_KEY") {
+            cmd.env("ZAI_API_KEY", key);
+        }
+        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+            cmd.env("ANTHROPIC_API_KEY", key);
+        }
+
+        let mut child = cmd.spawn()?;
+
+        // Build request
+        let request = SdkRequest {
+            prompt: prompt.to_string(),
             system: system.map(|s| s.to_string()),
+            model: Some(self.model.clone()),
+            base_url: Some(self.base_url.clone()),
+            work_dir: work_dir.map(|p| p.to_string_lossy().to_string()),
+            enable_tools,
         };
 
-        let url = format!("{}/v1/messages", self.base_url);
+        // Send request and close stdin to signal EOF
+        {
+            let stdin = child.stdin.as_mut().ok_or_else(|| anyhow!("No stdin"))?;
+            let mut request_json = serde_json::to_string(&request)?;
+            request_json.push('\n');
+            stdin.write_all(request_json.as_bytes()).await?;
+            stdin.flush().await?;
+        }
+        // Take ownership and drop to close stdin
+        drop(child.stdin.take());
 
-        let response = self
-            .client
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
+        // Read response
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!("No stdout"))?;
+        let mut reader = BufReader::new(stdout).lines();
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("API error {}: {}", status, body));
+        let mut response_text = String::new();
+
+        while let Some(line) = reader.next_line().await? {
+            if let Ok(event) = serde_json::from_str::<SdkEvent>(&line) {
+                match event.event_type.as_str() {
+                    "text" => {
+                        if let Some(text) = event.text {
+                            // Print in realtime
+                            print!("{}", text);
+                            use std::io::Write;
+                            std::io::stdout().flush().ok();
+                            response_text.push_str(&text);
+                        }
+                    }
+                    "error" => {
+                        if let Some(error) = event.error {
+                            return Err(anyhow!("SDK error: {}", error));
+                        }
+                    }
+                    "tool_start" => {
+                        if let Some(tool) = &event.tool {
+                            println!("\n\x1b[33m[{}]\x1b[0m", tool);
+                        }
+                    }
+                    "tool_result" => {
+                        if let Some(detail) = &event.detail {
+                            println!("\x1b[90m{}\x1b[0m", detail);
+                        }
+                    }
+                    "done" => {
+                        println!(); // Final newline
+                        break;
+                    }
+                    _ => {}
+                }
+            }
         }
 
-        let chat_response: ChatResponse = response.json().await?;
+        // Wait for process
+        let status = child.wait().await?;
+        if !status.success() && response_text.is_empty() {
+            return Err(anyhow!("SDK exited with code {:?}", status.code()));
+        }
 
-        chat_response
-            .content
-            .into_iter()
-            .filter_map(|c| c.text)
-            .next()
-            .ok_or_else(|| anyhow!("No text in response"))
+        Ok(response_text)
     }
 
-    async fn gather_context(&self, project_path: &Path) -> Result<String> {
-        let mut context = String::new();
+    fn find_sdk_binary(&self) -> Result<PathBuf> {
+        let candidates = [
+            // In target directory
+            PathBuf::from("target/palace-sdk"),
+            // In same directory as current exe
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.join("palace-sdk")))
+                .unwrap_or_default(),
+            // In PATH
+            which::which("palace-sdk").unwrap_or_default(),
+        ];
 
-        // File tree (limited depth)
-        context.push_str("## File Structure\n```\n");
-        if let Ok(output) = tokio::process::Command::new("find")
-            .args([
-                project_path.to_str().unwrap_or("."),
-                "-type", "f",
-                "-not", "-path", "*/.git/*",
-                "-not", "-path", "*/node_modules/*",
-                "-not", "-path", "*/target/*",
-                "-not", "-path", "*/__pycache__/*",
-                "-not", "-path", "*/.palace/*",
-            ])
-            .output()
-            .await
-        {
-            let files = String::from_utf8_lossy(&output.stdout);
-            // Limit to first 100 files
-            for (i, line) in files.lines().enumerate() {
-                if i >= 100 {
-                    context.push_str("... (truncated)\n");
-                    break;
-                }
-                context.push_str(line);
-                context.push('\n');
-            }
-        }
-        context.push_str("```\n\n");
-
-        // Key files content
-        let key_files = ["README.md", "SPEC.md", "Cargo.toml", "package.json", "pyproject.toml"];
-        for filename in key_files {
-            let file_path = project_path.join(filename);
-            if file_path.exists() {
-                if let Ok(content) = tokio::fs::read_to_string(&file_path).await {
-                    context.push_str(&format!("## {}\n```\n", filename));
-                    // Limit file content
-                    let truncated: String = content.chars().take(2000).collect();
-                    context.push_str(&truncated);
-                    if content.len() > 2000 {
-                        context.push_str("\n... (truncated)");
-                    }
-                    context.push_str("\n```\n\n");
-                }
+        for path in candidates {
+            if path.exists() && path.is_file() {
+                return Ok(path);
             }
         }
 
-        Ok(context)
+        Err(anyhow!(
+            "palace-sdk binary not found. Build with: cd go && go build -o ../target/palace-sdk ."
+        ))
     }
 
     fn parse_yaml_tasks(&self, response: &str) -> Result<Vec<TaskSuggestion>> {
         let mut tasks = Vec::new();
 
-        // Extract YAML block if wrapped in ```yaml
+        // Extract YAML block
         let yaml_content = if let Some(start) = response.find("```yaml") {
             let start = start + 7;
             if let Some(end) = response[start..].find("```") {
@@ -237,61 +262,107 @@ Be thorough but concise. Show what you're doing."#;
             response
         };
 
-        // Parse each action block
+        // Parse YAML
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum ParseMode {
+            Normal,
+            MultiLineDesc,
+            FilesList,
+        }
+
         let mut current_label: Option<String> = None;
         let mut current_desc: Option<String> = None;
         let mut current_time: Option<String> = None;
         let mut current_complexity: Option<String> = None;
         let mut current_files: Vec<String> = Vec::new();
-        let mut in_files_list = false;
+        let mut parse_mode = ParseMode::Normal;
+        let mut multiline_indent: usize = 0;
 
         for line in yaml_content.lines() {
             let trimmed = line.trim();
+            let leading_spaces = line.len() - line.trim_start().len();
+
+            if parse_mode == ParseMode::MultiLineDesc {
+                if leading_spaces > multiline_indent && !trimmed.is_empty() {
+                    if let Some(ref mut desc) = current_desc {
+                        if !desc.is_empty() {
+                            desc.push(' ');
+                        }
+                        desc.push_str(trimmed);
+                    }
+                    continue;
+                } else {
+                    parse_mode = ParseMode::Normal;
+                }
+            }
 
             if trimmed.starts_with("- label:") {
-                // Save previous task if exists
-                if let (Some(label), Some(desc)) = (current_label.take(), current_desc.take()) {
-                    tasks.push(TaskSuggestion {
-                        label,
-                        description: desc,
-                        time_estimate: current_time.take(),
-                        complexity: current_complexity.take(),
-                        affected_files: std::mem::take(&mut current_files),
-                    });
+                if let (Some(label), desc) = (current_label.take(), current_desc.take()) {
+                    let desc = desc.unwrap_or_default();
+                    let desc = if desc == "|" || desc == "-" || desc == ">" {
+                        String::new()
+                    } else {
+                        desc
+                    };
+                    if !desc.is_empty() {
+                        tasks.push(TaskSuggestion {
+                            label,
+                            description: desc,
+                            time_estimate: current_time.take(),
+                            complexity: current_complexity.take(),
+                            affected_files: std::mem::take(&mut current_files),
+                        });
+                    }
                 }
-                in_files_list = false;
-                current_label = Some(trimmed.trim_start_matches("- label:").trim().to_string());
+                parse_mode = ParseMode::Normal;
+                current_label = Some(trimmed.trim_start_matches("- label:").trim().trim_matches('"').to_string());
             } else if trimmed.starts_with("description:") {
-                in_files_list = false;
-                current_desc = Some(trimmed.trim_start_matches("description:").trim().to_string());
+                let value = trimmed.trim_start_matches("description:").trim();
+                if value == "|" || value == ">" || value == "-" || value.is_empty() {
+                    parse_mode = ParseMode::MultiLineDesc;
+                    multiline_indent = leading_spaces;
+                    current_desc = Some(String::new());
+                } else {
+                    parse_mode = ParseMode::Normal;
+                    current_desc = Some(value.trim_matches('"').to_string());
+                }
             } else if trimmed.starts_with("time_estimate:") {
-                in_files_list = false;
+                parse_mode = ParseMode::Normal;
                 current_time = Some(trimmed.trim_start_matches("time_estimate:").trim().trim_matches('"').to_string());
             } else if trimmed.starts_with("complexity:") {
-                in_files_list = false;
+                parse_mode = ParseMode::Normal;
                 current_complexity = Some(trimmed.trim_start_matches("complexity:").trim().to_string());
             } else if trimmed.starts_with("affected_files:") {
-                in_files_list = true;
-            } else if in_files_list && trimmed.starts_with("- ") {
+                parse_mode = ParseMode::FilesList;
+            } else if parse_mode == ParseMode::FilesList && trimmed.starts_with("- ") {
                 let file = trimmed.trim_start_matches("- ").trim().to_string();
                 if !file.is_empty() {
                     current_files.push(file);
                 }
-            } else if !trimmed.starts_with("-") && !trimmed.is_empty() {
-                // Reset files list if we hit a non-list line
-                in_files_list = false;
+            } else if !trimmed.starts_with("-") && !trimmed.is_empty() && !trimmed.starts_with("#") {
+                if parse_mode == ParseMode::FilesList {
+                    parse_mode = ParseMode::Normal;
+                }
             }
         }
 
         // Don't forget the last one
-        if let (Some(label), Some(desc)) = (current_label, current_desc) {
-            tasks.push(TaskSuggestion {
-                label,
-                description: desc,
-                time_estimate: current_time,
-                complexity: current_complexity,
-                affected_files: current_files,
-            });
+        if let (Some(label), desc) = (current_label, current_desc) {
+            let desc = desc.unwrap_or_default();
+            let desc = if desc == "|" || desc == "-" || desc == ">" {
+                String::new()
+            } else {
+                desc
+            };
+            if !desc.is_empty() {
+                tasks.push(TaskSuggestion {
+                    label,
+                    description: desc,
+                    time_estimate: current_time,
+                    complexity: current_complexity,
+                    affected_files: current_files,
+                });
+            }
         }
 
         Ok(tasks)

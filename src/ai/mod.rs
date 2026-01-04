@@ -4,3 +4,6 @@ pub mod client;
 pub mod streaming;
 
 pub use client::{AnthropicClient, TaskSuggestion};
+pub use streaming::{
+    DialogueOption, ExecutionEvent, Executor, PermissionRequest, PermissionResponse, UserResponse,
+};
