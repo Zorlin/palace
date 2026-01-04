@@ -1,5 +1,6 @@
 # Palace runtime
 .palace/
+.claude
 victories/**
 
 # MCP configuration (user-specific)
