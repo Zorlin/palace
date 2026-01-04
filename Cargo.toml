@@ -1,46 +1,69 @@
 [workspace]
-resolver = "2"
-members = [
-    "crates/palace-core",
-    "crates/palace-translator",
-    "crates/palace-cli",
-    "crates/palace-daemon",
-]
+members = [".", "crates/anthropic-ffi"]
 
-[workspace.package]
-version = "5.0.0"
+[package]
+name = "palace"
+version = "0.1.0"
 edition = "2021"
+description = "GPU-native recursive hierarchical self-improvement environment"
 license = "MIT"
-repository = "https://github.com/riffcc/palace"
+authors = ["Palace Contributors"]
 
-[workspace.dependencies]
+[dependencies]
+# GPU / Rendering
+wgpu = "28"
+winit = "0.30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+
+# Input
+gilrs = "0.11"
+
+# Parsing
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-
-# HTTP
-axum = "0.8"
-reqwest = { version = "0.12", features = ["json", "stream"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Error handling
-thiserror = "2"
 anyhow = "1"
+thiserror = "2"
+
+# Filesystem
+dirs = "6"
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Utilities
-uuid = { version = "1", features = ["v4"] }
-futures = "0.3"
-async-stream = "0.3"
-bytes = "1"
+# Text rendering
+wgpu_text = "28"
 
-# Internal crates
-palace-core = { path = "crates/palace-core" }
-palace-translator = { path = "crates/palace-translator" }
+# SVG rendering for controller glyphs
+resvg = "0.45"
+
+# PNG encoding for screenshots
+png = "0.17"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+libc = "0.2.179"
+
+# Anthropic SDK via Go FFI
+anthropic-ffi = { path = "crates/anthropic-ffi" }
+
+# Environment file loading
+dotenvy = "0.15"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1

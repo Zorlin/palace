@@ -23,6 +23,16 @@ This document explains how Palace integrates with Claude Code to enable Recursiv
 
 **This applies to ALL code, tests, examples, and documentation.**
 
+## ☠️ CRITICAL: NEVER Remove Socket Files
+
+**NEVER run `rm` on socket files. EVER.**
+
+- `/tmp/palace-debug.sock` and other `.sock` files are RUNTIME STATE
+- Removing them breaks running processes and IPC
+- If a socket file exists, it means something is using it (or just exited)
+- The correct fix is to handle stale sockets IN CODE, not delete them manually
+**This is not negotiable. Socket files are sacred.**
+
 ## 🥇 Golden Rule #1: TDD (Test-Driven Development)
 
 **EVERY feature, EVERY change, EVERY improvement MUST have tests.**
@@ -535,6 +545,174 @@ $ claude
 ```
 
 Each iteration builds on the last. Palace remembers. Claude improves.
+
+---
+
+## 🔧 Debugging Palace GPU
+
+Palace GPU is a native Rust application using WGPU. Here's how to debug it:
+
+### HARD REQUIREMENTS
+
+1. **NEVER use `cargo run --release`** - Always use `cargo run` (debug build). Release builds hide errors and make debugging impossible.
+
+2. **ALWAYS use `palace screenshot` command** - Never use `nc`, `socat`, or raw socket connections. The proper command is:
+   ```bash
+   ./target/debug/palace screenshot /tmp/screenshot.png
+   ```
+
+3. **EVENT-DRIVEN ARCHITECTURE** - Never poll. Use events everywhere:
+   - **Gamepad**: Runs in separate thread, sends events via `EventLoopProxy`
+   - **Debug commands**: Async server sends events via `EventLoopProxy`
+   - **Window events**: winit handles keyboard, touch, resize natively
+   - **Render loop**: Uses `ControlFlow::Wait` when idle (zero CPU)
+   - Only switches to `ControlFlow::Poll` when actively rendering or processing screenshots
+
+   This ensures Palace uses **zero CPU when idle** - critical for battery life on GPD Win 4.
+
+### Running in Debug Mode
+
+```bash
+# ALWAYS use this (debug build)
+cargo run
+
+# NEVER use this unless explicitly asked
+# cargo run --release
+```
+
+### Log Levels
+
+Palace uses `tracing` for logging. Set `RUST_LOG` environment variable:
+
+```bash
+# Show all debug messages
+RUST_LOG=debug cargo run
+
+# Show only palace module debug messages
+RUST_LOG=palace=debug cargo run
+
+# Show specific module traces
+RUST_LOG=palace::renderer=debug,palace::app=info cargo run
+```
+
+### Screenshots
+
+**ALWAYS use the palace CLI command:**
+
+```bash
+# Take a screenshot (while palace is running)
+./target/debug/palace screenshot -o /tmp/screenshot.png
+
+# Take 3 screenshots with 1 second delay
+./target/debug/palace screenshot -o /tmp/shot.png 3 1s
+```
+
+DO NOT use `nc`, `socat`, or raw socket commands. The CLI handles everything properly.
+
+### Common Issues
+
+1. **Segfault on exit**: Usually related to GPU resource cleanup. Check drop order of renderer components.
+
+2. **Text not rendering**:
+   - Ensure `text_brush.queue()` is called BEFORE `text_brush.draw()`
+   - Check that the text color alpha is > 0
+   - Verify screen position is within visible bounds
+
+3. **Cards not visible**:
+   - Check card instance buffer is being updated
+   - Verify card positions are in screen space (0,0 is top-left)
+   - Ensure shader uniforms (screen_size) are correct
+
+4. **Gamepad not detected**:
+   - Check `gilrs` initialization in logs
+   - Verify gamepad is connected before app starts
+   - Some gamepads need udev rules on Linux
+
+### Key Files
+
+- `src/main.rs` - Entry point, debug server setup
+- `src/app.rs` - Application state machine, input handling
+- `src/renderer/gpu.rs` - Main GPU renderer (~1000 lines)
+- `src/renderer/shaders/*.wgsl` - GPU shaders
+- `src/state.rs` - App state (ProjectChooser, ProjectView)
+- `src/projects.rs` - Project discovery and configuration
+
+---
+
+## 📍 Current Repository State
+
+**Branch**: `palace-gpu-native`
+
+This branch represents a complete rewrite of Palace from Python to native Rust with GPU rendering.
+
+### What's Implemented
+
+1. **GPU Rendering (WGPU 28)**
+   - Card-based UI with SDF rounded borders
+   - OLED-optimized (pure black backgrounds, no fill)
+   - Text rendering via `wgpu_text`
+   - Sprite rendering for Xbox controller glyphs
+
+2. **Project Chooser View**
+   - Grid layout of project cards
+   - Keyboard navigation (arrows/WASD)
+   - Gamepad navigation (D-Pad)
+   - Project name, description, language detection
+
+3. **Project View (WIP)**
+   - Menu with actions: Start Palace Loop, Build, Run, View Git History
+   - Navigation working, text rendering needs debugging
+
+4. **Input Handling**
+   - Keyboard: Arrows, WASD, Enter, Escape, Backspace
+   - Gamepad: D-Pad, A (select), B (back), Start (exit) - ALL button presses logged
+   - Touchscreen: Tap cards to select, tap back area to go back
+
+5. **Debug Infrastructure**
+   - Unix socket server for external commands
+   - Screenshot capture (async, non-blocking)
+   - `palace restart` command - rebuilds and relaunches in one step
+
+6. **Event-Driven Architecture (Zero CPU Idle)**
+   - Gamepad events via dedicated thread + EventLoopProxy
+   - Debug commands via async server + EventLoopProxy
+   - ControlFlow::Wait when idle, Poll only during active rendering
+   - Zero CPU usage when nothing is happening
+
+### What's NOT Implemented Yet
+
+- Actual project actions (Build, Run, etc.)
+- Palace RHSI loop integration
+- Git history viewer
+- Settings/configuration UI
+- Multi-monitor support
+
+### Known Issues
+
+- **Segfault on exit** - GPU cleanup issue (low priority)
+- **Unused code warnings** - Several methods prepared for future use
+
+### Architecture
+
+```
+src/
+├── main.rs           # Entry, tokio runtime, debug server
+├── app.rs            # ApplicationHandler, state machine
+├── state.rs          # AppState enum, ProjectAction
+├── projects.rs       # Project discovery, language detection
+├── debug/
+│   └── mod.rs        # Debug server, screenshot handling
+└── renderer/
+    ├── mod.rs        # Public exports
+    ├── gpu.rs        # Main Renderer struct
+    ├── cards.rs      # CardRenderer, CardInstance
+    ├── sprites.rs    # SpriteRenderer, Xbox glyphs
+    ├── text.rs       # Text utilities
+    ├── ui_scale.rs   # DPI-aware scaling
+    └── shaders/
+        ├── card.wgsl     # SDF rounded rect shader
+        └── sprite.wgsl   # Texture atlas shader
+```
 
 ---
 
