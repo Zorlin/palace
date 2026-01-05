@@ -85,11 +85,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let alpha_inner = smoothstep(inner_edge - aa, inner_edge + aa, d);
     let border_alpha = alpha_outer * alpha_inner;
 
-    // Glow effect for selected cards (ONLY outside the card edge)
+    // Selection effects
     var glow_alpha = 0.0;
-    if (in.selected > 0.5 && d > 0.0) {
-        // Only glow outside the card (d > 0)
-        glow_alpha = exp(-d * 0.06) * 0.35;
+    var selection_fill_alpha = 0.0;
+    if (in.selected > 0.5) {
+        // Subtle rounded glow outside the card edge
+        if (d > 0.0) {
+            glow_alpha = exp(-d * 0.08) * 0.3;
+        }
+        // Subtle inner fill for contrast (inside the card)
+        if (d < -in.border_width) {
+            // Fade from edge inward for smooth look
+            let inner_dist = abs(d + in.border_width);
+            selection_fill_alpha = smoothstep(0.0, in.border_width * 2.0, inner_dist) * 0.12;
+        }
     }
 
     // Semi-transparent overlay mode: no border, just a filled rectangle with alpha
@@ -121,12 +130,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    // OLED mode: border-only (transparent fill)
-    let final_alpha = max(border_alpha, glow_alpha);
+    // OLED mode: border-only (transparent fill) with selection highlight
+    let final_alpha = max(max(border_alpha, glow_alpha), selection_fill_alpha);
 
     // Discard fully transparent pixels for OLED optimization
     if (final_alpha < 0.01) {
         discard;
+    }
+
+    // Selection fill uses a slightly brighter version of border color
+    if (selection_fill_alpha > border_alpha && selection_fill_alpha > glow_alpha) {
+        // Brighten the color for selected fill
+        let bright_color = in.border_color.rgb * 1.3;
+        return vec4<f32>(bright_color, selection_fill_alpha);
     }
 
     return vec4<f32>(in.border_color.rgb, final_alpha);

@@ -229,6 +229,14 @@ pub enum AppState {
         generating: bool,
         /// Tool call currently being displayed
         current_tool: Option<String>,
+        /// Tool calls log (left side) - most recent first
+        tool_log: Vec<String>,
+        /// AI thoughts/commentary log (right side) - most recent first
+        thought_log: Vec<String>,
+        /// Scroll offset for logs (right thumbstick)
+        log_scroll_offset: usize,
+        /// Scroll offset for focused card detail panel (right thumbstick)
+        detail_scroll_offset: f32,
     },
     /// Main menu - opened with Start button (Resume, Settings, Exit)
     MainMenu {
@@ -248,6 +256,115 @@ pub enum AppState {
         /// Previous state (SettingsMenu) to return to
         previous_state: Box<AppState>,
     },
+    /// Permission modal - AI is waiting for user approval
+    PermissionModal {
+        /// The command requesting permission
+        command: String,
+        /// Command prefix for "always" approval
+        command_prefix: String,
+        /// Selected choice (0=Yes once, 1=Yes always, 2=No)
+        selected_choice: usize,
+        /// Previous state to return to
+        previous_state: Box<AppState>,
+    },
+    /// Execute modal - options for executing selected cards
+    ExecuteModal {
+        /// Selected execution option
+        selected_option: usize,
+        /// Previous state to return to
+        previous_state: Box<AppState>,
+    },
+}
+
+/// Execution options
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecuteOption {
+    /// Run with Claude Code CLI
+    Claude,
+    /// Run with Z.ai API
+    ZAi,
+    /// Run with Z.ai in turbo mode (streams between agents)
+    ZAiTurbo,
+}
+
+impl ExecuteOption {
+    pub fn all() -> &'static [ExecuteOption] {
+        &[
+            ExecuteOption::Claude,
+            ExecuteOption::ZAi,
+            ExecuteOption::ZAiTurbo,
+        ]
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            ExecuteOption::Claude => "Run with Claude",
+            ExecuteOption::ZAi => "Run with Z.ai",
+            ExecuteOption::ZAiTurbo => "Run with Z.ai (turbo)",
+        }
+    }
+}
+
+/// Permission choice options
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionChoice {
+    YesOnce,
+    YesAlways,
+    No,
+    SuggestElse,
+}
+
+impl PermissionChoice {
+    pub fn all() -> &'static [PermissionChoice] {
+        &[
+            PermissionChoice::YesOnce,
+            PermissionChoice::YesAlways,
+            PermissionChoice::No,
+            PermissionChoice::SuggestElse,
+        ]
+    }
+
+    pub fn label(&self, prefix: &str) -> String {
+        match self {
+            PermissionChoice::YesOnce => "Yes (once)".to_string(),
+            PermissionChoice::YesAlways => format!("Yes (always for '{}')", prefix),
+            PermissionChoice::No => "No".to_string(),
+            PermissionChoice::SuggestElse => "Suggest something else".to_string(),
+        }
+    }
+
+    /// Short label for glyph hints
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            PermissionChoice::YesOnce => "Yes",
+            PermissionChoice::YesAlways => "Always",
+            PermissionChoice::No => "No",
+            PermissionChoice::SuggestElse => "Suggest",
+        }
+    }
+}
+
+/// Response to a permission request (from UI to AI)
+#[derive(Debug, Clone)]
+pub enum PermissionResponse {
+    /// Approved (run the command)
+    Approved,
+    /// Approved and remember for this prefix
+    ApprovedAlways(String),
+    /// Denied (don't run)
+    Denied,
+    /// Suggest alternatives (fork conversation, ask Z.ai for alternatives)
+    SuggestElse {
+        /// The original command that was rejected
+        original_command: String,
+    },
+}
+
+impl PermissionResponse {
+    /// Whether this response approves the action
+    pub fn is_approved(&self) -> bool {
+        matches!(self, PermissionResponse::Approved | PermissionResponse::ApprovedAlways(_))
+    }
 }
 
 impl AppState {

@@ -1,15 +1,18 @@
 use crate::projects::ProjectsConfig;
 use crate::renderer::cards::{CardInstance, CardRenderer};
 use crate::renderer::sprites::{SpriteInstance, SpriteRenderer, XboxButton};
+use crate::renderer::text::{PreparedText, TextQueue, TextRequest};
 use crate::state::{AppState, SuggestionCard};
 use anyhow::{Context, Result};
-use wgpu_text::glyph_brush::{ab_glyph::FontRef, Layout, Section, Text};
-use wgpu_text::BrushBuilder;
+use glyphon::{
+    Cache, FontSystem, Resolution, SwashCache, TextAtlas, TextRenderer, Viewport,
+};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
-// Embedded font - using a monospace font for code display
-const FONT_BYTES: &[u8] = include_bytes!("fonts/JetBrainsMono-Regular.ttf");
+// Embedded fonts - primary + fallback for symbols/emoji
+const FONT_JETBRAINS: &[u8] = include_bytes!("fonts/JetBrainsMono-Regular.ttf");
+const FONT_EMOJI: &[u8] = include_bytes!("fonts/NotoColorEmoji.ttf");
 
 /// Simple fullscreen blit shader for copying screenshot texture to surface
 const BLIT_SHADER: &str = r#"
@@ -157,7 +160,14 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
-    text_brush: wgpu_text::TextBrush<FontRef<'static>>,
+    // Glyphon text rendering
+    font_system: FontSystem,
+    swash_cache: SwashCache,
+    text_cache: Cache,
+    viewport: Viewport,
+    text_atlas: TextAtlas,
+    text_renderer: TextRenderer,
+    text_queue: TextQueue,
     card_renderer: CardRenderer,
     sprite_renderer: SpriteRenderer,
     ui_scale: UiScale,
@@ -254,10 +264,41 @@ impl Renderer {
 
         surface.configure(&device, &config);
 
-        // Create text brush
-        let font = FontRef::try_from_slice(FONT_BYTES).context("Failed to load font")?;
-        let text_brush =
-            BrushBuilder::using_font(font).build(&device, size.width, size.height, surface_format);
+        // Initialize glyphon text rendering with color emoji support
+        let mut font_system = FontSystem::new();
+
+        // Load fonts into the font system
+        font_system.db_mut().load_font_data(FONT_JETBRAINS.to_vec());
+        font_system.db_mut().load_font_data(FONT_EMOJI.to_vec());
+
+        tracing::info!("Loaded {} fonts (with emoji support)", font_system.db().faces().count());
+
+        let swash_cache = SwashCache::new();
+        let text_cache = Cache::new(&device);
+        let mut viewport = Viewport::new(&device, &text_cache);
+        viewport.update(
+            &queue,
+            Resolution {
+                width: size.width,
+                height: size.height,
+            },
+        );
+
+        // Use Accurate color mode for proper emoji rendering
+        let mut text_atlas = TextAtlas::with_color_mode(
+            &device,
+            &queue,
+            &text_cache,
+            surface_format,
+            glyphon::ColorMode::Accurate,
+        );
+
+        let text_renderer = TextRenderer::new(
+            &mut text_atlas,
+            &device,
+            wgpu::MultisampleState::default(),
+            None,
+        );
 
         // Create card renderer
         let card_renderer = CardRenderer::new(&device, surface_format, size.width, size.height);
@@ -431,7 +472,13 @@ impl Renderer {
             queue,
             config,
             size,
-            text_brush,
+            font_system,
+            swash_cache,
+            text_cache,
+            viewport,
+            text_atlas,
+            text_renderer,
+            text_queue: TextQueue::new(),
             card_renderer,
             sprite_renderer,
             ui_scale,
@@ -517,14 +564,77 @@ impl Renderer {
         }
     }
 
+    /// Word wrap text to fit within a given width
+    fn wrap_text(&self, text: &str, max_width: f32, font_size: f32) -> Vec<String> {
+        let approx_char_width = font_size * 0.5;
+        let max_chars = (max_width / approx_char_width) as usize;
+        if max_chars == 0 {
+            return vec![text.to_string()];
+        }
+
+        let mut lines = Vec::new();
+        for paragraph in text.split('\n') {
+            let words: Vec<&str> = paragraph.split_whitespace().collect();
+            if words.is_empty() {
+                lines.push(String::new());
+                continue;
+            }
+
+            let mut current_line = String::new();
+            let mut current_len = 0usize;
+            for word in words {
+                let word_len = word.chars().count();
+                if current_line.is_empty() {
+                    if word_len > max_chars {
+                        // Word too long, split it by chars
+                        let mut chars = word.chars().peekable();
+                        while chars.peek().is_some() {
+                            let chunk: String = chars.by_ref().take(max_chars).collect();
+                            if chars.peek().is_some() {
+                                lines.push(chunk);
+                            } else {
+                                current_line = chunk;
+                                current_len = current_line.chars().count();
+                            }
+                        }
+                    } else {
+                        current_line = word.to_string();
+                        current_len = word_len;
+                    }
+                } else if current_len + 1 + word_len <= max_chars {
+                    current_line.push(' ');
+                    current_line.push_str(word);
+                    current_len += 1 + word_len;
+                } else {
+                    lines.push(current_line);
+                    current_line = word.to_string();
+                    current_len = word_len;
+                }
+            }
+            if !current_line.is_empty() {
+                lines.push(current_line);
+            }
+        }
+
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines
+    }
+
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
             self.size = new_size;
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
-            self.text_brush
-                .resize_view(new_size.width as f32, new_size.height as f32, &self.queue);
+            self.viewport.update(
+                &self.queue,
+                Resolution {
+                    width: new_size.width,
+                    height: new_size.height,
+                },
+            );
             self.card_renderer
                 .resize(&self.queue, new_size.width, new_size.height);
             self.sprite_renderer
@@ -534,6 +644,49 @@ impl Renderer {
             self.scene_texture = None;
             self.blur_texture = None;
             tracing::debug!("Resized to {}x{}", new_size.width, new_size.height);
+        }
+    }
+
+    /// Take queued text, prepare buffers, and upload to GPU
+    /// Returns PreparedText that must be kept alive until after render
+    fn prepare_text(&mut self) -> PreparedText {
+        let requests = self.text_queue.take();
+        let screen_width = self.size.width as f32;
+        let screen_height = self.size.height as f32;
+
+        // Update viewport for current screen size
+        self.viewport.update(
+            &self.queue,
+            Resolution {
+                width: self.size.width,
+                height: self.size.height,
+            },
+        );
+
+        let prepared = PreparedText::prepare(requests, &mut self.font_system, screen_width);
+
+        if let Err(e) = prepared.upload(
+            &self.device,
+            &self.queue,
+            &mut self.font_system,
+            &mut self.swash_cache,
+            &mut self.text_atlas,
+            &self.viewport,
+            &mut self.text_renderer,
+            screen_width,
+            screen_height,
+        ) {
+            tracing::error!("Failed to prepare text: {:?}", e);
+        }
+
+        prepared
+    }
+
+    /// Render text in the current render pass
+    /// PreparedText must be the result of the most recent prepare_text() call
+    fn render_text<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>) {
+        if let Err(e) = self.text_renderer.render(&self.text_atlas, &self.viewport, render_pass) {
+            tracing::error!("Failed to render text: {:?}", e);
         }
     }
 
@@ -562,6 +715,8 @@ impl Renderer {
             MainMenu(usize),
             Settings(usize),
             UiScale(usize),
+            Permission { selected: usize, command: String, prefix: String },
+            Execute(usize),
         }
 
         let (base_state, modal_type) = match state {
@@ -589,6 +744,16 @@ impl Renderer {
                 };
                 (actual_base, Some(ModalType::UiScale(*selected_item)))
             }
+            AppState::PermissionModal { previous_state, selected_choice, command, command_prefix, .. } => {
+                (previous_state.as_ref(), Some(ModalType::Permission {
+                    selected: *selected_choice,
+                    command: command.clone(),
+                    prefix: command_prefix.clone(),
+                }))
+            }
+            AppState::ExecuteModal { previous_state, selected_option } => {
+                (previous_state.as_ref(), Some(ModalType::Execute(*selected_option)))
+            }
             _ => (state, None),
         };
 
@@ -603,7 +768,7 @@ impl Renderer {
             AppState::PalaceLoop { cards, focused_index, .. } => {
                 self.build_suggestion_cards(cards, *focused_index)
             }
-            AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } => Vec::new(),
+            AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } | AppState::PermissionModal { .. } | AppState::ExecuteModal { .. } => Vec::new(),
         };
 
         // When modal is open, render base scene then overlay + modal
@@ -644,11 +809,14 @@ impl Renderer {
                 AppState::ProjectView { project_path, selected_action } => {
                     self.queue_project_view_text(project_path, *selected_action);
                 }
-                AppState::PalaceLoop { cards, current_tool, .. } => {
-                    self.queue_palace_loop_text(cards, current_tool.as_deref());
+                AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, detail_scroll_offset, .. } => {
+                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *detail_scroll_offset);
                 }
-                AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } => {}
+                AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } | AppState::PermissionModal { .. } | AppState::ExecuteModal { .. } => {}
             }
+
+            // Prepare base text for Pass 1
+            let _base_text = self.prepare_text();
 
             let mut encoder = self
                 .device
@@ -684,7 +852,7 @@ impl Renderer {
                         .draw(&mut render_pass, &self.queue, &sprites);
                 }
 
-                self.text_brush.draw(&mut render_pass);
+                self.render_text(&mut render_pass);
             }
 
             // Pass 2: Draw dark overlay + modal
@@ -693,7 +861,12 @@ impl Renderer {
                 ModalType::MainMenu(selected) => self.queue_main_menu_text(*selected),
                 ModalType::Settings(selected) => self.queue_settings_modal_text(*selected),
                 ModalType::UiScale(selected) => self.queue_ui_scale_modal_text(*selected),
+                ModalType::Permission { selected, command, prefix } => self.queue_permission_modal_text(*selected, command, prefix),
+                ModalType::Execute(selected) => self.queue_execute_modal_text(*selected),
             }
+
+            // Prepare modal text for Pass 2
+            let _modal_text = self.prepare_text();
 
             // Fullscreen dark overlay card + modal cards
             let mut modal_cards = vec![
@@ -706,6 +879,8 @@ impl Renderer {
                 ModalType::MainMenu(selected) => modal_cards.extend(self.build_main_menu_cards(*selected)),
                 ModalType::Settings(selected) => modal_cards.extend(self.build_settings_modal_cards(*selected)),
                 ModalType::UiScale(selected) => modal_cards.extend(self.build_ui_scale_modal_cards(*selected)),
+                ModalType::Permission { selected, command, prefix: _ } => modal_cards.extend(self.build_permission_modal_cards(*selected, command)),
+                ModalType::Execute(selected) => modal_cards.extend(self.build_execute_modal_cards(*selected)),
             }
 
             {
@@ -729,13 +904,21 @@ impl Renderer {
                 self.card_renderer
                     .draw(&mut render_pass, &self.queue, &modal_cards);
 
+                // Build sprites: help sprites + modal-specific sprites
+                let mut sprites = Vec::new();
                 if self.gamepad_connected {
-                    let sprites = self.build_help_sprites(state);
+                    sprites.extend(self.build_help_sprites(state));
+                }
+                // Add permission modal button glyphs (always show, not just gamepad)
+                if let ModalType::Permission { command, .. } = modal {
+                    sprites.extend(self.build_permission_modal_sprites(command));
+                }
+                if !sprites.is_empty() {
                     self.sprite_renderer
                         .draw(&mut render_pass, &self.queue, &sprites);
                 }
 
-                self.text_brush.draw(&mut render_pass);
+                self.render_text(&mut render_pass);
             }
 
             // If screenshot, blit to surface and capture
@@ -828,13 +1011,18 @@ impl Renderer {
                 AppState::ProjectView { project_path, selected_action } => {
                     self.queue_project_view_text(project_path, *selected_action);
                 }
-                AppState::PalaceLoop { cards, current_tool, .. } => {
-                    self.queue_palace_loop_text(cards, current_tool.as_deref());
+                AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, detail_scroll_offset, .. } => {
+                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *detail_scroll_offset);
                 }
                 AppState::MainMenu { .. } => {}
                 AppState::SettingsMenu { .. } => {}
                 AppState::UiScaleMenu { .. } => {}
+                AppState::PermissionModal { .. } => {}
+                AppState::ExecuteModal { .. } => {}
             }
+
+            // Prepare text
+            let _prepared = self.prepare_text();
 
             let screenshot_texture = self.screenshot_texture.as_ref().unwrap();
             let screenshot_view = screenshot_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -872,7 +1060,7 @@ impl Renderer {
                         .draw(&mut render_pass, &self.queue, &sprites);
                 }
 
-                self.text_brush.draw(&mut render_pass);
+                self.render_text(&mut render_pass);
             }
 
             // Blit to surface
@@ -935,13 +1123,18 @@ impl Renderer {
                 AppState::ProjectView { project_path, selected_action } => {
                     self.queue_project_view_text(project_path, *selected_action);
                 }
-                AppState::PalaceLoop { cards, current_tool, .. } => {
-                    self.queue_palace_loop_text(cards, current_tool.as_deref());
+                AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, detail_scroll_offset, .. } => {
+                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *detail_scroll_offset);
                 }
                 AppState::MainMenu { .. } => {}
                 AppState::SettingsMenu { .. } => {}
                 AppState::UiScaleMenu { .. } => {}
+                AppState::PermissionModal { .. } => {}
+                AppState::ExecuteModal { .. } => {}
             }
+
+            // Prepare text
+            let _prepared = self.prepare_text();
 
             let mut encoder = self
                 .device
@@ -976,7 +1169,7 @@ impl Renderer {
                         .draw(&mut render_pass, &self.queue, &sprites);
                 }
 
-                self.text_brush.draw(&mut render_pass);
+                self.render_text(&mut render_pass);
             }
 
             self.queue.submit(std::iter::once(encoder.finish()));
@@ -1176,11 +1369,9 @@ impl Renderer {
     fn queue_main_menu_text(&mut self, selected: usize) {
         use crate::state::MainMenuItem;
 
-        // Must match modal dimensions from build_main_menu_cards
         let modal_width = self.ui_scale.px(400.0).min(self.size.width as f32 - 40.0);
-        let modal_height = self.ui_scale.px(220.0);
         let modal_x = (self.size.width as f32 - modal_width) / 2.0;
-        let modal_y = (self.size.height as f32 - modal_height) / 2.0;
+        let modal_y = (self.size.height as f32 - self.ui_scale.px(220.0)) / 2.0;
 
         let scale = self.ui_scale.px(26.0);
         let inner_padding = self.ui_scale.px(20.0);
@@ -1189,36 +1380,31 @@ impl Renderer {
         let card_gap = self.ui_scale.px(10.0);
         let text_padding = self.ui_scale.px(12.0);
 
-        let mut sections = Vec::new();
-
-        // Menu items (no title)
         let items = MainMenuItem::all();
         let card_start_y = modal_y + title_height;
 
         for (i, item) in items.iter().enumerate() {
             let y = card_start_y + i as f32 * (card_height + card_gap) + text_padding;
-            let is_selected = i == selected;
-
-            let label_color = if is_selected {
+            let label_color = if i == selected {
                 [1.0, 1.0, 1.0, 1.0]
             } else {
                 [0.8, 0.8, 0.9, 1.0]
             };
 
-            // Center the text in the card
-            sections.push(
-                Section::default()
-                    .add_text(
-                        Text::new(item.label())
-                            .with_scale(scale)
-                            .with_color(label_color),
-                    )
-                    .with_screen_position((modal_x + inner_padding + self.ui_scale.px(15.0), y))
-                    .with_layout(Layout::default()),
+            self.text_queue.push(
+                item.label(),
+                modal_x + inner_padding + self.ui_scale.px(15.0),
+                y,
+                scale,
+                label_color,
             );
         }
 
-        let _ = self.text_brush.queue(&self.device, &self.queue, sections);
+        let help_state = AppState::MainMenu {
+            selected_item: selected,
+            previous_state: Box::new(AppState::project_chooser()),
+        };
+        self.queue_help_legend(&help_state);
     }
 
     fn build_settings_modal_cards(&self, selected: usize) -> Vec<CardInstance> {
@@ -1278,7 +1464,6 @@ impl Renderer {
     fn queue_settings_modal_text(&mut self, selected: usize) {
         use crate::state::SettingsItem;
 
-        // Must match modal dimensions from build_settings_modal_cards
         let modal_width = self.ui_scale.px(500.0).min(self.size.width as f32 - 40.0);
         let modal_height = self.ui_scale.px(250.0);
         let modal_x = (self.size.width as f32 - modal_width) / 2.0;
@@ -1292,21 +1477,8 @@ impl Renderer {
         let card_gap = self.ui_scale.px(12.0);
         let text_padding = self.ui_scale.px(18.0);
 
-        // NOTE: Modal text is ADDED to existing sections from base state
-        // We queue these separately after base state text
-        let mut sections = Vec::new();
-
         // Modal title
-        sections.push(
-            Section::default()
-                .add_text(
-                    Text::new("Settings")
-                        .with_scale(title_scale)
-                        .with_color([0.8, 0.9, 1.0, 1.0]),
-                )
-                .with_screen_position((modal_x + inner_padding, modal_y + self.ui_scale.px(12.0)))
-                .with_layout(Layout::default()),
-        );
+        self.text_queue.push("Settings", modal_x + inner_padding, modal_y + self.ui_scale.px(12.0), title_scale, [0.8, 0.9, 1.0, 1.0]);
 
         // Settings items
         let items = SettingsItem::all();
@@ -1314,44 +1486,36 @@ impl Renderer {
 
         for (i, item) in items.iter().enumerate() {
             let y = card_start_y + i as f32 * (card_height + card_gap) + text_padding;
-            let is_selected = i == selected;
-
-            let label_color = if is_selected {
+            let label_color = if i == selected {
                 [1.0, 1.0, 1.0, 1.0]
             } else {
                 [0.8, 0.8, 0.9, 1.0]
             };
 
-            // Item label
-            sections.push(
-                Section::default()
-                    .add_text(
-                        Text::new(item.label())
-                            .with_scale(scale)
-                            .with_color(label_color),
-                    )
-                    .with_screen_position((modal_x + inner_padding + self.ui_scale.px(15.0), y))
-                    .with_layout(Layout::default()),
-            );
+            self.text_queue.push(item.label(), modal_x + inner_padding + self.ui_scale.px(15.0), y, scale, label_color);
 
             // Value indicator on right side
             let value_text = match item {
                 SettingsItem::DarkMode => if self.dark_mode { "ON" } else { "OFF" },
-                SettingsItem::UiScale => "100%", // TODO: Get actual settings value
+                SettingsItem::UiScale => "100%",
             };
-            sections.push(
-                Section::default()
-                    .add_text(
-                        Text::new(value_text)
-                            .with_scale(scale * 0.85)
-                            .with_color([0.5, 0.8, 0.9, 1.0]),
-                    )
-                    .with_screen_position((modal_x + modal_width - inner_padding - self.ui_scale.px(60.0), y))
-                    .with_layout(Layout::default()),
+            self.text_queue.push(
+                value_text,
+                modal_x + modal_width - inner_padding - self.ui_scale.px(60.0),
+                y,
+                scale * 0.85,
+                [0.5, 0.8, 0.9, 1.0],
             );
         }
 
-        let _ = self.text_brush.queue(&self.device, &self.queue, sections);
+        let help_state = AppState::SettingsMenu {
+            selected_item: selected,
+            previous_state: Box::new(AppState::MainMenu {
+                selected_item: 0,
+                previous_state: Box::new(AppState::project_chooser()),
+            }),
+        };
+        self.queue_help_legend(&help_state);
     }
 
     fn build_ui_scale_modal_cards(&self, selected: usize) -> Vec<CardInstance> {
@@ -1407,9 +1571,136 @@ impl Renderer {
         cards
     }
 
+    fn build_permission_modal_cards(&self, selected: usize, command: &str) -> Vec<CardInstance> {
+        use crate::state::PermissionChoice;
+        let items = PermissionChoice::all();
+
+        // Dynamic modal dimensions based on command length
+        let max_width = self.ui_scale.px(800.0).min(self.size.width as f32 * 0.9);
+        let min_width = self.ui_scale.px(400.0);
+        let inner_padding = self.ui_scale.px(20.0);
+        let command_scale = self.ui_scale.px(16.0);
+
+        // Estimate chars per line (monospace ~0.6 width ratio)
+        let char_width = command_scale * 0.55;
+        let usable_width = max_width - inner_padding * 2.0;
+        let chars_per_line = (usable_width / char_width).floor() as usize;
+        let command_lines = ((command.len() as f32) / chars_per_line as f32).ceil() as usize;
+        let command_lines = command_lines.max(1).min(10); // Cap at 10 lines
+
+        // Calculate width based on command (but capped)
+        let command_text_width = (command.len().min(chars_per_line) as f32 * char_width) + inner_padding * 2.0;
+        let modal_width = command_text_width.max(min_width).min(max_width);
+
+        let item_count = items.len() as f32;
+        let card_height = self.ui_scale.px(50.0);
+        let card_gap = self.ui_scale.px(8.0);
+        let title_height = self.ui_scale.px(50.0);
+        let line_height = command_scale * 1.4;
+        let command_height = line_height * command_lines as f32 + self.ui_scale.px(20.0);
+        let modal_height = title_height + command_height + inner_padding + item_count * (card_height + card_gap);
+        let modal_x = (self.size.width as f32 - modal_width) / 2.0;
+        let modal_y = (self.size.height as f32 - modal_height) / 2.0;
+
+        let mut cards = Vec::new();
+
+        // Modal background card - OLED black with warning border
+        cards.push(
+            CardInstance::new(modal_x, modal_y, modal_width, modal_height, [1.0, 0.6, 0.2, 1.0]) // Orange warning border
+                .with_border_width(self.ui_scale.px(2.0))
+                .with_corner_radius(self.ui_scale.px(16.0))
+        );
+
+        // Choice option cards
+        let card_start_y = modal_y + title_height + command_height;
+        let card_width = modal_width - inner_padding * 2.0;
+
+        // Leave space for glyph on left side of each card
+        let glyph_space = self.ui_scale.px(50.0);
+        let card_content_width = card_width - glyph_space;
+
+        for (i, _item) in items.iter().enumerate() {
+            let y = card_start_y + i as f32 * (card_height + card_gap);
+            let is_selected = i == selected;
+
+            // Color based on choice type (matches Xbox button colors)
+            let choice_color = match i {
+                0 => [0.25, 0.55, 0.25, 1.0], // A = Green (Yes once)
+                1 => [0.2, 0.35, 0.6, 1.0],   // X = Blue (Yes always)
+                2 => [0.6, 0.2, 0.2, 1.0],    // B = Red (No)
+                _ => [0.55, 0.5, 0.15, 1.0],  // Y = Yellow (Suggest else)
+            };
+
+            let mut card = CardInstance::new(
+                modal_x + inner_padding + glyph_space,
+                y,
+                card_content_width,
+                card_height,
+                choice_color
+            )
+                .with_border_width(self.ui_scale.px(if is_selected { 3.0 } else { 1.5 }))
+                .with_corner_radius(self.ui_scale.px(10.0));
+
+            if is_selected {
+                card = card.selected();
+            }
+
+            cards.push(card);
+        }
+
+        cards
+    }
+
+    /// Build sprites for permission modal (button glyphs next to each option)
+    fn build_permission_modal_sprites(&self, command: &str) -> Vec<SpriteInstance> {
+        use crate::state::PermissionChoice;
+        let items = PermissionChoice::all();
+
+        // Same sizing as build_permission_modal_cards
+        let max_width = self.ui_scale.px(800.0).min(self.size.width as f32 * 0.9);
+        let min_width = self.ui_scale.px(400.0);
+        let inner_padding = self.ui_scale.px(20.0);
+        let command_scale = self.ui_scale.px(16.0);
+
+        let char_width = command_scale * 0.55;
+        let usable_width = max_width - inner_padding * 2.0;
+        let chars_per_line = (usable_width / char_width).floor() as usize;
+        let command_lines = ((command.len() as f32) / chars_per_line as f32).ceil() as usize;
+        let command_lines = command_lines.max(1).min(10);
+
+        let command_text_width = (command.len().min(chars_per_line) as f32 * char_width) + inner_padding * 2.0;
+        let modal_width = command_text_width.max(min_width).min(max_width);
+
+        let card_height = self.ui_scale.px(50.0);
+        let card_gap = self.ui_scale.px(8.0);
+        let title_height = self.ui_scale.px(50.0);
+        let line_height = command_scale * 1.4;
+        let command_height = line_height * command_lines as f32 + self.ui_scale.px(20.0);
+        let modal_height = title_height + command_height + inner_padding + items.len() as f32 * (card_height + card_gap);
+        let modal_x = (self.size.width as f32 - modal_width) / 2.0;
+        let modal_y = (self.size.height as f32 - modal_height) / 2.0;
+
+        let card_start_y = modal_y + title_height + command_height;
+        let glyph_size = self.ui_scale.px(36.0);
+
+        let mut sprites = Vec::new();
+
+        // Button glyph for each option
+        let buttons = [XboxButton::A, XboxButton::X, XboxButton::B, XboxButton::Y];
+        for (i, button) in buttons.iter().enumerate() {
+            if i >= items.len() { break; }
+            let y = card_start_y + i as f32 * (card_height + card_gap);
+            let glyph_x = modal_x + inner_padding + self.ui_scale.px(6.0);
+            let glyph_y = y + (card_height - glyph_size) / 2.0;
+
+            sprites.push(SpriteInstance::new(glyph_x, glyph_y, glyph_size, *button));
+        }
+
+        sprites
+    }
+
     fn queue_ui_scale_modal_text(&mut self, selected: usize) {
         use crate::state::UiScaleOption;
-        use wgpu_text::glyph_brush::{Layout, Section, Text};
 
         let items = UiScaleOption::all();
 
@@ -1429,18 +1720,13 @@ impl Renderer {
         let text_padding = self.ui_scale.px(14.0);
         let card_start_y = modal_y + title_height;
 
-        let mut sections = Vec::new();
-
         // Modal title
-        sections.push(
-            Section::default()
-                .add_text(
-                    Text::new("UI Scale")
-                        .with_scale(title_scale)
-                        .with_color([0.8, 0.9, 1.0, 1.0]),
-                )
-                .with_screen_position((modal_x + inner_padding, modal_y + self.ui_scale.px(12.0)))
-                .with_layout(Layout::default()),
+        self.text_queue.push(
+            "UI Scale",
+            modal_x + inner_padding,
+            modal_y + self.ui_scale.px(12.0),
+            title_scale,
+            [0.8, 0.9, 1.0, 1.0],
         );
 
         // Scale options
@@ -1455,33 +1741,271 @@ impl Renderer {
             };
 
             // Option label
-            sections.push(
-                Section::default()
-                    .add_text(
-                        Text::new(item.label())
-                            .with_scale(scale)
-                            .with_color(label_color),
-                    )
-                    .with_screen_position((modal_x + inner_padding + self.ui_scale.px(15.0), y))
-                    .with_layout(Layout::default()),
+            self.text_queue.push(
+                item.label(),
+                modal_x + inner_padding + self.ui_scale.px(15.0),
+                y,
+                scale,
+                label_color,
             );
 
             // Show current indicator if this is the current scale
             if item.value() == self.ui_scale.dpi_scale {
-                sections.push(
-                    Section::default()
-                        .add_text(
-                            Text::new("(current)")
-                                .with_scale(scale * 0.7)
-                                .with_color([0.5, 0.7, 0.5, 1.0]),
-                        )
-                        .with_screen_position((modal_x + modal_width - inner_padding - self.ui_scale.px(80.0), y))
-                        .with_layout(Layout::default()),
+                self.text_queue.push(
+                    "(current)",
+                    modal_x + modal_width - inner_padding - self.ui_scale.px(80.0),
+                    y,
+                    scale * 0.7,
+                    [0.5, 0.7, 0.5, 1.0],
                 );
             }
         }
 
-        let _ = self.text_brush.queue(&self.device, &self.queue, sections);
+        // Add help legend for modal state
+        let help_state = AppState::UiScaleMenu {
+            selected_item: selected,
+            previous_state: Box::new(AppState::SettingsMenu {
+                selected_item: 0,
+                previous_state: Box::new(AppState::MainMenu {
+                    selected_item: 0,
+                    previous_state: Box::new(AppState::project_chooser()),
+                }),
+            }),
+        };
+        self.queue_help_legend(&help_state);
+    }
+
+    fn queue_permission_modal_text(&mut self, selected: usize, command: &str, prefix: &str) {
+        use crate::state::PermissionChoice;
+
+        let items = PermissionChoice::all();
+
+        // Dynamic modal dimensions - must match build_permission_modal_cards
+        let max_width = self.ui_scale.px(800.0).min(self.size.width as f32 * 0.9);
+        let min_width = self.ui_scale.px(400.0);
+        let inner_padding = self.ui_scale.px(20.0);
+        let command_scale = self.ui_scale.px(16.0);
+
+        // Estimate chars per line (monospace ~0.6 width ratio)
+        let char_width = command_scale * 0.55;
+        let usable_width = max_width - inner_padding * 2.0;
+        let chars_per_line = (usable_width / char_width).floor() as usize;
+        let command_lines = ((command.len() as f32) / chars_per_line as f32).ceil() as usize;
+        let command_lines = command_lines.max(1).min(10); // Cap at 10 lines
+
+        // Calculate width based on command (but capped)
+        let command_text_width = (command.len().min(chars_per_line) as f32 * char_width) + inner_padding * 2.0;
+        let modal_width = command_text_width.max(min_width).min(max_width);
+
+        let item_count = items.len() as f32;
+        let card_height = self.ui_scale.px(50.0);
+        let card_gap = self.ui_scale.px(8.0);
+        let title_height = self.ui_scale.px(50.0);
+        let line_height = command_scale * 1.4;
+        let command_height = line_height * command_lines as f32 + self.ui_scale.px(20.0);
+        let modal_height = title_height + command_height + inner_padding + item_count * (card_height + card_gap);
+        let modal_x = (self.size.width as f32 - modal_width) / 2.0;
+        let modal_y = (self.size.height as f32 - modal_height) / 2.0;
+
+        let scale = self.ui_scale.px(22.0);
+        let title_scale = self.ui_scale.px(28.0);
+        let text_padding = self.ui_scale.px(14.0);
+        let card_start_y = modal_y + title_height + command_height;
+
+        // Modal title
+        self.text_queue.push(
+            "⚠️ Permission Required",
+            modal_x + inner_padding,
+            modal_y + self.ui_scale.px(12.0),
+            title_scale,
+            [1.0, 0.8, 0.3, 1.0], // Warning yellow
+        );
+
+        // Command display (full text with wrapping)
+        let text_area_width = modal_width - inner_padding * 2.0;
+        self.text_queue.push_bounded(
+            command,
+            modal_x + inner_padding,
+            modal_y + title_height + self.ui_scale.px(5.0),
+            command_scale,
+            [0.7, 0.9, 1.0, 1.0], // Command in light blue
+            text_area_width,
+            command_height,
+        );
+
+        // Pre-collect labels to avoid lifetime issues
+        let labels: Vec<String> = items.iter().map(|item| item.label(prefix)).collect();
+
+        // Space for glyph on left side (must match build_permission_modal_cards)
+        let glyph_space = self.ui_scale.px(50.0);
+
+        // Choice options (text positioned after glyph)
+        for (i, label) in labels.iter().enumerate() {
+            let y = card_start_y + i as f32 * (card_height + card_gap) + text_padding;
+            let is_selected = i == selected;
+
+            let label_color = if is_selected {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                [0.8, 0.8, 0.9, 1.0]
+            };
+
+            // Option label (positioned after glyph space)
+            self.text_queue.push(
+                label,
+                modal_x + inner_padding + glyph_space + self.ui_scale.px(10.0),
+                y,
+                scale,
+                label_color,
+            );
+        }
+
+        // Add help legend for modal state
+        let help_state = AppState::PermissionModal {
+            command: command.to_string(),
+            command_prefix: prefix.to_string(),
+            selected_choice: selected,
+            previous_state: Box::new(AppState::PalaceLoop {
+                project_path: std::path::PathBuf::new(),
+                cards: Vec::new(),
+                focused_index: 0,
+                generating: false,
+                current_tool: None,
+                tool_log: Vec::new(),
+                thought_log: Vec::new(),
+                log_scroll_offset: 0,
+                detail_scroll_offset: 0.0,
+            }),
+        };
+        self.queue_help_legend(&help_state);
+    }
+
+    fn build_execute_modal_cards(&self, selected: usize) -> Vec<CardInstance> {
+        use crate::state::ExecuteOption;
+        let items = ExecuteOption::all();
+
+        // Modal dimensions - centered on screen
+        let modal_width = self.ui_scale.px(400.0).min(self.size.width as f32 - 40.0);
+        let item_count = items.len() as f32;
+        let card_height = self.ui_scale.px(50.0);
+        let card_gap = self.ui_scale.px(8.0);
+        let inner_padding = self.ui_scale.px(20.0);
+        let title_height = self.ui_scale.px(50.0);
+        let modal_height = title_height + inner_padding + item_count * (card_height + card_gap);
+        let modal_x = (self.size.width as f32 - modal_width) / 2.0;
+        let modal_y = (self.size.height as f32 - modal_height) / 2.0;
+
+        let mut cards = Vec::new();
+
+        // Modal background card - OLED black with green border (execute = go)
+        cards.push(
+            CardInstance::new(modal_x, modal_y, modal_width, modal_height, [0.3, 0.8, 0.4, 1.0])
+                .with_border_width(self.ui_scale.px(2.0))
+                .with_corner_radius(self.ui_scale.px(16.0))
+        );
+
+        // Execute option cards
+        let card_start_y = modal_y + title_height;
+        let card_width = modal_width - inner_padding * 2.0;
+
+        for (i, item) in items.iter().enumerate() {
+            let y = card_start_y + i as f32 * (card_height + card_gap);
+            let is_selected = i == selected;
+
+            // Color based on option type
+            let option_color = match item {
+                ExecuteOption::Claude => [0.4, 0.5, 0.7, 1.0],    // Blue for Claude
+                ExecuteOption::ZAi => [0.5, 0.3, 0.7, 1.0],       // Purple for Z.ai
+                ExecuteOption::ZAiTurbo => [0.7, 0.3, 0.5, 1.0],  // Magenta for Turbo
+            };
+
+            let mut card = CardInstance::new(
+                modal_x + inner_padding,
+                y,
+                card_width,
+                card_height,
+                option_color
+            )
+                .with_border_width(self.ui_scale.px(if is_selected { 3.0 } else { 1.5 }))
+                .with_corner_radius(self.ui_scale.px(10.0));
+
+            if is_selected {
+                card = card.selected();
+            }
+
+            cards.push(card);
+        }
+
+        cards
+    }
+
+    fn queue_execute_modal_text(&mut self, selected: usize) {
+        use crate::state::ExecuteOption;
+
+        let items = ExecuteOption::all();
+
+        // Modal dimensions - match build_execute_modal_cards
+        let modal_width = self.ui_scale.px(400.0).min(self.size.width as f32 - 40.0);
+        let item_count = items.len() as f32;
+        let card_height = self.ui_scale.px(50.0);
+        let card_gap = self.ui_scale.px(8.0);
+        let inner_padding = self.ui_scale.px(20.0);
+        let title_height = self.ui_scale.px(50.0);
+        let modal_height = title_height + inner_padding + item_count * (card_height + card_gap);
+        let modal_x = (self.size.width as f32 - modal_width) / 2.0;
+        let modal_y = (self.size.height as f32 - modal_height) / 2.0;
+
+        let scale = self.ui_scale.px(22.0);
+        let title_scale = self.ui_scale.px(28.0);
+        let text_padding = self.ui_scale.px(14.0);
+        let card_start_y = modal_y + title_height;
+
+        // Modal title
+        self.text_queue.push(
+            "Execute Selected",
+            modal_x + inner_padding,
+            modal_y + self.ui_scale.px(12.0),
+            title_scale,
+            [0.8, 1.0, 0.9, 1.0],
+        );
+
+        // Execute options
+        for (i, item) in items.iter().enumerate() {
+            let y = card_start_y + i as f32 * (card_height + card_gap) + text_padding;
+            let is_selected = i == selected;
+
+            let label_color = if is_selected {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                [0.8, 0.8, 0.9, 1.0]
+            };
+
+            // Option label
+            self.text_queue.push(
+                item.label(),
+                modal_x + inner_padding + self.ui_scale.px(15.0),
+                y,
+                scale,
+                label_color,
+            );
+        }
+
+        // Add help legend for modal state
+        let help_state = AppState::ExecuteModal {
+            selected_option: selected,
+            previous_state: Box::new(AppState::PalaceLoop {
+                project_path: std::path::PathBuf::new(),
+                cards: Vec::new(),
+                focused_index: 0,
+                generating: false,
+                current_tool: None,
+                tool_log: Vec::new(),
+                thought_log: Vec::new(),
+                log_scroll_offset: 0,
+                detail_scroll_offset: 0.0,
+            }),
+        };
+        self.queue_help_legend(&help_state);
     }
 
     fn queue_project_chooser_text(&mut self, projects: &ProjectsConfig, selected: usize) {
@@ -1489,22 +2013,9 @@ impl Renderer {
         let title_scale = self.ui_scale.px(42.0);
         let left_margin = self.ui_scale.px(60.0);
         let top_margin = self.ui_scale.px(40.0);
-        let help_y = self.size.height as f32 - self.ui_scale.px(40.0);
-
-        // Build all sections - must queue ALL at once!
-        let mut sections = Vec::new();
 
         // Title
-        sections.push(
-            Section::default()
-                .add_text(
-                    Text::new("PALACE")
-                        .with_scale(title_scale)
-                        .with_color([0.8, 0.6, 1.0, 1.0]),
-                )
-                .with_screen_position((left_margin, top_margin))
-                .with_layout(Layout::default()),
-        );
+        self.text_queue.push("PALACE", left_margin, top_margin, title_scale, [0.8, 0.6, 1.0, 1.0]);
 
         // Subtitle
         let subtitle = if projects.projects.is_empty() {
@@ -1512,16 +2023,8 @@ impl Renderer {
         } else {
             "Projects"
         };
-        sections.push(
-            Section::default()
-                .add_text(
-                    Text::new(subtitle)
-                        .with_scale(scale * 0.6)
-                        .with_color(self.text_color_dim()),
-                )
-                .with_screen_position((left_margin, top_margin + title_scale + 8.0))
-                .with_layout(Layout::default()),
-        );
+        let dim_color = self.text_color_dim();
+        self.text_queue.push(subtitle, left_margin, top_margin + title_scale + 8.0, scale * 0.6, dim_color);
 
         // Grid for cards
         let grid = CardGrid::new(
@@ -1530,17 +2033,7 @@ impl Renderer {
             &self.ui_scale,
         );
 
-        // Pre-collect all strings to ensure they live long enough
-        let project_strings: Vec<_> = projects.projects.iter().map(|p| {
-            let description = if p.description.is_empty() {
-                p.path.to_string_lossy().to_string()
-            } else {
-                p.description.clone()
-            };
-            (p.name.clone(), description, p.languages.clone(), p.status)
-        }).collect();
-
-        for (i, (name, description, languages, status)) in project_strings.iter().enumerate() {
+        for (i, p) in projects.projects.iter().enumerate() {
             let (x, y) = grid.card_position(i);
             let is_selected = i == selected;
 
@@ -1550,75 +2043,57 @@ impl Renderer {
             // Project name
             let name_color = if is_selected {
                 self.text_color()
+            } else if self.dark_mode {
+                [0.85, 0.85, 0.9, 1.0]
             } else {
-                if self.dark_mode {
-                    [0.85, 0.85, 0.9, 1.0]
-                } else {
-                    [0.3, 0.3, 0.35, 1.0]
-                }
+                [0.3, 0.3, 0.35, 1.0]
             };
 
-            sections.push(
-                Section::default()
-                    .add_text(
-                        Text::new(name)
-                            .with_scale(name_scale)
-                            .with_color(name_color),
-                    )
-                    .with_screen_position((x + text_margin, y + text_margin))
-                    .with_bounds((grid.card_width - text_margin * 2.0, grid.card_height))
-                    .with_layout(Layout::default()),
+            self.text_queue.push_bounded(
+                &p.name,
+                x + text_margin,
+                y + text_margin,
+                name_scale,
+                name_color,
+                grid.card_width - text_margin * 2.0,
+                grid.card_height,
             );
 
             // Description
+            let description = if p.description.is_empty() {
+                p.path.to_string_lossy().to_string()
+            } else {
+                p.description.clone()
+            };
             let desc_y = y + text_margin + name_scale + self.ui_scale.px(8.0);
-            sections.push(
-                Section::default()
-                    .add_text(
-                        Text::new(description)
-                            .with_scale(self.ui_scale.px(12.0))
-                            .with_color(self.text_color_dim()),
-                    )
-                    .with_screen_position((x + text_margin, desc_y))
-                    .with_bounds((grid.card_width - text_margin * 2.0, self.ui_scale.px(40.0)))
-                    .with_layout(Layout::default()),
+            let dim_color = self.text_color_dim();
+            self.text_queue.push_bounded(
+                &description,
+                x + text_margin,
+                desc_y,
+                self.ui_scale.px(12.0),
+                dim_color,
+                grid.card_width - text_margin * 2.0,
+                self.ui_scale.px(40.0),
             );
 
             // Languages at bottom of card
             let lang_y = y + grid.card_height - text_margin - self.ui_scale.px(16.0);
             let mut lang_x = x + text_margin;
 
-            for (li, lang) in languages.iter().enumerate() {
+            for (li, lang) in p.languages.iter().enumerate() {
                 if li > 0 {
-                    sections.push(
-                        Section::default()
-                            .add_text(
-                                Text::new(" + ")
-                                    .with_scale(self.ui_scale.px(12.0))
-                                    .with_color([0.4, 0.4, 0.45, 1.0]),
-                            )
-                            .with_screen_position((lang_x, lang_y))
-                            .with_layout(Layout::default()),
-                    );
+                    self.text_queue.push(" + ", lang_x, lang_y, self.ui_scale.px(12.0), [0.4, 0.4, 0.45, 1.0]);
                     lang_x += self.ui_scale.px(24.0);
                 }
 
                 let lang_color = crate::projects::language_color(lang);
-                sections.push(
-                    Section::default()
-                        .add_text(
-                            Text::new(lang)
-                                .with_scale(self.ui_scale.px(13.0))
-                                .with_color(lang_color),
-                        )
-                        .with_screen_position((lang_x, lang_y))
-                        .with_layout(Layout::default()),
-                );
+                self.text_queue.push(lang, lang_x, lang_y, self.ui_scale.px(13.0), lang_color);
                 lang_x += self.ui_scale.px(lang.len() as f32 * 8.0 + 8.0);
             }
 
             // Status indicator (top right)
-            let status_text = match status {
+            let status_text = match p.status {
                 crate::renderer::ProjectStatus::Unknown => "",
                 crate::renderer::ProjectStatus::Building => "BUILDING",
                 crate::renderer::ProjectStatus::Error => "ERROR",
@@ -1627,61 +2102,35 @@ impl Renderer {
             };
 
             if !status_text.is_empty() {
-                sections.push(
-                    Section::default()
-                        .add_text(
-                            Text::new(status_text)
-                                .with_scale(self.ui_scale.px(10.0))
-                                .with_color(status.color()),
-                        )
-                        .with_screen_position((
-                            x + grid.card_width - text_margin - self.ui_scale.px(60.0),
-                            y + text_margin,
-                        ))
-                        .with_layout(Layout::default()),
+                self.text_queue.push(
+                    status_text,
+                    x + grid.card_width - text_margin - self.ui_scale.px(60.0),
+                    y + text_margin,
+                    self.ui_scale.px(10.0),
+                    p.status.color(),
                 );
             }
         }
 
-        // Help text
-        let help_text = if self.gamepad_connected {
-            "  Navigate        Select      Back"
-        } else {
-            "[Arrows/WASD] Navigate  [Enter] Select  [Esc] Exit"
-        };
-        sections.push(
-            Section::default()
-                .add_text(
-                    Text::new(help_text)
-                        .with_scale(scale * 0.5)
-                        .with_color([0.35, 0.35, 0.4, 1.0]),
-                )
-                .with_screen_position((left_margin, help_y))
-                .with_layout(Layout::default()),
-        );
+        // Add help legend
+        self.queue_help_legend(&AppState::ProjectChooser { selected_index: selected });
 
         // Empty state message
         if projects.projects.is_empty() {
             let center_y = self.size.height as f32 / 2.0;
-            sections.push(
-                Section::default()
-                    .add_text(
-                        Text::new("Launch Palace from a project directory to add it")
-                            .with_scale(scale * 0.7)
-                            .with_color([0.5, 0.5, 0.6, 1.0]),
-                    )
-                    .with_screen_position((left_margin, center_y))
-                    .with_layout(Layout::default()),
+            self.text_queue.push(
+                "Launch Palace from a project directory to add it",
+                left_margin,
+                center_y,
+                scale * 0.7,
+                [0.5, 0.5, 0.6, 1.0],
             );
         }
-
-        let _ = self.text_brush.queue(&self.device, &self.queue, sections);
     }
 
     fn queue_project_view_text(&mut self, project_path: &std::path::Path, selected_action: usize) {
         use crate::state::ProjectAction;
 
-        let scale = self.ui_scale.px(32.0);
         let title_scale = self.ui_scale.px(36.0);
         let left_margin = self.ui_scale.px(60.0);
         let top_margin = self.ui_scale.px(40.0);
@@ -1689,42 +2138,25 @@ impl Renderer {
         let project_name = project_path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("Unknown")
-            .to_string();
-        let path_str = project_path.to_string_lossy().to_string();
+            .unwrap_or("Unknown");
+        let path_str = project_path.to_string_lossy();
 
         let actions = ProjectAction::all();
         let card_height = self.ui_scale.px(70.0);
         let card_gap = self.ui_scale.px(16.0);
         let menu_start_y = top_margin + title_scale + self.ui_scale.px(60.0);
         let text_margin = self.ui_scale.px(20.0);
-        let help_y = self.size.height as f32 - self.ui_scale.px(40.0);
-
-        // Build all sections - must queue ALL at once, not separately!
-        let mut sections = Vec::new();
 
         // Title
-        sections.push(
-            Section::default()
-                .add_text(
-                    Text::new(&project_name)
-                        .with_scale(title_scale)
-                        .with_color([1.0, 1.0, 1.0, 1.0]),
-                )
-                .with_screen_position((left_margin, top_margin))
-                .with_layout(Layout::default()),
-        );
+        self.text_queue.push(project_name, left_margin, top_margin, title_scale, [1.0, 1.0, 1.0, 1.0]);
 
         // Path subtitle
-        sections.push(
-            Section::default()
-                .add_text(
-                    Text::new(&path_str)
-                        .with_scale(self.ui_scale.px(14.0))
-                        .with_color([0.4, 0.4, 0.5, 1.0]),
-                )
-                .with_screen_position((left_margin, top_margin + title_scale + self.ui_scale.px(8.0)))
-                .with_layout(Layout::default()),
+        self.text_queue.push(
+            path_str.as_ref(),
+            left_margin,
+            top_margin + title_scale + self.ui_scale.px(8.0),
+            self.ui_scale.px(14.0),
+            [0.4, 0.4, 0.5, 1.0],
         );
 
         // Action labels and descriptions
@@ -1737,54 +2169,35 @@ impl Renderer {
                 [0.75, 0.75, 0.8, 1.0]
             };
 
-            sections.push(
-                Section::default()
-                    .add_text(
-                        Text::new(action.label())
-                            .with_scale(self.ui_scale.px(22.0))
-                            .with_color(label_color),
-                    )
-                    .with_screen_position((left_margin + text_margin, y + text_margin))
-                    .with_layout(Layout::default()),
+            self.text_queue.push(
+                action.label(),
+                left_margin + text_margin,
+                y + text_margin,
+                self.ui_scale.px(22.0),
+                label_color,
             );
 
-            sections.push(
-                Section::default()
-                    .add_text(
-                        Text::new(action.description())
-                            .with_scale(self.ui_scale.px(12.0))
-                            .with_color([0.45, 0.45, 0.5, 1.0]),
-                    )
-                    .with_screen_position((left_margin + text_margin, y + text_margin + self.ui_scale.px(28.0)))
-                    .with_layout(Layout::default()),
+            self.text_queue.push(
+                action.description(),
+                left_margin + text_margin,
+                y + text_margin + self.ui_scale.px(28.0),
+                self.ui_scale.px(12.0),
+                [0.45, 0.45, 0.5, 1.0],
             );
         }
 
-        // Help text
-        let help_text = if self.gamepad_connected {
-            "  Navigate        Select      Back"
-        } else {
-            "[Arrows] Navigate  [Enter] Select  [Backspace] Back"
+        // Add help legend
+        let help_state = AppState::ProjectView {
+            project_path: project_path.to_path_buf(),
+            selected_action,
         };
-        sections.push(
-            Section::default()
-                .add_text(
-                    Text::new(help_text)
-                        .with_scale(scale * 0.6)
-                        .with_color([0.4, 0.4, 0.5, 1.0]),
-                )
-                .with_screen_position((left_margin, help_y))
-                .with_layout(Layout::default()),
-        );
-
-        let _ = self.text_brush.queue(&self.device, &self.queue, sections);
+        self.queue_help_legend(&help_state);
     }
 
-    fn queue_palace_loop_text(&mut self, cards: &[SuggestionCard], current_tool: Option<&str>) {
+    fn queue_palace_loop_text(&mut self, cards: &[SuggestionCard], current_tool: Option<&str>, tool_log: &[String], thought_log: &[String], log_scroll: usize, _focused_index: usize, _detail_scroll: f32) {
         let title_scale = self.ui_scale.px(42.0);
         let left_margin = self.ui_scale.px(60.0);
         let top_margin = self.ui_scale.px(40.0);
-        let help_y = self.size.height as f32 - self.ui_scale.px(40.0);
 
         let grid = CardGrid::for_palace_loop(
             self.size.width as f32,
@@ -1792,21 +2205,11 @@ impl Renderer {
             &self.ui_scale,
         );
 
-        let mut sections = Vec::new();
-
         // Title
-        sections.push(
-            Section::default()
-                .add_text(
-                    Text::new("PALACE LOOP")
-                        .with_scale(title_scale)
-                        .with_color([0.8, 0.6, 1.0, 1.0]),
-                )
-                .with_screen_position((left_margin, top_margin))
-                .with_layout(Layout::default()),
-        );
+        self.text_queue.push("PALACE LOOP", left_margin, top_margin, title_scale, [0.8, 0.6, 1.0, 1.0]);
 
         // Subtitle with current tool if any
+        let subtitle_y = top_margin + title_scale + 8.0;
         let subtitle = if let Some(tool) = current_tool {
             format!("Analyzing... {}", tool)
         } else if cards.is_empty() {
@@ -1814,50 +2217,88 @@ impl Renderer {
         } else {
             format!("{} suggestions", cards.len())
         };
-        sections.push(
-            Section::default()
-                .add_text(
-                    Text::new(&subtitle)
-                        .with_scale(self.ui_scale.px(18.0))
-                        .with_color(self.text_color_dim()),
-                )
-                .with_screen_position((left_margin, top_margin + title_scale + 8.0))
-                .with_layout(Layout::default()),
-        );
+        let dim_color = self.text_color_dim();
+        self.text_queue.push(&subtitle, left_margin, subtitle_y, self.ui_scale.px(18.0), dim_color);
 
-        // Pre-collect strings that need to outlive the loop
-        let card_strings: Vec<_> = cards.iter().map(|card| {
-            let category_upper = card.category.to_uppercase();
-            let display_cmd = card.command.as_ref().map(|cmd| {
-                if cmd.len() > 40 {
-                    format!("$ {}...", &cmd[..37])
-                } else {
-                    format!("$ {}", cmd)
+        // Two-column waterfall logs (tools left, thoughts right)
+        let line_height = self.ui_scale.px(16.0);
+        let log_scale = self.ui_scale.px(13.0);
+        let log_y_start = subtitle_y + self.ui_scale.px(28.0);
+
+        // Calculate max lines to fill available screen height
+        let available_height = self.size.height as f32 - log_y_start - self.ui_scale.px(40.0);
+        let max_lines = (available_height / line_height).floor() as usize;
+
+        // Split screen: left half for tools, right half for thoughts
+        let screen_mid = self.size.width as f32 / 2.0;
+        let right_margin = self.ui_scale.px(40.0);
+        let approx_char_width = log_scale * 0.5;
+        let left_max_chars = ((screen_mid - left_margin - self.ui_scale.px(20.0)) / approx_char_width) as usize;
+        let right_max_chars = ((screen_mid - right_margin) / approx_char_width) as usize;
+
+        // Left column: Tool calls (with proper text measurement for wrapping)
+        let left_col_width = screen_mid - left_margin - self.ui_scale.px(20.0);
+        if !tool_log.is_empty() {
+            let visible_start = log_scroll.min(tool_log.len().saturating_sub(1));
+            let mut y_offset = 0.0;
+            let mut entry_idx = 0;
+            for entry in tool_log.iter().skip(visible_start) {
+                if y_offset >= available_height {
+                    break;
                 }
-            });
-            (category_upper, display_cmd)
-        }).collect();
+                // Measure how many lines this entry will take
+                let (_w, h, _lines) = crate::renderer::text::measure_text(
+                    &mut self.font_system,
+                    entry,
+                    log_scale,
+                    left_col_width,
+                );
+                let alpha = (0.7 - (entry_idx as f32 * 0.03)).max(0.25);
+                let y = log_y_start + y_offset;
+                self.text_queue.push_bounded(entry, left_margin, y, log_scale, [0.5, 0.7, 0.9, alpha], left_col_width, h);
+                y_offset += h;
+                entry_idx += 1;
+            }
+        }
+
+        // Right column: AI thoughts/commentary (with proper text measurement for wrapping)
+        let right_col_width = screen_mid - right_margin;
+        if !thought_log.is_empty() {
+            let visible_start = log_scroll.min(thought_log.len().saturating_sub(1));
+            let mut y_offset = 0.0;
+            let mut entry_idx = 0;
+            for entry in thought_log.iter().skip(visible_start) {
+                if y_offset >= available_height {
+                    break;
+                }
+                // Measure how many lines this entry will take
+                let (_w, h, _lines) = crate::renderer::text::measure_text(
+                    &mut self.font_system,
+                    entry,
+                    log_scale,
+                    right_col_width,
+                );
+                let alpha = (0.7 - (entry_idx as f32 * 0.03)).max(0.25);
+                let y = log_y_start + y_offset;
+                self.text_queue.push_bounded(entry, screen_mid + self.ui_scale.px(10.0), y, log_scale, [0.7, 0.6, 0.8, alpha], right_col_width, h);
+                y_offset += h;
+                entry_idx += 1;
+            }
+        }
 
         // Card text
         let text_margin = self.ui_scale.px(16.0);
         for (i, card) in cards.iter().enumerate() {
             let (x, y) = grid.card_position(i);
-            let (category_upper, display_cmd) = &card_strings[i];
 
             // Category badge (bottom right, near border)
             if !card.category.is_empty() {
-                sections.push(
-                    Section::default()
-                        .add_text(
-                            Text::new(category_upper)
-                                .with_scale(self.ui_scale.px(10.0))
-                                .with_color(card.color()),
-                        )
-                        .with_screen_position((
-                            x + grid.card_width - text_margin - self.ui_scale.px(40.0),
-                            y + grid.card_height - text_margin - self.ui_scale.px(12.0),
-                        ))
-                        .with_layout(Layout::default()),
+                self.text_queue.push(
+                    &card.category.to_uppercase(),
+                    x + grid.card_width - text_margin - self.ui_scale.px(40.0),
+                    y + grid.card_height - text_margin - self.ui_scale.px(12.0),
+                    self.ui_scale.px(10.0),
+                    card.color(),
                 );
             }
 
@@ -1872,192 +2313,161 @@ impl Renderer {
             } else {
                 &card.title
             };
-            sections.push(
-                Section::default()
-                    .add_text(
-                        Text::new(display_title)
-                            .with_scale(self.ui_scale.px(20.0))
-                            .with_color(title_color),
-                    )
-                    .with_screen_position((x + text_margin, y + text_margin))
-                    .with_bounds((grid.card_width - text_margin * 2.0, grid.card_height))
-                    .with_layout(Layout::default()),
+            self.text_queue.push_bounded(
+                display_title,
+                x + text_margin,
+                y + text_margin,
+                self.ui_scale.px(20.0),
+                title_color,
+                grid.card_width - text_margin * 2.0,
+                grid.card_height,
             );
 
             // Description
             if !card.description.is_empty() {
                 let desc_y = y + text_margin + self.ui_scale.px(28.0);
-                sections.push(
-                    Section::default()
-                        .add_text(
-                            Text::new(&card.description)
-                                .with_scale(self.ui_scale.px(12.0))
-                                .with_color(self.text_color_dim()),
-                        )
-                        .with_screen_position((x + text_margin, desc_y))
-                        .with_bounds((grid.card_width - text_margin * 2.0, self.ui_scale.px(60.0)))
-                        .with_layout(Layout::default()),
+                let dim_color = self.text_color_dim();
+                self.text_queue.push_bounded(
+                    &card.description,
+                    x + text_margin,
+                    desc_y,
+                    self.ui_scale.px(12.0),
+                    dim_color,
+                    grid.card_width - text_margin * 2.0,
+                    self.ui_scale.px(60.0),
                 );
             }
 
             // Command at bottom if present
-            if let Some(ref cmd) = display_cmd {
+            if let Some(ref cmd) = card.command {
+                let display_cmd = if cmd.len() > 40 {
+                    format!("$ {}...", &cmd[..37])
+                } else {
+                    format!("$ {}", cmd)
+                };
                 let cmd_y = y + grid.card_height - text_margin - self.ui_scale.px(16.0);
-                sections.push(
-                    Section::default()
-                        .add_text(
-                            Text::new(cmd)
-                                .with_scale(self.ui_scale.px(11.0))
-                                .with_color([0.4, 0.8, 0.5, 1.0]), // Green for commands
-                        )
-                        .with_screen_position((x + text_margin, cmd_y))
-                        .with_layout(Layout::default()),
-                );
+                self.text_queue.push(&display_cmd, x + text_margin, cmd_y, self.ui_scale.px(11.0), [0.4, 0.8, 0.5, 1.0]);
             }
 
             // Selected indicator (checkmark)
             if card.selected {
-                sections.push(
-                    Section::default()
-                        .add_text(
-                            Text::new("✓")
-                                .with_scale(self.ui_scale.px(24.0))
-                                .with_color([0.2, 1.0, 0.4, 1.0]),
-                        )
-                        .with_screen_position((
-                            x + grid.card_width - text_margin - self.ui_scale.px(24.0),
-                            y + grid.card_height - text_margin - self.ui_scale.px(24.0),
-                        ))
-                        .with_layout(Layout::default()),
+                self.text_queue.push(
+                    "✓",
+                    x + grid.card_width - text_margin - self.ui_scale.px(24.0),
+                    y + grid.card_height - text_margin - self.ui_scale.px(24.0),
+                    self.ui_scale.px(24.0),
+                    [0.2, 1.0, 0.4, 1.0],
                 );
             }
         }
 
-        // Help text
-        let help_text = if self.gamepad_connected {
-            "  Navigate      Toggle       Execute      Back"
-        } else {
-            "[Arrows] Navigate  [Space] Toggle  [Enter] Execute  [Esc] Back"
+        // Add help legend
+        let help_state = AppState::PalaceLoop {
+            project_path: std::path::PathBuf::new(),
+            cards: Vec::new(),
+            focused_index: 0,
+            generating: false,
+            current_tool: None,
+            tool_log: Vec::new(),
+            thought_log: Vec::new(),
+            log_scroll_offset: 0,
+            detail_scroll_offset: 0.0,
         };
-        sections.push(
-            Section::default()
-                .add_text(
-                    Text::new(help_text)
-                        .with_scale(self.ui_scale.px(16.0))
-                        .with_color([0.35, 0.35, 0.4, 1.0]),
-                )
-                .with_screen_position((left_margin, help_y))
-                .with_layout(Layout::default()),
-        );
+        self.queue_help_legend(&help_state);
+    }
 
-        let _ = self.text_brush.queue(&self.device, &self.queue, sections);
+    /// Build help legend items: returns (button, label) pairs for current state
+    fn get_help_items(&self, state: &AppState) -> Vec<(XboxButton, &'static str)> {
+        match state {
+            AppState::ProjectChooser { .. } => vec![
+                (XboxButton::LeftStick, "Navigate"),
+                (XboxButton::A, "Select"),
+                (XboxButton::B, "Back"),
+            ],
+            AppState::ProjectView { .. } => vec![
+                (XboxButton::LeftStick, "Navigate"),
+                (XboxButton::A, "Select"),
+                (XboxButton::B, "Back"),
+            ],
+            AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } => vec![
+                (XboxButton::LeftStick, "Navigate"),
+                (XboxButton::A, "Select"),
+                (XboxButton::B, "Back"),
+            ],
+            AppState::PermissionModal { .. } => vec![
+                (XboxButton::A, "Yes"),
+                (XboxButton::B, "No"),
+                (XboxButton::X, "Always"),
+                (XboxButton::Y, "Suggest"),
+            ],
+            AppState::ExecuteModal { .. } => vec![
+                (XboxButton::LeftStick, "Navigate"),
+                (XboxButton::A, "Select"),
+                (XboxButton::B, "Back"),
+            ],
+            AppState::PalaceLoop { .. } => vec![
+                (XboxButton::LeftStick, "Navigate"),
+                (XboxButton::A, "Select"),
+                (XboxButton::B, "Back"),
+                (XboxButton::X, "Run"),
+                (XboxButton::Y, "Filter"),
+            ],
+        }
     }
 
     fn build_help_sprites(&self, state: &AppState) -> Vec<SpriteInstance> {
+        let items = self.get_help_items(state);
         let mut sprites = Vec::new();
+
         let glyph_size = self.ui_scale.px(24.0);
-        let left_margin = self.ui_scale.px(60.0);
+        let right_margin = self.ui_scale.px(20.0);
+        let top_margin = self.ui_scale.px(20.0);
+        let inner_gap = self.ui_scale.px(4.0); // Gap between glyph and label
+        let item_gap = self.ui_scale.px(16.0); // Gap between items
+        let label_width = self.ui_scale.px(44.0);
 
-        match state {
-            AppState::ProjectChooser { .. } => {
-                let help_y = self.size.height as f32 - self.ui_scale.px(40.0) - glyph_size * 0.25;
+        // Each item: [glyph][inner_gap][label]
+        // Between items: [item_gap]
+        let item_width = glyph_size + inner_gap + label_width;
+        let total_width = items.len() as f32 * item_width
+            + (items.len().saturating_sub(1)) as f32 * item_gap;
 
-                // Navigation icon
-                sprites.push(SpriteInstance::new(left_margin, help_y, glyph_size, XboxButton::DPad));
+        let start_x = self.size.width as f32 - right_margin - total_width;
+        let y = top_margin;
 
-                // A button for select (positioned after "Navigate" text)
-                sprites.push(SpriteInstance::new(
-                    left_margin + self.ui_scale.px(140.0),
-                    help_y,
-                    glyph_size,
-                    XboxButton::A,
-                ));
-
-                // B button for back (positioned after "Select" text)
-                sprites.push(SpriteInstance::new(
-                    left_margin + self.ui_scale.px(230.0),
-                    help_y,
-                    glyph_size,
-                    XboxButton::B,
-                ));
-            }
-            AppState::ProjectView { .. } => {
-                let help_y = self.size.height as f32 - self.ui_scale.px(40.0) - glyph_size * 0.25;
-
-                // D-Pad for navigation
-                sprites.push(SpriteInstance::new(left_margin, help_y, glyph_size, XboxButton::DPad));
-
-                // A button for select
-                sprites.push(SpriteInstance::new(
-                    left_margin + self.ui_scale.px(140.0),
-                    help_y,
-                    glyph_size,
-                    XboxButton::A,
-                ));
-
-                // B button for back
-                sprites.push(SpriteInstance::new(
-                    left_margin + self.ui_scale.px(230.0),
-                    help_y,
-                    glyph_size,
-                    XboxButton::B,
-                ));
-            }
-            AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } => {
-                let help_y = self.size.height as f32 - self.ui_scale.px(40.0) - glyph_size * 0.25;
-
-                // D-Pad for navigation
-                sprites.push(SpriteInstance::new(left_margin, help_y, glyph_size, XboxButton::DPad));
-
-                // A button for select/toggle
-                sprites.push(SpriteInstance::new(
-                    left_margin + self.ui_scale.px(140.0),
-                    help_y,
-                    glyph_size,
-                    XboxButton::A,
-                ));
-
-                // B button for back
-                sprites.push(SpriteInstance::new(
-                    left_margin + self.ui_scale.px(230.0),
-                    help_y,
-                    glyph_size,
-                    XboxButton::B,
-                ));
-            }
-            AppState::PalaceLoop { .. } => {
-                let help_y = self.size.height as f32 - self.ui_scale.px(40.0) - glyph_size * 0.25;
-
-                // D-Pad for navigation
-                sprites.push(SpriteInstance::new(left_margin, help_y, glyph_size, XboxButton::DPad));
-
-                // A button for toggle selection
-                sprites.push(SpriteInstance::new(
-                    left_margin + self.ui_scale.px(130.0),
-                    help_y,
-                    glyph_size,
-                    XboxButton::A,
-                ));
-
-                // X button for execute
-                sprites.push(SpriteInstance::new(
-                    left_margin + self.ui_scale.px(220.0),
-                    help_y,
-                    glyph_size,
-                    XboxButton::X,
-                ));
-
-                // B button for back
-                sprites.push(SpriteInstance::new(
-                    left_margin + self.ui_scale.px(320.0),
-                    help_y,
-                    glyph_size,
-                    XboxButton::B,
-                ));
-            }
+        for (i, (button, _label)) in items.iter().enumerate() {
+            let x = start_x + i as f32 * (item_width + item_gap);
+            sprites.push(SpriteInstance::new(x, y, glyph_size, *button));
         }
 
         sprites
+    }
+
+    /// Build help legend text sections (labels after glyphs) - top right corner
+    fn queue_help_legend(&mut self, state: &AppState) {
+        if !self.gamepad_connected {
+            return;
+        }
+
+        let items = self.get_help_items(state);
+        let glyph_size = self.ui_scale.px(24.0);
+        let right_margin = self.ui_scale.px(20.0);
+        let top_margin = self.ui_scale.px(20.0);
+        let inner_gap = self.ui_scale.px(4.0);
+        let item_gap = self.ui_scale.px(16.0);
+        let label_width = self.ui_scale.px(44.0);
+        let label_scale = self.ui_scale.px(14.0);
+
+        let item_width = glyph_size + inner_gap + label_width;
+        let total_width = items.len() as f32 * item_width
+            + (items.len().saturating_sub(1)) as f32 * item_gap;
+        let start_x = self.size.width as f32 - right_margin - total_width;
+        let y = top_margin + (glyph_size - label_scale) / 2.0;
+
+        for (i, (_, label)) in items.iter().enumerate() {
+            let x = start_x + i as f32 * (item_width + item_gap) + glyph_size + inner_gap;
+            self.text_queue.push(*label, x, y, label_scale, [0.6, 0.6, 0.65, 1.0]);
+        }
     }
 
     #[allow(dead_code)]

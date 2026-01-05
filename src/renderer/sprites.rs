@@ -452,8 +452,10 @@ impl SpriteRenderer {
         let svg_data = std::fs::read(path).ok()?;
         let tree = resvg::usvg::Tree::from_data(&svg_data, &resvg::usvg::Options::default()).ok()?;
 
-        // Create pixmap for rendering
+        // Create pixmap for rendering - explicitly transparent
         let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size)?;
+        // Pixmap::new() should be transparent, but let's be explicit
+        pixmap.fill(resvg::tiny_skia::Color::TRANSPARENT);
 
         // Calculate scale to fit SVG in cell
         let svg_size = tree.size();

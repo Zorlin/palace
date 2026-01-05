@@ -20,6 +20,10 @@ pub enum AppEvent {
     GamepadButton(Button),
     /// Gamepad button released
     GamepadButtonReleased(Button),
+    /// Gamepad left stick moved (axis, value -1.0 to 1.0)
+    GamepadStick { x: f32, y: f32 },
+    /// Gamepad right stick moved (for scrolling)
+    GamepadRightStick { x: f32, y: f32 },
     /// Gamepad connected
     GamepadConnected,
     /// Gamepad disconnected
@@ -32,6 +36,8 @@ pub enum AppEvent {
     Shutdown,
     /// AI is exploring with a tool
     AiToolCall(String),
+    /// AI thinking/commentary (shows in waterfall)
+    AiChatter(String),
     /// New suggestion card started
     SuggestionStart { id: usize },
     /// Suggestion field updated (title, category, description, command)
@@ -42,7 +48,19 @@ pub enum AppEvent {
     SuggestionsDone,
     /// AI error
     AiError(String),
+    /// Permission request from AI - requires user approval
+    PermissionRequest {
+        /// Unique ID for this request
+        id: usize,
+        /// The command or action requesting permission
+        command: String,
+        /// Channel to send response back
+        response_tx: tokio::sync::oneshot::Sender<PermissionResponse>,
+    },
 }
+
+// Re-export PermissionResponse from state for convenience
+pub use crate::state::PermissionResponse;
 
 pub struct App {
     window: Option<Window>,
@@ -66,11 +84,14 @@ pub struct App {
     r3_held: bool,
     /// Event loop proxy for sending events from background threads
     event_proxy: Arc<EventLoopProxy<AppEvent>>,
+    /// Pending permission response sender (set when permission modal is shown)
+    permission_response_tx: Option<tokio::sync::oneshot::Sender<PermissionResponse>>,
 }
 
 impl App {
     pub fn new(initial_state: AppState, projects: ProjectsConfig, event_proxy: EventLoopProxy<AppEvent>) -> Self {
         Self {
+            permission_response_tx: None,
             window: None,
             renderer: None,
             state: initial_state,
@@ -124,6 +145,9 @@ impl App {
                 self.state = *previous_state.clone();
             }
             AppState::UiScaleMenu { previous_state, .. } => {
+                self.state = *previous_state.clone();
+            }
+            AppState::ExecuteModal { previous_state, .. } => {
                 self.state = *previous_state.clone();
             }
             _ => {}
@@ -180,6 +204,8 @@ impl App {
             Button::DPadRight => self.handle_input(KeyCode::ArrowRight),
             Button::South => self.handle_input(KeyCode::Enter), // A button
             Button::East => self.handle_input(KeyCode::Backspace), // B button
+            Button::West => self.handle_input(KeyCode::KeyX), // X button
+            Button::North => self.handle_input(KeyCode::KeyY), // Y button
             Button::Start => {
                 // Open settings menu (or close if already in settings)
                 self.toggle_main_menu();
@@ -201,6 +227,84 @@ impl App {
             Button::LeftThumb => self.l3_held = false,
             Button::RightThumb => self.r3_held = false,
             _ => {}
+        }
+    }
+
+    /// Handle left thumbstick movement for navigation
+    /// Uses deadzone + threshold to convert analog to digital nav
+    fn handle_gamepad_stick(&mut self, x: f32, y: f32) {
+        const DEADZONE: f32 = 0.3;
+        const THRESHOLD: f32 = 0.7;
+
+        // If in passthrough mode, ignore stick input
+        if self.gamepad_passthrough {
+            return;
+        }
+
+        // Track last stick direction to avoid repeated inputs
+        // Use a simple threshold-crossing approach
+        static mut LAST_X: i8 = 0;
+        static mut LAST_Y: i8 = 0;
+
+        let new_x = if x > THRESHOLD { 1 } else if x < -THRESHOLD { -1 } else if x.abs() < DEADZONE { 0 } else { unsafe { LAST_X } };
+        let new_y = if y > THRESHOLD { 1 } else if y < -THRESHOLD { -1 } else if y.abs() < DEADZONE { 0 } else { unsafe { LAST_Y } };
+
+        unsafe {
+            // Only trigger when crossing threshold, not when held
+            if new_x != LAST_X {
+                if new_x > 0 {
+                    self.handle_input(KeyCode::ArrowRight);
+                    self.request_redraw();
+                } else if new_x < 0 {
+                    self.handle_input(KeyCode::ArrowLeft);
+                    self.request_redraw();
+                }
+                LAST_X = new_x;
+            }
+
+            // Y axis: negative = down (stick pushed away from you = up)
+            if new_y != LAST_Y {
+                if new_y > 0 {
+                    self.handle_input(KeyCode::ArrowUp);
+                    self.request_redraw();
+                } else if new_y < 0 {
+                    self.handle_input(KeyCode::ArrowDown);
+                    self.request_redraw();
+                }
+                LAST_Y = new_y;
+            }
+        }
+    }
+
+    /// Handle right thumbstick for scrolling activity log
+    fn handle_gamepad_right_stick(&mut self, y: f32) {
+        const DEADZONE: f32 = 0.3;
+        const THRESHOLD: f32 = 0.7;
+
+        if self.gamepad_passthrough {
+            return;
+        }
+
+        static mut LAST_Y: i8 = 0;
+
+        let new_y = if y > THRESHOLD { 1 } else if y < -THRESHOLD { -1 } else if y.abs() < DEADZONE { 0 } else { unsafe { LAST_Y } };
+
+        unsafe {
+            if new_y != LAST_Y {
+                if let AppState::PalaceLoop { tool_log, thought_log, log_scroll_offset, .. } = &mut self.state {
+                    let max_scroll = tool_log.len().max(thought_log.len()).saturating_sub(1);
+                    if new_y > 0 {
+                        // Up - scroll to older entries
+                        *log_scroll_offset = (*log_scroll_offset + 1).min(max_scroll);
+                        self.request_redraw();
+                    } else if new_y < 0 {
+                        // Down - scroll to newer entries
+                        *log_scroll_offset = log_scroll_offset.saturating_sub(1);
+                        self.request_redraw();
+                    }
+                }
+                LAST_Y = new_y;
+            }
         }
     }
 
@@ -244,6 +348,27 @@ impl App {
         self.show_gnome_overview();
 
         self.request_redraw();
+    }
+
+    /// Add a command prefix to the approved list
+    fn approve_command_prefix(prefix: &str) {
+        use std::sync::{OnceLock, Mutex as StdMutex};
+        static APPROVED: OnceLock<StdMutex<Vec<String>>> = OnceLock::new();
+        let approved = APPROVED.get_or_init(|| StdMutex::new(Vec::new()));
+        let mut list = approved.lock().unwrap();
+        if !list.contains(&prefix.to_string()) {
+            list.push(prefix.to_string());
+            tracing::info!("Approved command prefix: {}", prefix);
+        }
+    }
+
+    /// Check if a command is approved (prefix match)
+    pub fn is_command_approved(cmd: &str) -> bool {
+        use std::sync::{OnceLock, Mutex as StdMutex};
+        static APPROVED: OnceLock<StdMutex<Vec<String>>> = OnceLock::new();
+        let approved = APPROVED.get_or_init(|| StdMutex::new(Vec::new()));
+        let list = approved.lock().unwrap();
+        list.iter().any(|a| cmd.starts_with(a))
     }
 
     /// Show GNOME Overview so user can see and select Palace window
@@ -392,6 +517,10 @@ impl App {
                                     focused_index: 0,
                                     generating: true,
                                     current_tool: None,
+                                    tool_log: Vec::new(),
+                                    thought_log: Vec::new(),
+                                    log_scroll_offset: 0,
+                                    detail_scroll_offset: 0.0,
                                 };
 
                                 // Spawn AI suggestion thread
@@ -556,6 +685,71 @@ impl App {
                     _ => {}
                 }
             }
+            AppState::PermissionModal {
+                selected_choice,
+                previous_state,
+                command_prefix,
+                command,
+            } => {
+                use crate::state::PermissionChoice;
+                let choice_count = PermissionChoice::all().len();
+                let command_prefix = command_prefix.clone();
+                let command = command.clone();
+                let previous_state = previous_state.clone();
+
+                // Permission modal uses direct button mappings (QTE style):
+                // A = Yes once, X = Yes always, B = No, Y = Suggest else
+                match key {
+                    // Navigation still works for mouse/touch users
+                    KeyCode::ArrowUp | KeyCode::KeyW => {
+                        if *selected_choice > 0 {
+                            *selected_choice -= 1;
+                        } else {
+                            *selected_choice = choice_count - 1;
+                        }
+                    }
+                    KeyCode::ArrowDown | KeyCode::KeyS => {
+                        if *selected_choice < choice_count - 1 {
+                            *selected_choice += 1;
+                        } else {
+                            *selected_choice = 0;
+                        }
+                    }
+                    // A button / Enter / Space → Yes once
+                    KeyCode::Enter | KeyCode::Space => {
+                        if let Some(tx) = self.permission_response_tx.take() {
+                            let _ = tx.send(PermissionResponse::Approved);
+                        }
+                        self.state = *previous_state;
+                    }
+                    // X button → Yes always
+                    KeyCode::KeyX => {
+                        Self::approve_command_prefix(&command_prefix);
+                        if let Some(tx) = self.permission_response_tx.take() {
+                            let _ = tx.send(PermissionResponse::ApprovedAlways(command_prefix));
+                        }
+                        self.state = *previous_state;
+                    }
+                    // B button / Backspace / Escape → No
+                    KeyCode::Backspace | KeyCode::Escape => {
+                        if let Some(tx) = self.permission_response_tx.take() {
+                            let _ = tx.send(PermissionResponse::Denied);
+                        }
+                        self.state = *previous_state;
+                    }
+                    // Y button → Suggest something else (ask Z.ai for alternatives)
+                    KeyCode::KeyY => {
+                        tracing::info!("Suggest else requested for: {}", command);
+                        if let Some(tx) = self.permission_response_tx.take() {
+                            let _ = tx.send(PermissionResponse::SuggestElse {
+                                original_command: command,
+                            });
+                        }
+                        self.state = *previous_state;
+                    }
+                    _ => {}
+                }
+            }
             AppState::PalaceLoop {
                 cards,
                 focused_index,
@@ -563,16 +757,45 @@ impl App {
                 ..
             } => {
                 let card_count = cards.len();
+                let palace_columns = 5; // PalaceLoop uses 5-column grid
 
                 match key {
                     KeyCode::ArrowUp | KeyCode::KeyW => {
-                        if *focused_index > 0 {
-                            *focused_index -= 1;
+                        // Move up one row
+                        if *focused_index >= palace_columns {
+                            *focused_index -= palace_columns;
+                        } else if card_count > 0 {
+                            // Wrap to last row (same column or nearest)
+                            let last_row_start = (card_count.saturating_sub(1) / palace_columns) * palace_columns;
+                            let target = last_row_start + (*focused_index % palace_columns);
+                            *focused_index = target.min(card_count - 1);
                         }
                     }
                     KeyCode::ArrowDown | KeyCode::KeyS => {
+                        // Move down one row
+                        let next = *focused_index + palace_columns;
+                        if next < card_count {
+                            *focused_index = next;
+                        } else if card_count > 0 {
+                            // Wrap to first row (same column)
+                            *focused_index = *focused_index % palace_columns;
+                            if *focused_index >= card_count {
+                                *focused_index = 0;
+                            }
+                        }
+                    }
+                    KeyCode::ArrowLeft | KeyCode::KeyA => {
+                        if *focused_index > 0 {
+                            *focused_index -= 1;
+                        } else if card_count > 0 {
+                            *focused_index = card_count - 1;
+                        }
+                    }
+                    KeyCode::ArrowRight | KeyCode::KeyD => {
                         if card_count > 0 && *focused_index < card_count - 1 {
                             *focused_index += 1;
+                        } else {
+                            *focused_index = 0;
                         }
                     }
                     KeyCode::Enter | KeyCode::Space => {
@@ -589,15 +812,53 @@ impl App {
                         }
                     }
                     KeyCode::KeyX => {
-                        // Execute selected cards (only when done generating)
+                        // Show execute options modal (only when done generating and has selections)
                         if !*generating {
-                            let selected: Vec<_> = cards.iter()
-                                .filter(|c| c.selected)
-                                .map(|c| c.title.clone())
-                                .collect();
-                            tracing::info!("Execute selected: {:?}", selected);
-                            // TODO: Execute selected actions
+                            let has_selected = cards.iter().any(|c| c.selected);
+                            if has_selected {
+                                self.state = AppState::ExecuteModal {
+                                    selected_option: 0,
+                                    previous_state: Box::new(self.state.clone()),
+                                };
+                            }
                         }
+                    }
+                    _ => {}
+                }
+            }
+            AppState::ExecuteModal {
+                selected_option,
+                previous_state,
+            } => {
+                use crate::state::ExecuteOption;
+                let option_count = ExecuteOption::all().len();
+                let previous_state = previous_state.clone();
+
+                match key {
+                    KeyCode::ArrowUp | KeyCode::KeyW => {
+                        if *selected_option > 0 {
+                            *selected_option -= 1;
+                        } else {
+                            *selected_option = option_count - 1;
+                        }
+                    }
+                    KeyCode::ArrowDown | KeyCode::KeyS => {
+                        if *selected_option < option_count - 1 {
+                            *selected_option += 1;
+                        } else {
+                            *selected_option = 0;
+                        }
+                    }
+                    KeyCode::Enter | KeyCode::Space => {
+                        let option = ExecuteOption::all()[*selected_option];
+                        tracing::info!("Execute option selected: {:?}", option);
+                        // TODO: Implement actual execution
+                        // For now, just return to previous state
+                        self.state = *previous_state;
+                    }
+                    KeyCode::Backspace | KeyCode::Escape => {
+                        // Go back to PalaceLoop
+                        self.state = *previous_state;
                     }
                     _ => {}
                 }
@@ -759,18 +1020,33 @@ impl App {
                 ..
             } => {
                 // Tap on suggestion cards to toggle selection
-                let margin = 72.0;
-                let card_height = 100.0;
-                let card_gap = 16.0;
-                let top_offset = 140.0;
+                // Must match CardGrid::for_palace_loop() in gpu.rs
+                let ui_scale = self.renderer.as_ref().map(|r| r.ui_scale()).unwrap_or(1.0);
+                let scale = |v: f32| v * ui_scale;
+
+                let target_columns = 5usize;
+                let base_gap = 16.0;
+                let base_margin = 40.0;
+                let screen_width = size.width as f32;
+
+                let gap = scale(base_gap);
+                let margin_x = scale(base_margin);
+                let margin_y = scale(base_margin + 80.0); // Extra space for title + subtitle
+
+                // Calculate card width to fit exactly 5 columns
+                let available_width = screen_width - margin_x * 2.0;
+                let card_width = (available_width - gap * (target_columns - 1) as f32) / target_columns as f32;
+                let card_height = card_width * 0.6; // Same aspect ratio as renderer
 
                 for (i, _card) in cards.iter().enumerate() {
-                    let card_y = top_offset + i as f32 * (card_height + card_gap);
-                    let card_width = size.width as f32 - margin * 2.0;
+                    let col = i % target_columns;
+                    let row = i / target_columns;
+                    let card_x = margin_x + col as f32 * (card_width + gap);
+                    let card_y = margin_y + row as f32 * (card_height + gap);
 
-                    if x >= margin && x <= margin + card_width
+                    if x >= card_x && x <= card_x + card_width
                        && y >= card_y && y <= card_y + card_height {
-                        tracing::info!("Tapped suggestion card {}", i);
+                        tracing::info!("Tapped suggestion card {} at ({}, {})", i, col, row);
                         *focused_index = i;
                         // Toggle selection
                         if let Some(card) = cards.get_mut(i) {
@@ -803,6 +1079,85 @@ impl App {
                        && y >= card_y && y <= card_y + card_height {
                         tracing::info!("Tapped scale option {}", i);
                         *selected_item = i;
+                        self.handle_input(KeyCode::Enter);
+                        return;
+                    }
+                }
+            }
+            AppState::PermissionModal { selected_choice, command, .. } => {
+                // Tap on permission choice options - dynamic sizing based on command
+                use crate::state::PermissionChoice;
+                let ui_scale = self.renderer.as_ref().map(|r| r.ui_scale()).unwrap_or(1.0);
+                let scale = |v: f32| v * ui_scale;
+
+                let max_width = scale(800.0).min(size.width as f32 * 0.9);
+                let min_width = scale(400.0);
+                let inner_padding = scale(20.0);
+                let command_scale = scale(16.0);
+
+                // Estimate chars per line
+                let char_width = command_scale * 0.55;
+                let usable_width = max_width - inner_padding * 2.0;
+                let chars_per_line = (usable_width / char_width).floor() as usize;
+                let command_lines = ((command.len() as f32) / chars_per_line as f32).ceil() as usize;
+                let command_lines = command_lines.max(1).min(10);
+
+                let command_text_width = (command.len().min(chars_per_line) as f32 * char_width) + inner_padding * 2.0;
+                let modal_width = command_text_width.max(min_width).min(max_width);
+
+                let item_count = PermissionChoice::all().len() as f32;
+                let card_height = scale(50.0);
+                let card_gap = scale(8.0);
+                let title_height = scale(50.0);
+                let line_height = command_scale * 1.4;
+                let command_height = line_height * command_lines as f32 + scale(20.0);
+                let modal_height = title_height + command_height + inner_padding + item_count * (card_height + card_gap);
+                let modal_x = (size.width as f32 - modal_width) / 2.0;
+                let modal_y = (size.height as f32 - modal_height) / 2.0;
+
+                let items = PermissionChoice::all();
+                let card_start_y = modal_y + title_height + command_height;
+                for (i, _item) in items.iter().enumerate() {
+                    let card_y = card_start_y + i as f32 * (card_height + card_gap);
+                    let card_width = modal_width - inner_padding * 2.0;
+                    let card_x = modal_x + inner_padding;
+
+                    if x >= card_x && x <= card_x + card_width
+                       && y >= card_y && y <= card_y + card_height {
+                        tracing::info!("Tapped permission choice {}", i);
+                        *selected_choice = i;
+                        self.handle_input(KeyCode::Enter);
+                        return;
+                    }
+                }
+            }
+            AppState::ExecuteModal { selected_option, .. } => {
+                // Tap on execute option items
+                use crate::state::ExecuteOption;
+                let ui_scale = self.renderer.as_ref().map(|r| r.ui_scale()).unwrap_or(1.0);
+                let scale = |v: f32| v * ui_scale;
+
+                let modal_width = scale(400.0).min(size.width as f32 - 40.0);
+                let item_count = ExecuteOption::all().len() as f32;
+                let card_height = scale(50.0);
+                let card_gap = scale(8.0);
+                let inner_padding = scale(20.0);
+                let title_height = scale(50.0);
+                let modal_height = title_height + inner_padding + item_count * (card_height + card_gap);
+                let modal_x = (size.width as f32 - modal_width) / 2.0;
+                let modal_y = (size.height as f32 - modal_height) / 2.0;
+
+                let items = ExecuteOption::all();
+                let card_start_y = modal_y + title_height;
+                for (i, _item) in items.iter().enumerate() {
+                    let card_y = card_start_y + i as f32 * (card_height + card_gap);
+                    let card_width = modal_width - inner_padding * 2.0;
+                    let card_x = modal_x + inner_padding;
+
+                    if x >= card_x && x <= card_x + card_width
+                       && y >= card_y && y <= card_y + card_height {
+                        tracing::info!("Tapped execute option {}", i);
+                        *selected_option = i;
                         self.handle_input(KeyCode::Enter);
                         return;
                     }
@@ -1041,6 +1396,12 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::GamepadButtonReleased(button) => {
                 self.handle_gamepad_button_released(button);
             }
+            AppEvent::GamepadStick { x, y } => {
+                self.handle_gamepad_stick(x, y);
+            }
+            AppEvent::GamepadRightStick { x: _, y } => {
+                self.handle_gamepad_right_stick(y);
+            }
             AppEvent::GamepadConnected => {
                 tracing::info!("Gamepad connected");
                 self.gamepad_connected = true;
@@ -1071,15 +1432,36 @@ impl ApplicationHandler<AppEvent> for App {
                 event_loop.exit();
             }
             AppEvent::AiToolCall(description) => {
-                // Update current tool display in PalaceLoop
-                if let AppState::PalaceLoop { current_tool, .. } = &mut self.state {
-                    *current_tool = Some(description);
+                // Update current tool display and add to tool log
+                if let AppState::PalaceLoop { current_tool, tool_log, .. } = &mut self.state {
+                    *current_tool = Some(description.clone());
+                    // Add to front of log (most recent first) - description already has emoji
+                    tool_log.insert(0, description);
+                    // Keep log reasonably sized
+                    if tool_log.len() > 500 {
+                        tool_log.truncate(500);
+                    }
+                    self.request_redraw();
+                }
+            }
+            AppEvent::AiChatter(text) => {
+                // AI thinking/commentary - add to thought log (right side)
+                if let AppState::PalaceLoop { thought_log, .. } = &mut self.state {
+                    thought_log.insert(0, text);
+                    if thought_log.len() > 500 {
+                        thought_log.truncate(500);
+                    }
                     self.request_redraw();
                 }
             }
             AppEvent::SuggestionStart { id } => {
-                // Add new card
-                if let AppState::PalaceLoop { cards, .. } = &mut self.state {
+                // Add new card, clear logs when first suggestion arrives
+                if let AppState::PalaceLoop { cards, tool_log, thought_log, .. } = &mut self.state {
+                    if cards.is_empty() {
+                        // First suggestion - clear the context-gathering waterfalls
+                        tool_log.clear();
+                        thought_log.clear();
+                    }
                     cards.push(SuggestionCard::new(id));
                     self.request_redraw();
                 }
@@ -1123,6 +1505,20 @@ impl ApplicationHandler<AppEvent> for App {
                     *current_tool = Some(format!("Error: {}", error));
                     self.request_redraw();
                 }
+            }
+            AppEvent::PermissionRequest { id: _, command, response_tx } => {
+                // Show permission modal
+                tracing::info!("Permission requested: {}", command);
+                let cmd_prefix = command.split_whitespace().next().unwrap_or(&command).to_string();
+                // Store the sender in the app (not the state, since state derives Clone)
+                self.permission_response_tx = Some(response_tx);
+                self.state = AppState::PermissionModal {
+                    command: command.clone(),
+                    command_prefix: cmd_prefix,
+                    selected_choice: 0,
+                    previous_state: Box::new(self.state.clone()),
+                };
+                self.request_redraw();
             }
         }
     }
@@ -1231,6 +1627,20 @@ impl App {
                     "selected": selected_item
                 })
             }
+            AppState::PermissionModal { .. } => {
+                // Permission modal is transient - just return to chooser on restart
+                serde_json::json!({
+                    "view": "chooser",
+                    "selected": 0
+                })
+            }
+            AppState::ExecuteModal { .. } => {
+                // Execute modal is transient - just return to chooser on restart
+                serde_json::json!({
+                    "view": "chooser",
+                    "selected": 0
+                })
+            }
         }
         .to_string()
     }
@@ -1267,6 +1677,7 @@ impl App {
             move |event: SuggestionEvent| {
                 let app_event = match event {
                     SuggestionEvent::ToolCall(desc) => AppEvent::AiToolCall(desc),
+                    SuggestionEvent::Chatter(text) => AppEvent::AiChatter(text),
                     SuggestionEvent::CardStart { id } => AppEvent::SuggestionStart { id },
                     SuggestionEvent::CardUpdate { id, field, value } => {
                         AppEvent::SuggestionUpdate { id, field, value }
@@ -1279,8 +1690,33 @@ impl App {
             }
         };
 
+        // Create permission requester that sends events to the GUI
+        let permission_proxy = proxy.clone();
+        let permission_requester: crate::ai::PermissionRequester = Box::new(move |command: &str| {
+            // Create oneshot channel for response
+            let (tx, rx) = tokio::sync::oneshot::channel::<PermissionResponse>();
+
+            // Send permission request to GUI
+            static PERMISSION_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let id = PERMISSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            if permission_proxy.send_event(AppEvent::PermissionRequest {
+                id,
+                command: command.to_string(),
+                response_tx: tx,
+            }).is_err() {
+                return PermissionResponse::Denied; // Event loop closed
+            }
+
+            // Block waiting for user response
+            match rx.blocking_recv() {
+                Ok(response) => response,
+                Err(_) => PermissionResponse::Denied, // Channel closed = deny
+            }
+        });
+
         // Run streaming suggestions
-        if let Err(e) = engine.stream_to_gui(&context, callback) {
+        if let Err(e) = engine.stream_to_gui(&context, callback, Some(permission_requester)) {
             tracing::error!("AI suggestion error: {}", e);
             let _ = proxy.send_event(AppEvent::AiError(e.to_string()));
         }

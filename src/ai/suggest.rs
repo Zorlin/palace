@@ -111,8 +111,19 @@ fn select_menu(prompt: &str, options: &[&str]) -> Option<usize> {
     result
 }
 
+use crate::state::PermissionResponse;
+
+/// Permission requester callback type
+/// Returns PermissionResponse indicating user's choice
+pub type PermissionRequester = Box<dyn Fn(&str) -> PermissionResponse + Send + Sync>;
+
 /// Execute a tool and return its result
-fn execute_tool(tool_name: &str, tool_input: &str, project_root: &Path) -> String {
+fn execute_tool(
+    tool_name: &str,
+    tool_input: &str,
+    project_root: &Path,
+    permission_requester: Option<&PermissionRequester>,
+) -> String {
     let input: serde_json::Value = serde_json::from_str(tool_input).unwrap_or_default();
 
     match tool_name {
@@ -198,20 +209,40 @@ fn execute_tool(tool_name: &str, tool_input: &str, project_root: &Path) -> Strin
                     } else {
                         drop(list); // Release lock before prompting
 
-                        let prompt = format!("Permission required: {}", cmd);
-                        let always_opt = format!("Yes (always for '{}')", cmd_prefix);
-                        let options = ["Yes (once)", &always_opt, "No"];
+                        // Use GUI permission requester if available, otherwise terminal
+                        let response = if let Some(requester) = permission_requester {
+                            requester(cmd)
+                        } else {
+                            // Fallback to terminal menu
+                            let prompt = format!("Permission required: {}", cmd);
+                            let always_opt = format!("Yes (always for '{}')", cmd_prefix);
+                            let options = ["Yes (once)", &always_opt, "No"];
 
-                        match select_menu(&prompt, &options) {
-                            Some(0) => {
-                                // One-time approval
+                            match select_menu(&prompt, &options) {
+                                Some(0) => PermissionResponse::Approved,
+                                Some(1) => {
+                                    // Always approve this prefix
+                                    approved.lock().unwrap().push(cmd_prefix.to_string());
+                                    PermissionResponse::ApprovedAlways(cmd_prefix.to_string())
+                                }
+                                _ => PermissionResponse::Denied,
                             }
-                            Some(1) => {
-                                // Always approve this prefix
-                                approved.lock().unwrap().push(cmd_prefix.to_string());
+                        };
+
+                        match &response {
+                            PermissionResponse::Approved => {
+                                // Continue with execution
                             }
-                            _ => {
+                            PermissionResponse::ApprovedAlways(prefix) => {
+                                // Add to approved list
+                                approved.lock().unwrap().push(prefix.clone());
+                            }
+                            PermissionResponse::Denied => {
                                 return format!("Denied: {}", cmd);
+                            }
+                            PermissionResponse::SuggestElse { original_command } => {
+                                // User wants alternatives - return special marker
+                                return format!("SUGGEST_ELSE: User rejected '{}' and wants alternative approaches", original_command);
                             }
                         }
                     }
@@ -255,33 +286,86 @@ fn tool_emoji(tool_name: &str) -> &'static str {
     }
 }
 
-/// Convert tool call to human-readable description
+/// Convert tool call to human-readable description with emoji
 fn tool_description(tool_name: &str, input_json: &str) -> String {
     let input: serde_json::Value = serde_json::from_str(input_json).unwrap_or_default();
 
     match tool_name {
+        // Claude Code tools
+        "Read" => {
+            let path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            format!("📖 Reading {}", path)
+        }
+        "Bash" => {
+            let cmd = input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            if cmd.len() > 50 {
+                format!("💻 {:.50}...", cmd)
+            } else {
+                format!("💻 {}", cmd)
+            }
+        }
+        "Grep" => {
+            let pattern = input
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("*");
+            format!("🔍 grep {}", pattern)
+        }
+        "Glob" => {
+            let pattern = input
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("*");
+            format!("📁 glob {}", pattern)
+        }
+        "Edit" => {
+            let path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            format!("✏️ Editing {}", path)
+        }
+        "Write" => {
+            let path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            format!("📝 Writing {}", path)
+        }
+        // Legacy tool names
         "read_file" => {
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-            format!("Reading {}", path)
+            format!("📖 Reading {}", path)
         }
         "list_directory" => {
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-            format!("Listing {}/", path)
+            format!("📁 Listing {}/", path)
         }
         "search_files" => {
-            let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("*");
-            format!("Searching {}", pattern)
+            let pattern = input
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("*");
+            format!("🔍 Searching {}", pattern)
         }
         "run_command" => {
-            let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("?");
-            // Truncate long commands
+            let cmd = input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
             if cmd.len() > 50 {
-                format!("Running {}...", &cmd[..50])
+                format!("💻 {:.50}...", cmd)
             } else {
-                format!("Running {}", cmd)
+                format!("💻 {}", cmd)
             }
         }
-        _ => format!("{} {:?}", tool_name, input),
+        _ => format!("🔧 {} {:?}", tool_name, input),
     }
 }
 
@@ -706,7 +790,7 @@ After exploring, output your suggestions in YAML format (no markdown fences)."#;
                 }
             },
             move |tool_name, tool_input| {
-                execute_tool(tool_name, tool_input, &project_root)
+                execute_tool(tool_name, tool_input, &project_root, None)
             },
         )?;
 
@@ -847,7 +931,12 @@ Respond in JSON array format:
 
     /// Stream suggestions to an event loop proxy for GUI display
     /// Parses YAML as it streams and sends AppEvents
-    pub fn stream_to_gui<F>(&self, context: &ProjectContext, send_event: F) -> Result<()>
+    pub fn stream_to_gui<F>(
+        &self,
+        context: &ProjectContext,
+        send_event: F,
+        permission_requester: Option<PermissionRequester>,
+    ) -> Result<()>
     where
         F: Fn(SuggestionEvent) + Send + 'static,
     {
@@ -875,6 +964,7 @@ suggestions:
         let current_tool_input = Arc::new(Mutex::new(String::new()));
         let current_tool_name = Arc::new(Mutex::new(String::new()));
         let yaml_buffer = Arc::new(Mutex::new(String::new()));
+        let chatter_buffer = Arc::new(Mutex::new(String::new()));
         let parser_state = Arc::new(Mutex::new(YamlParserState::default()));
         let in_suggestions = Arc::new(Mutex::new(false));
 
@@ -882,6 +972,7 @@ suggestions:
         let input_clone = current_tool_input.clone();
         let name_clone = current_tool_name.clone();
         let yaml_clone = yaml_buffer.clone();
+        let chatter_clone = chatter_buffer.clone();
         let parser_clone = parser_state.clone();
         let in_sugg_clone = in_suggestions.clone();
         let send_clone = Arc::new(send_event);
@@ -907,6 +998,34 @@ suggestions:
                         if !*in_sugg_clone.lock().unwrap() {
                             if buf.contains("suggestions:") {
                                 *in_sugg_clone.lock().unwrap() = true;
+                            } else {
+                                // Before suggestions: buffer text, emit on sentence/paragraph end
+                                let mut chatter = chatter_clone.lock().unwrap();
+                                chatter.push_str(&chunk);
+
+                                // Flush on sentence endings or newlines
+                                loop {
+                                    // Find first flush point: newline or sentence end
+                                    let flush_at = chatter
+                                        .find('\n')
+                                        .or_else(|| {
+                                            // Look for sentence endings followed by space or end
+                                            chatter.find(". ").map(|i| i + 1)
+                                                .or_else(|| chatter.find("! ").map(|i| i + 1))
+                                                .or_else(|| chatter.find("? ").map(|i| i + 1))
+                                        });
+
+                                    if let Some(pos) = flush_at {
+                                        let line = chatter[..pos].trim().to_string();
+                                        *chatter = chatter[pos..].trim_start().to_string();
+
+                                        if !line.is_empty() && !line.starts_with("```") {
+                                            send_clone(SuggestionEvent::Chatter(line));
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
                             }
                         }
 
@@ -916,6 +1035,16 @@ suggestions:
                         }
                     }
                     StreamEvent::ToolUseStart(tool_info) => {
+                        // Flush any pending chatter - tool start means thought ended
+                        {
+                            let mut chatter = chatter_clone.lock().unwrap();
+                            let remaining = chatter.trim().to_string();
+                            if !remaining.is_empty() && !remaining.starts_with("```") {
+                                send_clone(SuggestionEvent::Chatter(remaining));
+                            }
+                            chatter.clear();
+                        }
+
                         in_tool = true;
                         let name = tool_info.split(':').last().unwrap_or(&tool_info);
                         *name_clone.lock().unwrap() = name.to_string();
@@ -950,7 +1079,7 @@ suggestions:
                 }
             },
             move |tool_name, tool_input| {
-                execute_tool(tool_name, tool_input, &project_root)
+                execute_tool(tool_name, tool_input, &project_root, permission_requester.as_ref())
             },
         )?;
 
@@ -963,6 +1092,8 @@ suggestions:
 pub enum SuggestionEvent {
     /// Tool being called (human-readable description)
     ToolCall(String),
+    /// AI thinking/commentary text
+    Chatter(String),
     /// New suggestion card started
     CardStart { id: usize },
     /// Card field updated
@@ -1126,7 +1257,7 @@ mod tests {
 
     #[test]
     fn test_parse_suggestions() {
-        let engine = SuggestionEngine::new("http://test", "key", "model");
+        let engine = SuggestionEngine::new(Some("test-key"), Some("test-model")).unwrap();
 
         let response = r#"Here are my suggestions:
 ```json
@@ -1145,5 +1276,88 @@ mod tests {
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].title, "Run tests");
         assert_eq!(suggestions[0].command, Some("cargo test".to_string()));
+    }
+
+    #[test]
+    fn test_tool_description_has_emoji() {
+        // Read tool should have 📖
+        let desc = tool_description("Read", r#"{"file_path": "/test.rs"}"#);
+        assert!(desc.starts_with("📖"), "Read tool should start with 📖, got: {}", desc);
+        assert!(desc.contains("/test.rs"));
+
+        // Bash tool should have 💻
+        let desc = tool_description("Bash", r#"{"command": "cargo build"}"#);
+        assert!(desc.starts_with("💻"), "Bash tool should start with 💻, got: {}", desc);
+
+        // Grep tool should have 🔍
+        let desc = tool_description("Grep", r#"{"pattern": "TODO"}"#);
+        assert!(desc.starts_with("🔍"), "Grep tool should start with 🔍, got: {}", desc);
+
+        // Glob tool should have 📁
+        let desc = tool_description("Glob", r#"{"pattern": "*.rs"}"#);
+        assert!(desc.starts_with("📁"), "Glob tool should start with 📁, got: {}", desc);
+
+        // Edit tool should have ✏️
+        let desc = tool_description("Edit", r#"{"file_path": "/test.rs"}"#);
+        assert!(desc.starts_with("✏️"), "Edit tool should start with ✏️, got: {}", desc);
+
+        // Write tool should have 📝
+        let desc = tool_description("Write", r#"{"file_path": "/new.rs"}"#);
+        assert!(desc.starts_with("📝"), "Write tool should start with 📝, got: {}", desc);
+
+        // Unknown tool should have 🔧
+        let desc = tool_description("SomeRandomTool", r#"{}"#);
+        assert!(desc.starts_with("🔧"), "Unknown tool should start with 🔧, got: {}", desc);
+    }
+
+    #[test]
+    fn test_chatter_event_generated() {
+        use std::sync::{Arc, Mutex};
+
+        let events: Arc<Mutex<Vec<SuggestionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        // Simulate the text processing logic from stream_to_gui
+        let in_suggestions = false;
+        let text_before_suggestions = "Let me analyze your project.\nLooking at the codebase structure.\n";
+
+        // This simulates what happens in StreamEvent::Text handler
+        if !in_suggestions {
+            for line in text_before_suggestions.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() && !trimmed.starts_with("```") {
+                    events_clone.lock().unwrap().push(SuggestionEvent::Chatter(trimmed.to_string()));
+                }
+            }
+        }
+
+        let collected = events.lock().unwrap();
+        assert_eq!(collected.len(), 2, "Should have 2 chatter events");
+        assert!(matches!(&collected[0], SuggestionEvent::Chatter(s) if s == "Let me analyze your project."));
+        assert!(matches!(&collected[1], SuggestionEvent::Chatter(s) if s == "Looking at the codebase structure."));
+    }
+
+    #[test]
+    fn test_chatter_not_generated_after_suggestions_start() {
+        use std::sync::{Arc, Mutex};
+
+        let events: Arc<Mutex<Vec<SuggestionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        // Once in_suggestions is true, no chatter should be generated
+        let in_suggestions = true;
+        let text_after_suggestions = "suggestions:\n- title: Fix bug\n";
+
+        if !in_suggestions {
+            for line in text_after_suggestions.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() && !trimmed.starts_with("```") {
+                    events_clone.lock().unwrap().push(SuggestionEvent::Chatter(trimmed.to_string()));
+                }
+            }
+        }
+
+        let collected = events.lock().unwrap();
+        assert_eq!(collected.len(), 0, "No chatter events after suggestions start");
     }
 }

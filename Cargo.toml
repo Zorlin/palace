@@ -41,8 +41,8 @@ dirs = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Text rendering
-wgpu_text = "28"
+# Text rendering (cosmic-text based, supports color emoji)
+glyphon = "0.10"
 
 # SVG rendering for controller glyphs
 resvg = "0.45"

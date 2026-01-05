@@ -833,6 +833,49 @@ fn run_gamepad_thread(proxy: winit::event_loop::EventLoopProxy<app::AppEvent>) {
                         break;
                     }
                 }
+                gilrs::EventType::AxisChanged(axis, value, _) => {
+                    // Track left and right stick X and Y, send combined events
+                    use gilrs::Axis;
+                    static mut LEFT_X: f32 = 0.0;
+                    static mut LEFT_Y: f32 = 0.0;
+                    static mut RIGHT_X: f32 = 0.0;
+                    static mut RIGHT_Y: f32 = 0.0;
+
+                    let (send_left, send_right) = unsafe {
+                        match axis {
+                            Axis::LeftStickX => {
+                                LEFT_X = value;
+                                (true, false)
+                            }
+                            Axis::LeftStickY => {
+                                LEFT_Y = value;
+                                (true, false)
+                            }
+                            Axis::RightStickX => {
+                                RIGHT_X = value;
+                                (false, true)
+                            }
+                            Axis::RightStickY => {
+                                RIGHT_Y = value;
+                                (false, true)
+                            }
+                            _ => (false, false),
+                        }
+                    };
+
+                    if send_left {
+                        let (x, y) = unsafe { (LEFT_X, LEFT_Y) };
+                        if proxy.send_event(app::AppEvent::GamepadStick { x, y }).is_err() {
+                            break;
+                        }
+                    }
+                    if send_right {
+                        let (x, y) = unsafe { (RIGHT_X, RIGHT_Y) };
+                        if proxy.send_event(app::AppEvent::GamepadRightStick { x, y }).is_err() {
+                            break;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
