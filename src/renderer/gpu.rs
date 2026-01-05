@@ -1838,17 +1838,22 @@ impl Renderer {
         sprites
     }
 
-    /// Build sprites for survey modal (button glyphs next to first 4 options)
+    /// Build sprites for survey modal (button glyphs to the LEFT of first 4 options)
     fn build_survey_modal_sprites(&self, option_count: usize) -> Vec<SpriteInstance> {
-        // Must match queue_survey_modal_text dimensions
-        let modal_width = self.ui_scale.px(500.0).min(self.size.width as f32 - 40.0);
-        let total_options = option_count + 1; // +1 for "Other"
+        // Must match queue_survey_modal_text dimensions - FULL WIDTH layout
+        let margin = self.ui_scale.px(48.0);
         let card_height = self.ui_scale.px(60.0);
         let card_gap = self.ui_scale.px(10.0);
         let inner_padding = self.ui_scale.px(20.0);
         let title_height = self.ui_scale.px(80.0);
-        let modal_height = title_height + inner_padding + total_options as f32 * (card_height + card_gap);
-        let modal_x = (self.size.width as f32 - modal_width) / 2.0;
+
+        // Calculate visible options (same as text rendering)
+        let available_height = self.size.height as f32 - margin * 2.0 - title_height - self.ui_scale.px(60.0);
+        let max_visible = (available_height / (card_height + card_gap)).floor() as usize;
+        let total_options = option_count + 1; // +1 for "Other"
+
+        let modal_height = title_height + inner_padding + max_visible.min(total_options) as f32 * (card_height + card_gap);
+        let modal_x = margin;
         let modal_y = (self.size.height as f32 - modal_height) / 2.0;
         let card_start_y = modal_y + title_height;
         let glyph_size = self.ui_scale.px(32.0);
@@ -1858,9 +1863,10 @@ impl Renderer {
         let buttons = [XboxButton::A, XboxButton::X, XboxButton::B, XboxButton::Y];
 
         for (i, button) in buttons.iter().enumerate() {
-            if i >= total_options { break; }
+            if i >= total_options.min(max_visible) { break; }
             let y = card_start_y + i as f32 * (card_height + card_gap);
-            let glyph_x = modal_x + inner_padding + self.ui_scale.px(8.0);
+            // Position glyphs to the LEFT of the card (before inner_padding)
+            let glyph_x = modal_x + (inner_padding - glyph_size) / 2.0;
             let glyph_y = y + (card_height - glyph_size) / 2.0;
             sprites.push(SpriteInstance::new(glyph_x, glyph_y, glyph_size, *button));
         }
@@ -2689,7 +2695,8 @@ impl Renderer {
             // Left column: Tool calls (with proper text measurement for wrapping)
             let left_col_width = screen_mid - left_margin - self.ui_scale.px(20.0);
             if !tool_log.is_empty() {
-                let visible_start = log_scroll.min(tool_log.len().saturating_sub(1));
+                let visible_start = log_scroll as usize;
+                let visible_start = visible_start.min(tool_log.len().saturating_sub(1));
                 let mut y_offset = 0.0;
                 let mut entry_idx = 0;
                 for entry in tool_log.iter().skip(visible_start) {

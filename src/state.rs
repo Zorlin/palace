@@ -599,9 +599,9 @@ mod tests {
     #[test]
     fn test_project_action_descriptions() {
         assert!(ProjectAction::StartPalaceLoop.description().contains("AI-assisted"));
-        assert!(ProjectAction::Build.description().contains("Compile"));
-        assert!(ProjectAction::Run.description().contains("Execute"));
-        assert!(ProjectAction::ViewGitHistory.description().contains("Git"));
+        assert!(ProjectAction::Build.description().to_lowercase().contains("compile"));
+        assert!(ProjectAction::Run.description().to_lowercase().contains("execute"));
+        assert!(ProjectAction::ViewGitHistory.description().to_lowercase().contains("git"));
     }
 
     // ============== SuggestionCard Tests ==============

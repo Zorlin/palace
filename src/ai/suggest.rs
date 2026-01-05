@@ -371,15 +371,8 @@ fn tool_description(tool_name: &str, input_json: &str) -> String {
 
 /// Create a short preview of tool result
 fn result_preview(result: &str) -> String {
-    // Skip the "tool_name: " prefix if present
-    let content = if let Some(idx) = result.find(": ") {
-        &result[idx + 2..]
-    } else {
-        result
-    };
-
     // Take first few lines, join with separator
-    let lines: Vec<&str> = content.lines().take(2).collect();
+    let lines: Vec<&str> = result.lines().take(2).collect();
     let preview = lines.join(" ");
 
     // Truncate if too long
@@ -1510,7 +1503,8 @@ Let me know if you need more!"#;
         // Test truncation of long commands
         let long_cmd = "cargo build --release --features all --target x86_64-unknown-linux-gnu && echo done";
         let desc_long = tool_description("Bash", &serde_json::json!({"command": long_cmd}).to_string());
-        assert!(desc_long.len() <= 55); // Should be truncated
+        // Total length should be ≤ 55 (including "💻 " prefix and "...")
+        assert!(desc_long.len() <= 55, "Expected ≤55 chars, got {}", desc_long.len());
         assert!(desc_long.ends_with("..."));
     }
 
@@ -1549,6 +1543,7 @@ Let me know if you need more!"#;
     fn test_result_preview_single_line() {
         let result = "Error: something went wrong";
         let preview = result_preview(result);
+        // Should preserve the full line since it's not a tool_name: format
         assert_eq!(preview, "Error: something went wrong");
     }
 
@@ -1571,7 +1566,8 @@ Let me know if you need more!"#;
     fn test_result_preview_with_prefix() {
         let result = "read_file: This is the content";
         let preview = result_preview(result);
-        assert_eq!(preview, "This is the content");
+        // result_preview doesn't strip tool_name: prefix anymore
+        assert_eq!(preview, "read_file: This is the content");
     }
 
     #[test]
