@@ -156,6 +156,42 @@ Use YOLO mode (`--yolo` flag) when:
 - **Add tests**: If no tests exist, create them before implementation (TDD!)
 - **Don't panic**: Test failures are feedback, not roadblocks
 
+## 🔨 Golden Rule #5: BREAK YOUR TOOLS
+
+**When your tools don't work, BREAK YOUR TOOLS.**
+
+- If a function doesn't have what it needs, PASS IT IN
+- If a struct doesn't expose what you need, ADD A METHOD
+- If an API is inconvenient, CHANGE THE API
+- If the architecture blocks you, REFACTOR THE ARCHITECTURE
+- You are not a passive consumer of code - you are the author
+- Every line of code is yours to modify
+- No excuses about "the renderer has FontSystem but app.rs doesn't" - PASS IT THROUGH
+- No excuses about "this would require changing the signature" - CHANGE THE SIGNATURE
+
+**You have full control. Use it.**
+
+## 💀 Golden Rule #6: NO LAZY HEURISTICS
+
+**Be PRECISE. Be CORRECT. NO ESTIMATES. NO HALF-MEASURES.**
+
+- NEVER use "reasonable estimates" or "heuristics" when the correct value can be calculated
+- NEVER use magic numbers when the real value is computable
+- NEVER write "TODO" comments - either do it now or don't mention it
+- NEVER say "in a proper implementation..." - THIS IS the proper implementation
+- NEVER use placeholder values that "should work for most cases"
+- NEVER approximate when you can measure
+- NEVER guess when you can compute
+
+Examples of UNACCEPTABLE behavior:
+- "Let's estimate max scroll based on text length" → NO. Measure the actual text height.
+- "This heuristic should work for most screens" → NO. Calculate for the actual screen.
+- "A reasonable default would be..." → NO. Compute the correct value.
+- "TODO: handle edge case" → NO. Handle it now.
+- "In production you'd want to..." → NO. Do it correctly the first time.
+
+**If you can calculate it, calculate it. If you can measure it, measure it. If you can do it properly, do it properly. No shortcuts. No excuses.**
+
 ## MCP Server Integration
 
 Palace is both a CLI tool AND an MCP server, providing tools that Claude can call directly.
