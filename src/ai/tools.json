@@ -111,7 +111,7 @@
         },
         "header": {
           "type": "string",
-          "description": "Short label for the question (max 12 chars), e.g. 'Language', 'Framework'"
+          "description": "Short label for context"
         },
         "options": {
           "type": "array",

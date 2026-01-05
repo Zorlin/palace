@@ -347,6 +347,10 @@ pub enum AppState {
         multi_select: bool,
         /// Selected option indices (for multi-select)
         selected_indices: Vec<usize>,
+        /// Use quick-select face buttons (disabled when user navigates with dpad)
+        use_quick_select: bool,
+        /// Scroll offset for long option lists
+        scroll_offset: usize,
         /// Previous state to return to
         previous_state: Box<AppState>,
         /// Channel to send response back

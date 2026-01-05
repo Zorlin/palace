@@ -807,6 +807,8 @@ impl Renderer {
                 custom_active: bool,
                 multi_select: bool,
                 selected_indices: Vec<usize>,
+                use_quick_select: bool,
+                scroll_offset: usize,
             },
         }
 
@@ -845,7 +847,7 @@ impl Renderer {
             AppState::ExecuteModal { previous_state, selected_option } => {
                 (previous_state.as_ref(), Some(ModalType::Execute(*selected_option)))
             }
-            AppState::Survey { previous_state, question, header, options, focused_index, custom_input, custom_active, multi_select, selected_indices, .. } => {
+            AppState::Survey { previous_state, question, header, options, focused_index, custom_input, custom_active, multi_select, selected_indices, use_quick_select, scroll_offset, .. } => {
                 (previous_state.as_ref(), Some(ModalType::Survey {
                     question: question.clone(),
                     header: header.clone(),
@@ -855,6 +857,8 @@ impl Renderer {
                     custom_active: *custom_active,
                     multi_select: *multi_select,
                     selected_indices: selected_indices.clone(),
+                    use_quick_select: *use_quick_select,
+                    scroll_offset: *scroll_offset,
                 }))
             }
             _ => (state, None),
@@ -966,8 +970,8 @@ impl Renderer {
                 ModalType::UiScale { selected, user_scale_override } => self.queue_ui_scale_modal_text(*selected, *user_scale_override),
                 ModalType::Permission { selected, command, prefix } => self.queue_permission_modal_text(*selected, command, prefix),
                 ModalType::Execute(selected) => self.queue_execute_modal_text(*selected),
-                ModalType::Survey { question, header, options, focused, custom_input, custom_active, multi_select, selected_indices } => {
-                    self.queue_survey_modal_text(question, header, options, *focused, custom_input, *custom_active, *multi_select, selected_indices);
+                ModalType::Survey { question, header, options, focused, custom_input, custom_active, multi_select, selected_indices, use_quick_select, scroll_offset } => {
+                    self.queue_survey_modal_text(question, header, options, *focused, custom_input, *custom_active, *multi_select, selected_indices, *use_quick_select, *scroll_offset);
                 }
             }
 
@@ -987,8 +991,8 @@ impl Renderer {
                 ModalType::UiScale { selected, .. } => modal_cards.extend(self.build_ui_scale_modal_cards(*selected)),
                 ModalType::Permission { selected, command, prefix: _ } => modal_cards.extend(self.build_permission_modal_cards(*selected, command)),
                 ModalType::Execute(selected) => modal_cards.extend(self.build_execute_modal_cards(*selected)),
-                ModalType::Survey { question: _, header: _, options, focused, custom_input: _, custom_active: _, multi_select: _, selected_indices } => {
-                    modal_cards.extend(self.build_survey_modal_cards(options, *focused, selected_indices));
+                ModalType::Survey { question: _, header: _, options, focused, custom_input: _, custom_active: _, multi_select: _, selected_indices, scroll_offset, .. } => {
+                    modal_cards.extend(self.build_survey_modal_cards(options, *focused, selected_indices, *scroll_offset));
                 }
             }
 
@@ -1022,9 +1026,11 @@ impl Renderer {
                 if let ModalType::Permission { command, .. } = modal {
                     sprites.extend(self.build_permission_modal_sprites(command));
                 }
-                // Add survey modal button glyphs
-                if let ModalType::Survey { options, .. } = modal {
-                    sprites.extend(self.build_survey_modal_sprites(options.len()));
+                // Add survey modal button glyphs (only when quick-select is active)
+                if let ModalType::Survey { options, use_quick_select, .. } = modal {
+                    if *use_quick_select {
+                        sprites.extend(self.build_survey_modal_sprites(options.len()));
+                    }
                 }
                 if !sprites.is_empty() {
                     self.sprite_renderer
@@ -2187,16 +2193,24 @@ impl Renderer {
         custom_active: bool,
         multi_select: bool,
         selected_indices: &[usize],
+        _use_quick_select: bool,
+        scroll_offset: usize,
     ) {
-        // Modal dimensions
-        let modal_width = self.ui_scale.px(500.0).min(self.size.width as f32 - 40.0);
-        let option_count = options.len() + 1; // +1 for "Other"
+        // Modal dimensions - full width minus margins
+        let margin = self.ui_scale.px(48.0);
+        let modal_width = self.size.width as f32 - margin * 2.0;
         let card_height = self.ui_scale.px(60.0);
         let card_gap = self.ui_scale.px(10.0);
         let inner_padding = self.ui_scale.px(20.0);
         let title_height = self.ui_scale.px(80.0);
-        let modal_height = title_height + inner_padding + option_count as f32 * (card_height + card_gap);
-        let modal_x = (self.size.width as f32 - modal_width) / 2.0;
+
+        // Calculate how many options fit on screen
+        let available_height = self.size.height as f32 - margin * 2.0 - title_height - self.ui_scale.px(60.0);
+        let max_visible = (available_height / (card_height + card_gap)).floor() as usize;
+        let total_options = options.len() + 1; // +1 for "Other"
+
+        let modal_height = title_height + inner_padding + max_visible.min(total_options) as f32 * (card_height + card_gap);
+        let modal_x = margin;
         let modal_y = (self.size.height as f32 - modal_height) / 2.0;
 
         let scale = self.ui_scale.px(18.0);
@@ -2205,7 +2219,7 @@ impl Renderer {
         let text_padding = self.ui_scale.px(14.0);
         let card_start_y = modal_y + title_height;
 
-        // Header badge (e.g., "Auth method")
+        // Header badge
         if !header.is_empty() {
             self.text_queue.push(
                 header,
@@ -2227,20 +2241,34 @@ impl Renderer {
             self.ui_scale.px(50.0),
         );
 
-        // Options
+        // Scroll indicator if needed
+        if scroll_offset > 0 {
+            self.text_queue.push(
+                "▲ more above",
+                modal_x + modal_width / 2.0 - self.ui_scale.px(40.0),
+                card_start_y - self.ui_scale.px(18.0),
+                small_scale,
+                [0.5, 0.5, 0.6, 0.7],
+            );
+        }
+
+        // Options (with scroll)
+        let mut visible_idx = 0;
         for (i, opt) in options.iter().enumerate() {
-            let y = card_start_y + i as f32 * (card_height + card_gap) + text_padding;
+            if i < scroll_offset { continue; }
+            if visible_idx >= max_visible { break; }
+
+            let y = card_start_y + visible_idx as f32 * (card_height + card_gap) + text_padding;
             let is_focused = i == focused;
             let is_selected = selected_indices.contains(&i);
-
-            // Button glyphs are rendered as sprites in build_survey_modal_sprites
+            visible_idx += 1;
 
             // Checkbox for multi-select
             if multi_select {
                 let check = if is_selected { "☑" } else { "☐" };
                 self.text_queue.push(
                     check,
-                    modal_x + inner_padding + self.ui_scale.px(45.0),
+                    modal_x + inner_padding + self.ui_scale.px(10.0),
                     y,
                     scale,
                     if is_selected { [0.3, 1.0, 0.5, 1.0] } else { [0.5, 0.5, 0.6, 1.0] },
@@ -2248,7 +2276,7 @@ impl Renderer {
             }
 
             // Label
-            let label_x = modal_x + inner_padding + self.ui_scale.px(if multi_select { 70.0 } else { 50.0 });
+            let label_x = modal_x + inner_padding + self.ui_scale.px(if multi_select { 40.0 } else { 10.0 });
             let label_color = if is_focused {
                 [1.0, 1.0, 1.0, 1.0]
             } else {
@@ -2275,42 +2303,56 @@ impl Renderer {
             }
         }
 
-        // "Other" option
+        // "Other" option (if visible)
         let other_idx = options.len();
-        let other_y = card_start_y + other_idx as f32 * (card_height + card_gap) + text_padding;
-        let is_other_focused = focused == other_idx;
+        if other_idx >= scroll_offset && visible_idx < max_visible {
+            let y = card_start_y + visible_idx as f32 * (card_height + card_gap) + text_padding;
+            let is_other_focused = focused == other_idx;
 
-        self.text_queue.push(
-            "[▶]",
-            modal_x + inner_padding + self.ui_scale.px(8.0),
-            other_y,
-            scale,
-            if is_other_focused { [0.8, 0.5, 1.0, 1.0] } else { [0.5, 0.5, 0.6, 1.0] },
-        );
+            self.text_queue.push(
+                "▶",
+                modal_x + inner_padding + self.ui_scale.px(10.0),
+                y,
+                scale,
+                if is_other_focused { [0.8, 0.5, 1.0, 1.0] } else { [0.5, 0.5, 0.6, 1.0] },
+            );
 
-        let label_x = modal_x + inner_padding + self.ui_scale.px(50.0);
-        self.text_queue.push(
-            "Other (type custom answer)",
-            label_x,
-            other_y,
-            scale,
-            if is_other_focused { [1.0, 1.0, 1.0, 1.0] } else { [0.6, 0.6, 0.7, 1.0] },
-        );
+            let label_x = modal_x + inner_padding + self.ui_scale.px(40.0);
+            self.text_queue.push(
+                "Other (type custom answer)",
+                label_x,
+                y,
+                scale,
+                if is_other_focused { [1.0, 1.0, 1.0, 1.0] } else { [0.6, 0.6, 0.7, 1.0] },
+            );
 
-        // Custom input field
-        if custom_active {
-            let input_y = other_y + scale + self.ui_scale.px(8.0);
-            let display_text = if custom_input.is_empty() {
-                "Type here...".to_string()
-            } else {
-                format!("{}▌", custom_input)
-            };
-            let input_color = if custom_input.is_empty() {
-                [0.4, 0.4, 0.5, 0.7]
-            } else {
-                [0.9, 0.9, 1.0, 1.0]
-            };
-            self.text_queue.push(&display_text, label_x, input_y, scale, input_color);
+            // Custom input field
+            if custom_active {
+                let input_y = y + scale + self.ui_scale.px(8.0);
+                let display_text = if custom_input.is_empty() {
+                    "Type here...".to_string()
+                } else {
+                    format!("{}▌", custom_input)
+                };
+                let input_color = if custom_input.is_empty() {
+                    [0.4, 0.4, 0.5, 0.7]
+                } else {
+                    [0.9, 0.9, 1.0, 1.0]
+                };
+                self.text_queue.push(&display_text, label_x, input_y, scale, input_color);
+            }
+        }
+
+        // Scroll indicator if more below
+        if scroll_offset + max_visible < total_options {
+            let y = card_start_y + max_visible as f32 * (card_height + card_gap);
+            self.text_queue.push(
+                "▼ more below",
+                modal_x + modal_width / 2.0 - self.ui_scale.px(40.0),
+                y,
+                small_scale,
+                [0.5, 0.5, 0.6, 0.7],
+            );
         }
 
         // Help legend
@@ -2323,6 +2365,8 @@ impl Renderer {
             custom_active: false,
             multi_select,
             selected_indices: Vec::new(),
+            use_quick_select: false,
+            scroll_offset: 0,
             previous_state: Box::new(AppState::PalaceLoop {
                 project_path: std::path::PathBuf::new(),
                 cards: Vec::new(),
@@ -2346,15 +2390,23 @@ impl Renderer {
         options: &[crate::state::SurveyOption],
         focused: usize,
         selected_indices: &[usize],
+        scroll_offset: usize,
     ) -> Vec<CardInstance> {
-        let modal_width = self.ui_scale.px(500.0).min(self.size.width as f32 - 40.0);
-        let option_count = options.len() + 1; // +1 for "Other"
+        // Full-width layout matching queue_survey_modal_text
+        let margin = self.ui_scale.px(48.0);
+        let modal_width = self.size.width as f32 - margin * 2.0;
         let card_height = self.ui_scale.px(60.0);
         let card_gap = self.ui_scale.px(10.0);
         let inner_padding = self.ui_scale.px(20.0);
         let title_height = self.ui_scale.px(80.0);
-        let modal_height = title_height + inner_padding + option_count as f32 * (card_height + card_gap);
-        let modal_x = (self.size.width as f32 - modal_width) / 2.0;
+
+        // Calculate how many options fit on screen
+        let available_height = self.size.height as f32 - margin * 2.0 - title_height - self.ui_scale.px(60.0);
+        let max_visible = (available_height / (card_height + card_gap)).floor() as usize;
+        let total_options = options.len() + 1; // +1 for "Other"
+
+        let modal_height = title_height + inner_padding + max_visible.min(total_options) as f32 * (card_height + card_gap);
+        let modal_x = margin;
         let modal_y = (self.size.height as f32 - modal_height) / 2.0;
 
         let mut cards = Vec::new();
@@ -2366,14 +2418,19 @@ impl Renderer {
                 .with_corner_radius(self.ui_scale.px(16.0))
         );
 
-        // Option cards
+        // Option cards (with scroll)
         let card_start_y = modal_y + title_height;
         let card_width = modal_width - inner_padding * 2.0;
 
-        for i in 0..option_count {
+        let mut visible_idx = 0;
+        for i in 0..total_options {
+            if i < scroll_offset { continue; }
+            if visible_idx >= max_visible { break; }
+
             let is_focused = i == focused;
             let is_selected = selected_indices.contains(&i);
-            let y = card_start_y + i as f32 * (card_height + card_gap);
+            let y = card_start_y + visible_idx as f32 * (card_height + card_gap);
+            visible_idx += 1;
 
             let border_color = if is_selected {
                 [0.3, 1.0, 0.5, 0.95] // Green for selected
@@ -2884,7 +2941,7 @@ impl Renderer {
                     log_scale,
                     left_col_width,
                 );
-                let alpha = (0.85 - (entry_idx as f32 * 0.03)).max(0.25);
+                let alpha = 0.9; // No fade - clarity over aesthetics
                 let y = log_start_y + y_offset;
 
                 // Parse entry: [HH:MM:SS] icon action  summary dot
@@ -2990,7 +3047,7 @@ impl Renderer {
                     log_scale,
                     right_col_width,
                 );
-                let alpha = (0.85 - (entry_idx as f32 * 0.03)).max(0.25);
+                let alpha = 0.9; // No fade - clarity over aesthetics
                 let y = log_start_y + y_offset;
                 let x = screen_mid + self.ui_scale.px(10.0);
 

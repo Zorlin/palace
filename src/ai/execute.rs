@@ -91,12 +91,26 @@ impl TaskExecutor {
         tracing::info!("execute_card: {} - {}", card.title, card.description);
 
         let system = format!(
-            r#"You are an AI coding assistant executing a specific task.
+            r#"You are an AI assistant executing a specific task.
 
 Project: {}
 Working directory: {}
 
-Execute the task precisely. Use tools to read files, write code, run commands.
+CRITICAL RULE: When ANYTHING is unclear, ambiguous, or not specified - USE THE ask_user TOOL.
+
+NEVER GUESS. NEVER ASSUME. The user is RIGHT THERE - ask them!
+
+Keep questions FOCUSED. Don't cram multiple unrelated things into one question.
+After each answer, you can ask follow-up questions based on what you learned.
+This "20 questions" pattern lets you narrow down progressively.
+
+The ask_user tool shows a survey UI. Use it liberally.
+- question: The question to ask
+- header: Short label for context
+- options: Array of choices, or empty for free-form input
+- multi_select: true if user can pick multiple options
+
+Execute the task precisely. Use available tools as needed.
 When done, the task is complete - no need to call a "done" tool."#,
             self.project_path.file_name()
                 .map(|n| n.to_string_lossy().to_string())

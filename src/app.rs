@@ -1010,6 +1010,8 @@ impl App {
                 custom_active,
                 multi_select,
                 selected_indices,
+                use_quick_select,
+                scroll_offset,
                 previous_state,
                 response_tx,
                 ..
@@ -1018,29 +1020,61 @@ impl App {
                 let option_count = options.len();
                 let previous_state = previous_state.clone();
                 let has_custom = true; // Always have "Other" option
+                let total = option_count + if has_custom { 1 } else { 0 };
+
+                // Calculate visible_count based on actual screen size
+                let visible_count = if let Some(ref renderer) = self.renderer {
+                    let size = renderer.size();
+                    let ui_scale = renderer.ui_scale();
+                    let scale = |v: f32| v * ui_scale;
+                    let margin = scale(48.0);
+                    let title_height = scale(80.0);
+                    let card_height = scale(60.0);
+                    let card_gap = scale(10.0);
+                    let available_height = size.height as f32 - margin * 2.0 - title_height - scale(60.0);
+                    (available_height / (card_height + card_gap)).floor() as usize
+                } else {
+                    8 // Fallback
+                };
 
                 match key {
                     KeyCode::ArrowUp | KeyCode::KeyW => {
+                        // Navigation disables quick-select
+                        *use_quick_select = false;
                         if !*custom_active {
-                            let total = option_count + if has_custom { 1 } else { 0 };
                             if *focused_index > 0 {
                                 *focused_index -= 1;
                             } else {
                                 *focused_index = total - 1;
+                                // Wrap to bottom - scroll to show last item
+                                *scroll_offset = total.saturating_sub(visible_count);
+                            }
+                            // Update scroll to keep focused item visible
+                            if *focused_index < *scroll_offset {
+                                *scroll_offset = *focused_index;
                             }
                         }
                     }
                     KeyCode::ArrowDown | KeyCode::KeyS => {
+                        // Navigation disables quick-select
+                        *use_quick_select = false;
                         if !*custom_active {
-                            let total = option_count + if has_custom { 1 } else { 0 };
                             if *focused_index < total - 1 {
                                 *focused_index += 1;
                             } else {
                                 *focused_index = 0;
+                                *scroll_offset = 0; // Wrap to top
+                            }
+                            // Update scroll to keep focused item visible
+                            if *focused_index >= *scroll_offset + visible_count {
+                                *scroll_offset = focused_index.saturating_sub(visible_count - 1);
+                            }
+                            if *focused_index < *scroll_offset {
+                                *scroll_offset = *focused_index;
                             }
                         }
                     }
-                    // A button / Enter / Space → Select option 0 directly, or focused option
+                    // A button / Enter / Space → Confirm focused or quick-select option 0
                     KeyCode::Enter | KeyCode::Space => {
                         if *custom_active {
                             // In custom mode, submit if there's input
@@ -1050,6 +1084,12 @@ impl App {
                                 }
                                 self.state = *previous_state;
                             }
+                        } else if *use_quick_select && option_count > 0 {
+                            // Quick-select option 0
+                            if let Some(tx) = response_tx.take() {
+                                let _ = tx.send(SurveyResponse::Selected(vec![0]));
+                            }
+                            self.state = *previous_state;
                         } else if *focused_index >= option_count {
                             // Focused on "Other" option - activate custom input
                             *custom_active = true;
@@ -1061,14 +1101,14 @@ impl App {
                                 selected_indices.push(*focused_index);
                             }
                         } else {
-                            // Single select - submit immediately
+                            // Single select - submit focused
                             if let Some(tx) = response_tx.take() {
                                 let _ = tx.send(SurveyResponse::Selected(vec![*focused_index]));
                             }
                             self.state = *previous_state;
                         }
                     }
-                    // X button → Select option 1 directly (in single-select) or confirm (in multi-select)
+                    // X button → Quick-select option 1, or confirm multi-select
                     KeyCode::KeyX => {
                         if *custom_active {
                             // Ignore in custom mode
@@ -1080,31 +1120,30 @@ impl App {
                                 }
                                 self.state = *previous_state;
                             }
-                        } else if option_count > 1 {
-                            // Direct select option 1
+                        } else if *use_quick_select && option_count > 1 {
+                            // Quick-select option 1
                             if let Some(tx) = response_tx.take() {
                                 let _ = tx.send(SurveyResponse::Selected(vec![1]));
                             }
                             self.state = *previous_state;
                         }
                     }
-                    // B button / Backspace → Select option 2 directly, or backspace in custom mode
+                    // B button / Backspace → Quick-select option 2, or backspace
                     KeyCode::Backspace => {
                         if *custom_active {
                             custom_input.pop();
-                        } else if !*multi_select && option_count > 2 {
-                            // Direct select option 2
+                        } else if *use_quick_select && option_count > 2 {
+                            // Quick-select option 2
                             if let Some(tx) = response_tx.take() {
                                 let _ = tx.send(SurveyResponse::Selected(vec![2]));
                             }
                             self.state = *previous_state;
                         }
-                        // If < 3 options, B does nothing (user must navigate)
                     }
-                    // Y button → Select option 3 directly
+                    // Y button → Quick-select option 3
                     KeyCode::KeyY => {
-                        if !*custom_active && !*multi_select && option_count > 3 {
-                            // Direct select option 3
+                        if !*custom_active && *use_quick_select && option_count > 3 {
+                            // Quick-select option 3
                             if let Some(tx) = response_tx.take() {
                                 let _ = tx.send(SurveyResponse::Selected(vec![3]));
                             }
@@ -1607,31 +1646,43 @@ impl App {
                     }
                 }
             }
-            AppState::Survey { options, focused_index, .. } => {
-                // Tap on survey option items
+            AppState::Survey { options, focused_index, scroll_offset, .. } => {
+                // Tap on survey option items - full-width layout with scroll
                 let ui_scale = self.renderer.as_ref().map(|r| r.ui_scale()).unwrap_or(1.0);
                 let scale = |v: f32| v * ui_scale;
 
-                let modal_width = scale(500.0).min(size.width as f32 - 40.0);
-                let option_count = options.len() + 1; // +1 for "Other"
+                let margin = scale(48.0);
+                let modal_width = size.width as f32 - margin * 2.0;
+                let total_options = options.len() + 1; // +1 for "Other"
                 let card_height = scale(60.0);
                 let card_gap = scale(10.0);
                 let inner_padding = scale(20.0);
-                let title_height = scale(80.0); // Question area
-                let modal_height = title_height + inner_padding + option_count as f32 * (card_height + card_gap);
-                let modal_x = (size.width as f32 - modal_width) / 2.0;
+                let title_height = scale(80.0);
+
+                // Calculate visible options
+                let available_height = size.height as f32 - margin * 2.0 - title_height - scale(60.0);
+                let max_visible = (available_height / (card_height + card_gap)).floor() as usize;
+                let visible_count = max_visible.min(total_options);
+
+                let modal_height = title_height + inner_padding + visible_count as f32 * (card_height + card_gap);
+                let modal_x = margin;
                 let modal_y = (size.height as f32 - modal_height) / 2.0;
 
                 let card_start_y = modal_y + title_height;
-                for i in 0..option_count {
-                    let card_y = card_start_y + i as f32 * (card_height + card_gap);
-                    let card_width = modal_width - inner_padding * 2.0;
-                    let card_x = modal_x + inner_padding;
+                let card_width = modal_width - inner_padding * 2.0;
+                let card_x = modal_x + inner_padding;
+
+                // Check visible cards (accounting for scroll)
+                for visible_idx in 0..visible_count {
+                    let actual_idx = *scroll_offset + visible_idx;
+                    if actual_idx >= total_options { break; }
+
+                    let card_y = card_start_y + visible_idx as f32 * (card_height + card_gap);
 
                     if x >= card_x && x <= card_x + card_width
                        && y >= card_y && y <= card_y + card_height {
-                        tracing::info!("Tapped survey option {}", i);
-                        *focused_index = i;
+                        tracing::info!("Tapped survey option {}", actual_idx);
+                        *focused_index = actual_idx;
                         self.handle_input(KeyCode::Enter);
                         return;
                     }
@@ -2072,6 +2123,9 @@ impl ApplicationHandler<AppEvent> for App {
                     custom_active: false,
                     multi_select,
                     selected_indices: Vec::new(),
+                    // Quick-select only for single-select mode (disabled when user navigates)
+                    use_quick_select: !multi_select,
+                    scroll_offset: 0,
                     previous_state: Box::new(self.state.clone()),
                     response_tx: Some(response_tx),
                 };
