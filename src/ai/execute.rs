@@ -244,7 +244,9 @@ When done, the task is complete - no need to call a "done" tool."#,
             move |tool_name, tool_input| {
                 tracing::debug!("Executing tool: {} with input: {}", tool_name, tool_input);
                 let result = execute_tool(&tool_ctx_clone, tool_name, tool_input);
-                tracing::debug!("Tool result: {}", &result[..result.len().min(200)]);
+                // Safe truncation respecting UTF-8 char boundaries
+                let truncated: String = result.chars().take(200).collect();
+                tracing::debug!("Tool result: {}", truncated);
                 result
             },
         )?;
