@@ -2,6 +2,7 @@ mod ai;
 mod app;
 mod debug;
 mod display;
+mod persistence;
 mod projects;
 mod renderer;
 mod state;

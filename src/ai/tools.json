@@ -1,0 +1,143 @@
+[
+  {
+    "name": "bash",
+    "description": "Execute a shell command in the project directory",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "The bash command to execute"
+        }
+      },
+      "required": ["command"]
+    }
+  },
+  {
+    "name": "read_file",
+    "description": "Read the contents of a file",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "Path to the file (relative to project or absolute)"
+        }
+      },
+      "required": ["file_path"]
+    }
+  },
+  {
+    "name": "write_file",
+    "description": "Write content to a file (creates parent directories)",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "Path to the file (relative to project or absolute)"
+        },
+        "content": {
+          "type": "string",
+          "description": "Content to write to the file"
+        }
+      },
+      "required": ["file_path", "content"]
+    }
+  },
+  {
+    "name": "edit_file",
+    "description": "Edit a file by replacing old_string with new_string",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "Path to the file to edit"
+        },
+        "old_string": {
+          "type": "string",
+          "description": "The exact string to find and replace"
+        },
+        "new_string": {
+          "type": "string",
+          "description": "The string to replace it with"
+        }
+      },
+      "required": ["file_path", "old_string", "new_string"]
+    }
+  },
+  {
+    "name": "glob",
+    "description": "Find files matching a glob pattern",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "description": "Glob pattern like **/*.rs or src/*.py"
+        }
+      },
+      "required": ["pattern"]
+    }
+  },
+  {
+    "name": "grep",
+    "description": "Search for a pattern in files using ripgrep or grep",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "description": "Regex pattern to search for"
+        },
+        "path": {
+          "type": "string",
+          "description": "Optional subdirectory to search in"
+        }
+      },
+      "required": ["pattern"]
+    }
+  },
+  {
+    "name": "ask_user",
+    "description": "Ask the user a question with any number of options. Use this EXTENSIVELY when unsure. Perfect for clarifying requirements, choosing between approaches, or gathering project specifications.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "question": {
+          "type": "string",
+          "description": "The question to ask (clear, specific, ends with ?)"
+        },
+        "header": {
+          "type": "string",
+          "description": "Short label for the question (max 12 chars), e.g. 'Language', 'Framework'"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "description": "Short option label (1-5 words)"
+              },
+              "description": {
+                "type": "string",
+                "description": "Brief explanation of this choice"
+              }
+            },
+            "required": ["label", "description"]
+          },
+          "description": "Options for the user to choose from. First 4 can be selected with face buttons (A/B/X/Y), rest via d-pad navigation."
+        },
+        "multi_select": {
+          "type": "boolean",
+          "description": "If true, user can select multiple options",
+          "default": false
+        }
+      },
+      "required": ["question", "header", "options"]
+    }
+  }
+]

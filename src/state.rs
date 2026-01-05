@@ -207,6 +207,35 @@ impl SuggestionCard {
     }
 }
 
+/// A survey option for AskUserQuestion
+#[derive(Debug, Clone)]
+pub struct SurveyOption {
+    /// Display label for this option
+    pub label: String,
+    /// Description explaining this option
+    pub description: String,
+}
+
+impl SurveyOption {
+    pub fn new(label: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            description: description.into(),
+        }
+    }
+}
+
+/// Response from a survey (sent back to caller)
+#[derive(Debug, Clone)]
+pub enum SurveyResponse {
+    /// User selected specific option(s)
+    Selected(Vec<usize>),
+    /// User provided custom text
+    Custom(String),
+    /// User cancelled
+    Cancelled,
+}
+
 /// Current application state
 #[derive(Debug, Clone)]
 pub enum AppState {
@@ -224,8 +253,10 @@ pub enum AppState {
         project_path: PathBuf,
         /// Cards with streaming suggestions
         cards: Vec<SuggestionCard>,
-        /// Currently focused card index
+        /// Currently focused card index (keyboard/gamepad)
         focused_index: usize,
+        /// Currently hovered card index (mouse)
+        hovered_index: Option<usize>,
         /// Is the AI still generating suggestions?
         generating: bool,
         /// Tool call currently being displayed
@@ -238,6 +269,8 @@ pub enum AppState {
         log_scroll_offset: usize,
         /// Scroll offset for focused card detail panel (right thumbstick)
         detail_scroll_offset: f32,
+        /// Max scroll for current focused card (calculated from content height)
+        detail_max_scroll: f32,
     },
     /// Main menu - opened with Start button (Resume, Settings, Exit)
     MainMenu {
@@ -277,6 +310,48 @@ pub enum AppState {
         /// Previous state to return to
         previous_state: Box<AppState>,
     },
+    /// Executing - Claude/Z.ai is running the selected tasks
+    Executing {
+        /// Project path
+        project_path: PathBuf,
+        /// Cards being executed
+        executing_cards: Vec<SuggestionCard>,
+        /// Current execution status
+        status: ExecutionStatus,
+        /// Left column: tool calls with timestamps (format: "[HH:MM:SS] icon action")
+        tool_log: Vec<String>,
+        /// Right column: Claude's commentary/thoughts with timestamps
+        thought_log: Vec<String>,
+        /// Scroll offset for logs
+        log_scroll_offset: usize,
+        /// Which executor is running (Claude, ZAi, etc)
+        executor: ExecuteOption,
+        /// Previous state to return to (PalaceLoop)
+        previous_state: Box<AppState>,
+    },
+    /// Survey/Question UI - for Claude's AskUserQuestion tool
+    Survey {
+        /// The question being asked
+        question: String,
+        /// Short header label (e.g., "Auth method")
+        header: String,
+        /// Available options (up to 4 + custom)
+        options: Vec<SurveyOption>,
+        /// Currently focused option index
+        focused_index: usize,
+        /// Custom input text (when "Other" option is selected)
+        custom_input: String,
+        /// Whether custom input is active
+        custom_active: bool,
+        /// Allow multiple selections
+        multi_select: bool,
+        /// Selected option indices (for multi-select)
+        selected_indices: Vec<usize>,
+        /// Previous state to return to
+        previous_state: Box<AppState>,
+        /// Channel to send response back
+        response_tx: Option<std::sync::mpsc::Sender<SurveyResponse>>,
+    },
 }
 
 /// Execution options
@@ -305,6 +380,36 @@ impl ExecuteOption {
             ExecuteOption::ZAi => "Run with Z.ai",
             ExecuteOption::ZAiTurbo => "Run with Z.ai (turbo)",
         }
+    }
+}
+
+/// Execution status
+#[derive(Debug, Clone)]
+pub enum ExecutionStatus {
+    /// Waiting to start
+    Pending,
+    /// Currently running
+    Running {
+        /// Current card index being executed
+        current_card: usize,
+        /// Total cards to execute
+        total_cards: usize,
+    },
+    /// Completed successfully
+    Completed,
+    /// Failed with error
+    Failed(String),
+    /// Cancelled by user
+    Cancelled,
+}
+
+impl ExecutionStatus {
+    pub fn is_running(&self) -> bool {
+        matches!(self, ExecutionStatus::Running { .. })
+    }
+
+    pub fn is_done(&self) -> bool {
+        matches!(self, ExecutionStatus::Completed | ExecutionStatus::Failed(_) | ExecutionStatus::Cancelled)
     }
 }
 

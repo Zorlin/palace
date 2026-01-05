@@ -192,6 +192,8 @@ pub struct Renderer {
     blur_texture: Option<wgpu::Texture>,
     /// Dark mode enabled (true = dark, false = light)
     dark_mode: bool,
+    /// Whether UI scale is auto-detected (true) or user-set (false)
+    is_auto_scale: bool,
 }
 
 impl Renderer {
@@ -493,6 +495,7 @@ impl Renderer {
             scene_texture: None,
             blur_texture: None,
             dark_mode: true,
+            is_auto_scale: true,
         })
     }
 
@@ -505,14 +508,73 @@ impl Renderer {
     }
 
     /// Set UI scale factor (e.g., 1.5 for 150% scaling)
-    pub fn set_ui_scale(&mut self, scale: f32) {
+    /// is_auto: true if auto-detected, false if user-set
+    pub fn set_ui_scale(&mut self, scale: f32, is_auto: bool) {
         self.ui_scale.dpi_scale = scale;
-        tracing::info!("UI scale set to {}", scale);
+        self.is_auto_scale = is_auto;
+        tracing::info!("UI scale set to {} ({})", scale, if is_auto { "auto" } else { "manual" });
     }
 
     /// Get current UI scale factor
     pub fn ui_scale(&self) -> f32 {
         self.ui_scale.dpi_scale
+    }
+
+    /// Calculate max scroll for text content
+    /// Returns 0.0 if content fits within visible height
+    pub fn calculate_max_scroll(&mut self, text: &str, font_size: f32, width: f32, visible_height: f32) -> f32 {
+        let (_, content_height, _) = crate::renderer::text::measure_text(
+            &mut self.font_system,
+            text,
+            font_size,
+            width,
+        );
+        (content_height - visible_height).max(0.0)
+    }
+
+    /// Calculate max scroll for a suggestion card's description
+    /// Uses the same layout parameters as rendering
+    pub fn calculate_card_max_scroll(&mut self, card: &crate::state::SuggestionCard) -> f32 {
+        let grid = CardGrid::for_palace_loop(
+            self.size.width as f32,
+            self.size.height as f32,
+            &self.ui_scale,
+        );
+
+        let text_margin = self.ui_scale.px(12.0);
+        let desc_scale = self.ui_scale.px(13.0);
+        let desc_width = grid.card_width - text_margin * 2.0;
+        let visible_height = grid.card_height - text_margin * 2.0;
+
+        // Build same text as render: description + command
+        let description = if card.description.is_empty() {
+            if card.streaming { "Loading..." } else { "No description" }
+        } else {
+            &card.description
+        };
+
+        let full_markdown = if let Some(ref cmd) = card.command {
+            if cmd.trim().is_empty() {
+                // No command to display
+                description.to_string()
+            } else {
+                let display_cmd = if cmd.len() > 40 {
+                    format!("$ {}...", &cmd[..37])
+                } else {
+                    format!("$ {}", cmd)
+                };
+                format!("{}\n\n{}", description, display_cmd)
+            }
+        } else {
+            description.to_string()
+        };
+
+        // Parse markdown and measure the resulting plain text
+        // This matches what the renderer does when it parses and displays
+        let spans = crate::renderer::text::parse_markdown(&full_markdown);
+        let plain_text = crate::renderer::text::spans_to_plain_text(&spans);
+
+        self.calculate_max_scroll(&plain_text, desc_scale, desc_width, visible_height)
     }
 
     pub fn set_gamepad_connected(&mut self, connected: bool) {
@@ -544,6 +606,24 @@ impl Renderer {
         } else {
             [0.4, 0.4, 0.45, 1.0] // Darker gray
         }
+    }
+
+    /// Get temporal rainbow color based on timestamp in log entry
+    /// Entries with similar timestamps get similar hues - helps visually match left/right columns
+    fn temporal_rainbow_color(&self, entry: &str, alpha: f32) -> [f32; 4] {
+        // Try to parse timestamp [HH:MM:SS] at start
+        if entry.starts_with('[') && entry.len() > 10 && entry.chars().nth(9) == Some(']') {
+            // Extract seconds from timestamp for hue cycling
+            // Format: [HH:MM:SS]
+            if let Ok(seconds) = entry[7..9].parse::<u32>() {
+                // Map seconds (0-59) to hue (0-360), cycle every minute
+                let hue = (seconds as f32 / 60.0) * 360.0;
+                let (r, g, b) = hsl_to_rgb(hue, 0.4, 0.65); // Soft saturation, moderate lightness
+                return [r, g, b, alpha];
+            }
+        }
+        // Default to blue-ish gray if no timestamp
+        [0.5, 0.6, 0.8, alpha]
     }
 
     /// Get border color based on dark mode
@@ -651,6 +731,7 @@ impl Renderer {
     /// Returns PreparedText that must be kept alive until after render
     fn prepare_text(&mut self) -> PreparedText {
         let requests = self.text_queue.take();
+        let markdown_requests = self.text_queue.take_markdown();
         let screen_width = self.size.width as f32;
         let screen_height = self.size.height as f32;
 
@@ -663,7 +744,7 @@ impl Renderer {
             },
         );
 
-        let prepared = PreparedText::prepare(requests, &mut self.font_system, screen_width);
+        let prepared = PreparedText::prepare(requests, markdown_requests, &mut self.font_system, screen_width);
 
         if let Err(e) = prepared.upload(
             &self.device,
@@ -717,6 +798,16 @@ impl Renderer {
             UiScale { selected: usize, user_scale_override: Option<f32> },
             Permission { selected: usize, command: String, prefix: String },
             Execute(usize),
+            Survey {
+                question: String,
+                header: String,
+                options: Vec<crate::state::SurveyOption>,
+                focused: usize,
+                custom_input: String,
+                custom_active: bool,
+                multi_select: bool,
+                selected_indices: Vec<usize>,
+            },
         }
 
         let (base_state, modal_type) = match state {
@@ -754,6 +845,18 @@ impl Renderer {
             AppState::ExecuteModal { previous_state, selected_option } => {
                 (previous_state.as_ref(), Some(ModalType::Execute(*selected_option)))
             }
+            AppState::Survey { previous_state, question, header, options, focused_index, custom_input, custom_active, multi_select, selected_indices, .. } => {
+                (previous_state.as_ref(), Some(ModalType::Survey {
+                    question: question.clone(),
+                    header: header.clone(),
+                    options: options.clone(),
+                    focused: *focused_index,
+                    custom_input: custom_input.clone(),
+                    custom_active: *custom_active,
+                    multi_select: *multi_select,
+                    selected_indices: selected_indices.clone(),
+                }))
+            }
             _ => (state, None),
         };
 
@@ -765,10 +868,10 @@ impl Renderer {
             AppState::ProjectView { selected_action, .. } => {
                 self.build_action_cards(*selected_action)
             }
-            AppState::PalaceLoop { cards, focused_index, .. } => {
-                self.build_suggestion_cards(cards, *focused_index)
+            AppState::PalaceLoop { cards, focused_index, hovered_index, .. } => {
+                self.build_suggestion_cards(cards, *focused_index, *hovered_index)
             }
-            AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } | AppState::PermissionModal { .. } | AppState::ExecuteModal { .. } => Vec::new(),
+            AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } | AppState::PermissionModal { .. } | AppState::ExecuteModal { .. } | AppState::Survey { .. } | AppState::Executing { .. } => Vec::new(),
         };
 
         // When modal is open, render base scene then overlay + modal
@@ -809,10 +912,10 @@ impl Renderer {
                 AppState::ProjectView { project_path, selected_action } => {
                     self.queue_project_view_text(project_path, *selected_action);
                 }
-                AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, detail_scroll_offset, .. } => {
-                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *detail_scroll_offset);
+                AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, hovered_index, detail_scroll_offset, .. } => {
+                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *hovered_index, *detail_scroll_offset);
                 }
-                AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } | AppState::PermissionModal { .. } | AppState::ExecuteModal { .. } => {}
+                AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } | AppState::PermissionModal { .. } | AppState::ExecuteModal { .. } | AppState::Survey { .. } | AppState::Executing { .. } => {}
             }
 
             // Prepare base text for Pass 1
@@ -863,6 +966,9 @@ impl Renderer {
                 ModalType::UiScale { selected, user_scale_override } => self.queue_ui_scale_modal_text(*selected, *user_scale_override),
                 ModalType::Permission { selected, command, prefix } => self.queue_permission_modal_text(*selected, command, prefix),
                 ModalType::Execute(selected) => self.queue_execute_modal_text(*selected),
+                ModalType::Survey { question, header, options, focused, custom_input, custom_active, multi_select, selected_indices } => {
+                    self.queue_survey_modal_text(question, header, options, *focused, custom_input, *custom_active, *multi_select, selected_indices);
+                }
             }
 
             // Prepare modal text for Pass 2
@@ -881,6 +987,9 @@ impl Renderer {
                 ModalType::UiScale { selected, .. } => modal_cards.extend(self.build_ui_scale_modal_cards(*selected)),
                 ModalType::Permission { selected, command, prefix: _ } => modal_cards.extend(self.build_permission_modal_cards(*selected, command)),
                 ModalType::Execute(selected) => modal_cards.extend(self.build_execute_modal_cards(*selected)),
+                ModalType::Survey { question: _, header: _, options, focused, custom_input: _, custom_active: _, multi_select: _, selected_indices } => {
+                    modal_cards.extend(self.build_survey_modal_cards(options, *focused, selected_indices));
+                }
             }
 
             {
@@ -912,6 +1021,10 @@ impl Renderer {
                 // Add permission modal button glyphs (always show, not just gamepad)
                 if let ModalType::Permission { command, .. } = modal {
                     sprites.extend(self.build_permission_modal_sprites(command));
+                }
+                // Add survey modal button glyphs
+                if let ModalType::Survey { options, .. } = modal {
+                    sprites.extend(self.build_survey_modal_sprites(options.len()));
                 }
                 if !sprites.is_empty() {
                     self.sprite_renderer
@@ -1011,14 +1124,16 @@ impl Renderer {
                 AppState::ProjectView { project_path, selected_action } => {
                     self.queue_project_view_text(project_path, *selected_action);
                 }
-                AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, detail_scroll_offset, .. } => {
-                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *detail_scroll_offset);
+                AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, hovered_index, detail_scroll_offset, .. } => {
+                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *hovered_index, *detail_scroll_offset);
                 }
                 AppState::MainMenu { .. } => {}
                 AppState::SettingsMenu { .. } => {}
                 AppState::UiScaleMenu { .. } => {}
                 AppState::PermissionModal { .. } => {}
                 AppState::ExecuteModal { .. } => {}
+                AppState::Survey { .. } => {}
+                AppState::Executing { .. } => {}
             }
 
             // Prepare text
@@ -1123,14 +1238,18 @@ impl Renderer {
                 AppState::ProjectView { project_path, selected_action } => {
                     self.queue_project_view_text(project_path, *selected_action);
                 }
-                AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, detail_scroll_offset, .. } => {
-                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *detail_scroll_offset);
+                AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, hovered_index, detail_scroll_offset, .. } => {
+                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *hovered_index, *detail_scroll_offset);
+                }
+                AppState::Executing { tool_log, thought_log, log_scroll_offset, status, executor, .. } => {
+                    self.queue_executing_text(tool_log, thought_log, *log_scroll_offset, status, *executor);
                 }
                 AppState::MainMenu { .. } => {}
                 AppState::SettingsMenu { .. } => {}
                 AppState::UiScaleMenu { .. } => {}
                 AppState::PermissionModal { .. } => {}
                 AppState::ExecuteModal { .. } => {}
+                AppState::Survey { .. } => {}
             }
 
             // Prepare text
@@ -1276,7 +1395,7 @@ impl Renderer {
             .collect()
     }
 
-    fn build_suggestion_cards(&self, cards: &[SuggestionCard], focused: usize) -> Vec<CardInstance> {
+    fn build_suggestion_cards(&self, cards: &[SuggestionCard], focused: usize, hovered: Option<usize>) -> Vec<CardInstance> {
         let grid = CardGrid::for_palace_loop(
             self.size.width as f32,
             self.size.height as f32,
@@ -1288,17 +1407,18 @@ impl Renderer {
             .enumerate()
             .map(|(i, card)| {
                 let (x, y) = grid.card_position(i);
-                let is_focused = i == focused;
+                // Card is "flipped" when focused via keyboard/gamepad OR hovered via mouse
+                let is_flipped = i == focused || hovered == Some(i);
 
                 // Use card's category color for BORDER only (alpha < 1.0 = OLED mode = black fill)
                 let mut color = card.color();
                 color[3] = 0.95; // OLED mode: colored border, black background
 
                 let mut instance = CardInstance::new(x, y, grid.card_width, grid.card_height, color)
-                    .with_border_width(self.ui_scale.px(if is_focused { 4.0 } else { 2.0 }))
+                    .with_border_width(self.ui_scale.px(if is_flipped { 4.0 } else { 2.0 }))
                     .with_corner_radius(self.ui_scale.px(12.0));
 
-                if is_focused {
+                if is_flipped {
                     instance = instance.selected();
                 }
 
@@ -1495,13 +1615,26 @@ impl Renderer {
             self.text_queue.push(item.label(), modal_x + inner_padding + self.ui_scale.px(15.0), y, scale, label_color);
 
             // Value indicator on right side
-            let value_text = match item {
-                SettingsItem::DarkMode => if self.dark_mode { "ON" } else { "OFF" },
-                SettingsItem::UiScale => "100%",
+            let value_text: String = match item {
+                SettingsItem::DarkMode => if self.dark_mode { "ON".to_string() } else { "OFF".to_string() },
+                SettingsItem::UiScale => format!("{}%", (self.ui_scale.dpi_scale * 100.0) as i32),
             };
+            let value_x = modal_x + modal_width - inner_padding - self.ui_scale.px(60.0);
+
+            // Show "(auto)" indicator to the left of the value for auto-detected UI scale
+            if matches!(item, SettingsItem::UiScale) && self.is_auto_scale {
+                self.text_queue.push(
+                    "(auto)",
+                    value_x - self.ui_scale.px(55.0),
+                    y + self.ui_scale.px(2.0),
+                    scale * 0.6,
+                    [0.5, 0.8, 0.9, 0.7],
+                );
+            }
+
             self.text_queue.push(
-                value_text,
-                modal_x + modal_width - inner_padding - self.ui_scale.px(60.0),
+                &value_text,
+                value_x,
                 y,
                 scale * 0.85,
                 [0.5, 0.8, 0.9, 1.0],
@@ -1699,6 +1832,36 @@ impl Renderer {
         sprites
     }
 
+    /// Build sprites for survey modal (button glyphs next to first 4 options)
+    fn build_survey_modal_sprites(&self, option_count: usize) -> Vec<SpriteInstance> {
+        // Must match queue_survey_modal_text dimensions
+        let modal_width = self.ui_scale.px(500.0).min(self.size.width as f32 - 40.0);
+        let total_options = option_count + 1; // +1 for "Other"
+        let card_height = self.ui_scale.px(60.0);
+        let card_gap = self.ui_scale.px(10.0);
+        let inner_padding = self.ui_scale.px(20.0);
+        let title_height = self.ui_scale.px(80.0);
+        let modal_height = title_height + inner_padding + total_options as f32 * (card_height + card_gap);
+        let modal_x = (self.size.width as f32 - modal_width) / 2.0;
+        let modal_y = (self.size.height as f32 - modal_height) / 2.0;
+        let card_start_y = modal_y + title_height;
+        let glyph_size = self.ui_scale.px(32.0);
+
+        let mut sprites = Vec::new();
+        // Same order as permission modal: A=0, X=1, B=2, Y=3
+        let buttons = [XboxButton::A, XboxButton::X, XboxButton::B, XboxButton::Y];
+
+        for (i, button) in buttons.iter().enumerate() {
+            if i >= total_options { break; }
+            let y = card_start_y + i as f32 * (card_height + card_gap);
+            let glyph_x = modal_x + inner_padding + self.ui_scale.px(8.0);
+            let glyph_y = y + (card_height - glyph_size) / 2.0;
+            sprites.push(SpriteInstance::new(glyph_x, glyph_y, glyph_size, *button));
+        }
+
+        sprites
+    }
+
     fn queue_ui_scale_modal_text(&mut self, selected: usize, user_scale_override: Option<f32>) {
         use crate::state::UiScaleOption;
 
@@ -1871,12 +2034,14 @@ impl Renderer {
                 project_path: std::path::PathBuf::new(),
                 cards: Vec::new(),
                 focused_index: 0,
+                hovered_index: None,
                 generating: false,
                 current_tool: None,
                 tool_log: Vec::new(),
                 thought_log: Vec::new(),
                 log_scroll_offset: 0,
                 detail_scroll_offset: 0.0,
+                detail_max_scroll: 0.0,
             }),
         };
         self.queue_help_legend(&help_state);
@@ -1999,15 +2164,243 @@ impl Renderer {
                 project_path: std::path::PathBuf::new(),
                 cards: Vec::new(),
                 focused_index: 0,
+                hovered_index: None,
                 generating: false,
                 current_tool: None,
                 tool_log: Vec::new(),
                 thought_log: Vec::new(),
                 log_scroll_offset: 0,
                 detail_scroll_offset: 0.0,
+                detail_max_scroll: 0.0,
             }),
         };
         self.queue_help_legend(&help_state);
+    }
+
+    fn queue_survey_modal_text(
+        &mut self,
+        question: &str,
+        header: &str,
+        options: &[crate::state::SurveyOption],
+        focused: usize,
+        custom_input: &str,
+        custom_active: bool,
+        multi_select: bool,
+        selected_indices: &[usize],
+    ) {
+        // Modal dimensions
+        let modal_width = self.ui_scale.px(500.0).min(self.size.width as f32 - 40.0);
+        let option_count = options.len() + 1; // +1 for "Other"
+        let card_height = self.ui_scale.px(60.0);
+        let card_gap = self.ui_scale.px(10.0);
+        let inner_padding = self.ui_scale.px(20.0);
+        let title_height = self.ui_scale.px(80.0);
+        let modal_height = title_height + inner_padding + option_count as f32 * (card_height + card_gap);
+        let modal_x = (self.size.width as f32 - modal_width) / 2.0;
+        let modal_y = (self.size.height as f32 - modal_height) / 2.0;
+
+        let scale = self.ui_scale.px(18.0);
+        let title_scale = self.ui_scale.px(24.0);
+        let small_scale = self.ui_scale.px(12.0);
+        let text_padding = self.ui_scale.px(14.0);
+        let card_start_y = modal_y + title_height;
+
+        // Header badge (e.g., "Auth method")
+        if !header.is_empty() {
+            self.text_queue.push(
+                header,
+                modal_x + inner_padding,
+                modal_y + self.ui_scale.px(10.0),
+                small_scale,
+                [0.6, 0.8, 1.0, 1.0],
+            );
+        }
+
+        // Question text
+        self.text_queue.push_bounded(
+            question,
+            modal_x + inner_padding,
+            modal_y + self.ui_scale.px(28.0),
+            title_scale,
+            [0.9, 0.9, 1.0, 1.0],
+            modal_width - inner_padding * 2.0,
+            self.ui_scale.px(50.0),
+        );
+
+        // Options
+        for (i, opt) in options.iter().enumerate() {
+            let y = card_start_y + i as f32 * (card_height + card_gap) + text_padding;
+            let is_focused = i == focused;
+            let is_selected = selected_indices.contains(&i);
+
+            // Button glyphs are rendered as sprites in build_survey_modal_sprites
+
+            // Checkbox for multi-select
+            if multi_select {
+                let check = if is_selected { "☑" } else { "☐" };
+                self.text_queue.push(
+                    check,
+                    modal_x + inner_padding + self.ui_scale.px(45.0),
+                    y,
+                    scale,
+                    if is_selected { [0.3, 1.0, 0.5, 1.0] } else { [0.5, 0.5, 0.6, 1.0] },
+                );
+            }
+
+            // Label
+            let label_x = modal_x + inner_padding + self.ui_scale.px(if multi_select { 70.0 } else { 50.0 });
+            let label_color = if is_focused {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                [0.8, 0.8, 0.9, 1.0]
+            };
+            self.text_queue.push(&opt.label, label_x, y, scale, label_color);
+
+            // Description (below label)
+            if !opt.description.is_empty() {
+                let desc_color = if is_focused {
+                    [0.7, 0.7, 0.8, 0.9]
+                } else {
+                    [0.5, 0.5, 0.6, 0.7]
+                };
+                self.text_queue.push_bounded(
+                    &opt.description,
+                    label_x,
+                    y + scale + self.ui_scale.px(4.0),
+                    small_scale,
+                    desc_color,
+                    modal_width - label_x + modal_x - inner_padding,
+                    self.ui_scale.px(30.0),
+                );
+            }
+        }
+
+        // "Other" option
+        let other_idx = options.len();
+        let other_y = card_start_y + other_idx as f32 * (card_height + card_gap) + text_padding;
+        let is_other_focused = focused == other_idx;
+
+        self.text_queue.push(
+            "[▶]",
+            modal_x + inner_padding + self.ui_scale.px(8.0),
+            other_y,
+            scale,
+            if is_other_focused { [0.8, 0.5, 1.0, 1.0] } else { [0.5, 0.5, 0.6, 1.0] },
+        );
+
+        let label_x = modal_x + inner_padding + self.ui_scale.px(50.0);
+        self.text_queue.push(
+            "Other (type custom answer)",
+            label_x,
+            other_y,
+            scale,
+            if is_other_focused { [1.0, 1.0, 1.0, 1.0] } else { [0.6, 0.6, 0.7, 1.0] },
+        );
+
+        // Custom input field
+        if custom_active {
+            let input_y = other_y + scale + self.ui_scale.px(8.0);
+            let display_text = if custom_input.is_empty() {
+                "Type here...".to_string()
+            } else {
+                format!("{}▌", custom_input)
+            };
+            let input_color = if custom_input.is_empty() {
+                [0.4, 0.4, 0.5, 0.7]
+            } else {
+                [0.9, 0.9, 1.0, 1.0]
+            };
+            self.text_queue.push(&display_text, label_x, input_y, scale, input_color);
+        }
+
+        // Help legend
+        let help_state = AppState::Survey {
+            question: String::new(),
+            header: String::new(),
+            options: Vec::new(),
+            focused_index: 0,
+            custom_input: String::new(),
+            custom_active: false,
+            multi_select,
+            selected_indices: Vec::new(),
+            previous_state: Box::new(AppState::PalaceLoop {
+                project_path: std::path::PathBuf::new(),
+                cards: Vec::new(),
+                focused_index: 0,
+                hovered_index: None,
+                generating: false,
+                current_tool: None,
+                tool_log: Vec::new(),
+                thought_log: Vec::new(),
+                log_scroll_offset: 0,
+                detail_scroll_offset: 0.0,
+                detail_max_scroll: 0.0,
+            }),
+            response_tx: None,
+        };
+        self.queue_help_legend(&help_state);
+    }
+
+    fn build_survey_modal_cards(
+        &self,
+        options: &[crate::state::SurveyOption],
+        focused: usize,
+        selected_indices: &[usize],
+    ) -> Vec<CardInstance> {
+        let modal_width = self.ui_scale.px(500.0).min(self.size.width as f32 - 40.0);
+        let option_count = options.len() + 1; // +1 for "Other"
+        let card_height = self.ui_scale.px(60.0);
+        let card_gap = self.ui_scale.px(10.0);
+        let inner_padding = self.ui_scale.px(20.0);
+        let title_height = self.ui_scale.px(80.0);
+        let modal_height = title_height + inner_padding + option_count as f32 * (card_height + card_gap);
+        let modal_x = (self.size.width as f32 - modal_width) / 2.0;
+        let modal_y = (self.size.height as f32 - modal_height) / 2.0;
+
+        let mut cards = Vec::new();
+
+        // Modal background card - purple border for questions
+        cards.push(
+            CardInstance::new(modal_x, modal_y, modal_width, modal_height, [0.6, 0.4, 0.9, 1.0])
+                .with_border_width(self.ui_scale.px(2.0))
+                .with_corner_radius(self.ui_scale.px(16.0))
+        );
+
+        // Option cards
+        let card_start_y = modal_y + title_height;
+        let card_width = modal_width - inner_padding * 2.0;
+
+        for i in 0..option_count {
+            let is_focused = i == focused;
+            let is_selected = selected_indices.contains(&i);
+            let y = card_start_y + i as f32 * (card_height + card_gap);
+
+            let border_color = if is_selected {
+                [0.3, 1.0, 0.5, 0.95] // Green for selected
+            } else if is_focused {
+                [0.8, 0.6, 1.0, 0.95] // Purple for focused
+            } else {
+                [0.4, 0.4, 0.5, 0.85] // Gray for unfocused
+            };
+
+            let mut instance = CardInstance::new(
+                modal_x + inner_padding,
+                y,
+                card_width,
+                card_height,
+                border_color,
+            )
+            .with_border_width(self.ui_scale.px(if is_focused { 3.0 } else { 1.5 }))
+            .with_corner_radius(self.ui_scale.px(8.0));
+
+            if is_focused {
+                instance = instance.selected();
+            }
+
+            cards.push(instance);
+        }
+
+        cards
     }
 
     fn queue_project_chooser_text(&mut self, projects: &ProjectsConfig, selected: usize) {
@@ -2196,7 +2589,7 @@ impl Renderer {
         self.queue_help_legend(&help_state);
     }
 
-    fn queue_palace_loop_text(&mut self, cards: &[SuggestionCard], current_tool: Option<&str>, tool_log: &[String], thought_log: &[String], log_scroll: usize, _focused_index: usize, _detail_scroll: f32) {
+    fn queue_palace_loop_text(&mut self, cards: &[SuggestionCard], current_tool: Option<&str>, tool_log: &[String], thought_log: &[String], log_scroll: usize, focused_index: usize, hovered_index: Option<usize>, detail_scroll: f32) {
         let title_scale = self.ui_scale.px(42.0);
         let left_margin = self.ui_scale.px(60.0);
         let top_margin = self.ui_scale.px(40.0);
@@ -2223,141 +2616,166 @@ impl Renderer {
         self.text_queue.push(&subtitle, left_margin, subtitle_y, self.ui_scale.px(18.0), dim_color);
 
         // Two-column waterfall logs (tools left, thoughts right)
-        let line_height = self.ui_scale.px(16.0);
-        let log_scale = self.ui_scale.px(13.0);
-        let log_y_start = subtitle_y + self.ui_scale.px(28.0);
+        // Only show logs when cards haven't appeared yet (during analysis phase)
+        if cards.is_empty() {
+            let line_height = self.ui_scale.px(16.0);
+            let log_scale = self.ui_scale.px(13.0);
+            let log_y_start = subtitle_y + self.ui_scale.px(28.0);
 
-        // Calculate max lines to fill available screen height
-        let available_height = self.size.height as f32 - log_y_start - self.ui_scale.px(40.0);
-        let max_lines = (available_height / line_height).floor() as usize;
+            // Calculate max lines to fill available screen height
+            let available_height = self.size.height as f32 - log_y_start - self.ui_scale.px(40.0);
 
-        // Split screen: left half for tools, right half for thoughts
-        let screen_mid = self.size.width as f32 / 2.0;
-        let right_margin = self.ui_scale.px(40.0);
-        let approx_char_width = log_scale * 0.5;
-        let left_max_chars = ((screen_mid - left_margin - self.ui_scale.px(20.0)) / approx_char_width) as usize;
-        let right_max_chars = ((screen_mid - right_margin) / approx_char_width) as usize;
+            // Split screen: left half for tools, right half for thoughts
+            let screen_mid = self.size.width as f32 / 2.0;
+            let right_margin = self.ui_scale.px(40.0);
 
-        // Left column: Tool calls (with proper text measurement for wrapping)
-        let left_col_width = screen_mid - left_margin - self.ui_scale.px(20.0);
-        if !tool_log.is_empty() {
-            let visible_start = log_scroll.min(tool_log.len().saturating_sub(1));
-            let mut y_offset = 0.0;
-            let mut entry_idx = 0;
-            for entry in tool_log.iter().skip(visible_start) {
-                if y_offset >= available_height {
-                    break;
+            // Left column: Tool calls (with proper text measurement for wrapping)
+            let left_col_width = screen_mid - left_margin - self.ui_scale.px(20.0);
+            if !tool_log.is_empty() {
+                let visible_start = log_scroll.min(tool_log.len().saturating_sub(1));
+                let mut y_offset = 0.0;
+                let mut entry_idx = 0;
+                for entry in tool_log.iter().skip(visible_start) {
+                    if y_offset >= available_height {
+                        break;
+                    }
+                    // Measure how many lines this entry will take
+                    let (_w, h, _lines) = crate::renderer::text::measure_text(
+                        &mut self.font_system,
+                        entry,
+                        log_scale,
+                        left_col_width,
+                    );
+                    let alpha = (0.7 - (entry_idx as f32 * 0.03)).max(0.25);
+                    let y = log_y_start + y_offset;
+                    self.text_queue.push_bounded(entry, left_margin, y, log_scale, [0.5, 0.7, 0.9, alpha], left_col_width, h);
+                    y_offset += h;
+                    entry_idx += 1;
                 }
-                // Measure how many lines this entry will take
-                let (_w, h, _lines) = crate::renderer::text::measure_text(
-                    &mut self.font_system,
-                    entry,
-                    log_scale,
-                    left_col_width,
-                );
-                let alpha = (0.7 - (entry_idx as f32 * 0.03)).max(0.25);
-                let y = log_y_start + y_offset;
-                self.text_queue.push_bounded(entry, left_margin, y, log_scale, [0.5, 0.7, 0.9, alpha], left_col_width, h);
-                y_offset += h;
-                entry_idx += 1;
+            }
+
+            // Right column: AI thoughts/commentary (with proper text measurement for wrapping)
+            let right_col_width = screen_mid - right_margin;
+            if !thought_log.is_empty() {
+                let visible_start = log_scroll.min(thought_log.len().saturating_sub(1));
+                let mut y_offset = 0.0;
+                let mut entry_idx = 0;
+                for entry in thought_log.iter().skip(visible_start) {
+                    if y_offset >= available_height {
+                        break;
+                    }
+                    // Measure how many lines this entry will take
+                    let (_w, h, _lines) = crate::renderer::text::measure_text(
+                        &mut self.font_system,
+                        entry,
+                        log_scale,
+                        right_col_width,
+                    );
+                    let alpha = (0.7 - (entry_idx as f32 * 0.03)).max(0.25);
+                    let y = log_y_start + y_offset;
+                    self.text_queue.push_bounded(entry, screen_mid + self.ui_scale.px(10.0), y, log_scale, [0.7, 0.6, 0.8, alpha], right_col_width, h);
+                    y_offset += h;
+                    entry_idx += 1;
+                }
             }
         }
 
-        // Right column: AI thoughts/commentary (with proper text measurement for wrapping)
-        let right_col_width = screen_mid - right_margin;
-        if !thought_log.is_empty() {
-            let visible_start = log_scroll.min(thought_log.len().saturating_sub(1));
-            let mut y_offset = 0.0;
-            let mut entry_idx = 0;
-            for entry in thought_log.iter().skip(visible_start) {
-                if y_offset >= available_height {
-                    break;
-                }
-                // Measure how many lines this entry will take
-                let (_w, h, _lines) = crate::renderer::text::measure_text(
-                    &mut self.font_system,
-                    entry,
-                    log_scale,
-                    right_col_width,
-                );
-                let alpha = (0.7 - (entry_idx as f32 * 0.03)).max(0.25);
-                let y = log_y_start + y_offset;
-                self.text_queue.push_bounded(entry, screen_mid + self.ui_scale.px(10.0), y, log_scale, [0.7, 0.6, 0.8, alpha], right_col_width, h);
-                y_offset += h;
-                entry_idx += 1;
-            }
-        }
-
-        // Card text
-        let text_margin = self.ui_scale.px(16.0);
+        // Card text - "flip" behavior: focused cards show description, others show title
+        let text_margin = self.ui_scale.px(12.0);
         for (i, card) in cards.iter().enumerate() {
             let (x, y) = grid.card_position(i);
 
-            // Category badge (bottom right, near border)
-            if !card.category.is_empty() {
-                self.text_queue.push(
-                    &card.category.to_uppercase(),
-                    x + grid.card_width - text_margin - self.ui_scale.px(40.0),
-                    y + grid.card_height - text_margin - self.ui_scale.px(12.0),
-                    self.ui_scale.px(10.0),
-                    card.color(),
-                );
-            }
+            // Determine if this card is "flipped" (showing back face with description)
+            let is_flipped = i == focused_index || hovered_index == Some(i);
 
-            // Title
-            let title_color = if card.streaming {
-                [0.85, 0.85, 0.9, 1.0]
-            } else {
-                self.text_color()
-            };
-            let display_title = if card.title.is_empty() {
-                if card.streaming { "..." } else { "Untitled" }
-            } else {
-                &card.title
-            };
-            self.text_queue.push_bounded(
-                display_title,
-                x + text_margin,
-                y + text_margin,
-                self.ui_scale.px(20.0),
-                title_color,
-                grid.card_width - text_margin * 2.0,
-                grid.card_height,
-            );
+            if is_flipped {
+                // BACK FACE: Description + command (all scrollable together)
+                let desc_color = self.text_color();
+                let desc_scale = self.ui_scale.px(13.0);
+                let desc_width = grid.card_width - text_margin * 2.0;
+                let visible_height = grid.card_height - text_margin * 2.0;
 
-            // Description
-            if !card.description.is_empty() {
-                let desc_y = y + text_margin + self.ui_scale.px(28.0);
-                let dim_color = self.text_color_dim();
-                self.text_queue.push_bounded(
-                    &card.description,
-                    x + text_margin,
-                    desc_y,
-                    self.ui_scale.px(12.0),
-                    dim_color,
-                    grid.card_width - text_margin * 2.0,
-                    self.ui_scale.px(60.0),
-                );
-            }
+                // Calculate scroll offset for this card (only applies to focused card)
+                let scroll_offset = if i == focused_index { detail_scroll } else { 0.0 };
 
-            // Command at bottom if present
-            if let Some(ref cmd) = card.command {
-                let display_cmd = if cmd.len() > 40 {
-                    format!("$ {}...", &cmd[..37])
+                // Build combined content: description + command
+                let description = if card.description.is_empty() {
+                    if card.streaming { "Loading..." } else { "No description" }
                 } else {
-                    format!("$ {}", cmd)
+                    &card.description
                 };
-                let cmd_y = y + grid.card_height - text_margin - self.ui_scale.px(16.0);
-                self.text_queue.push(&display_cmd, x + text_margin, cmd_y, self.ui_scale.px(11.0), [0.4, 0.8, 0.5, 1.0]);
+
+                let full_text = if let Some(ref cmd) = card.command {
+                    if cmd.trim().is_empty() {
+                        // No command to display
+                        description.to_string()
+                    } else {
+                        let display_cmd = if cmd.len() > 40 {
+                            format!("$ {}...", &cmd[..37])
+                        } else {
+                            format!("$ {}", cmd)
+                        };
+                        format!("{}\n\n{}", description, display_cmd)
+                    }
+                } else {
+                    description.to_string()
+                };
+
+                // Render with scroll offset applied (markdown for styling)
+                self.text_queue.push_markdown_scroll(
+                    &full_text,
+                    x + text_margin,
+                    y + text_margin,
+                    desc_scale,
+                    desc_color,
+                    desc_width,
+                    visible_height,
+                    scroll_offset,
+                );
+            } else {
+                // FRONT FACE: Show title + category
+                let title_color = if card.streaming {
+                    [0.85, 0.85, 0.9, 1.0]
+                } else {
+                    self.text_color()
+                };
+                let display_title = if card.title.is_empty() {
+                    if card.streaming { "..." } else { "Untitled" }
+                } else {
+                    &card.title
+                };
+
+                // Title fills most of the card
+                let title_height = grid.card_height - text_margin * 2.0 - self.ui_scale.px(24.0);
+                self.text_queue.push_bounded(
+                    display_title,
+                    x + text_margin,
+                    y + text_margin,
+                    self.ui_scale.px(16.0),
+                    title_color,
+                    grid.card_width - text_margin * 2.0,
+                    title_height,
+                );
+
+                // Category badge (bottom left, FRONT FACE ONLY)
+                if !card.category.is_empty() {
+                    self.text_queue.push(
+                        &card.category.to_uppercase(),
+                        x + text_margin,
+                        y + grid.card_height - text_margin - self.ui_scale.px(10.0),
+                        self.ui_scale.px(9.0),
+                        card.color(),
+                    );
+                }
             }
 
-            // Selected indicator (checkmark)
+            // Selected indicator (checkmark) - always visible
             if card.selected {
                 self.text_queue.push(
                     "✓",
-                    x + grid.card_width - text_margin - self.ui_scale.px(24.0),
-                    y + grid.card_height - text_margin - self.ui_scale.px(24.0),
-                    self.ui_scale.px(24.0),
+                    x + grid.card_width - text_margin - self.ui_scale.px(16.0),
+                    y + grid.card_height - text_margin - self.ui_scale.px(14.0),
+                    self.ui_scale.px(18.0),
                     [0.2, 1.0, 0.4, 1.0],
                 );
             }
@@ -2368,12 +2786,278 @@ impl Renderer {
             project_path: std::path::PathBuf::new(),
             cards: Vec::new(),
             focused_index: 0,
+            hovered_index: None,
             generating: false,
             current_tool: None,
             tool_log: Vec::new(),
             thought_log: Vec::new(),
             log_scroll_offset: 0,
             detail_scroll_offset: 0.0,
+            detail_max_scroll: 0.0,
+        };
+        self.queue_help_legend(&help_state);
+    }
+
+    /// Queue text for Executing state - two columns: tools (left), thoughts (right)
+    /// Left: colorized timestamp + icon + action, plain summary, colored dot
+    /// Right: colorized timestamp, plain commentary text
+    fn queue_executing_text(
+        &mut self,
+        tool_log: &[String],
+        thought_log: &[String],
+        log_scroll: usize,
+        status: &crate::state::ExecutionStatus,
+        _executor: crate::state::ExecuteOption,
+    ) {
+        let screen_width = self.size.width as f32;
+        let screen_height = self.size.height as f32;
+
+        let margin = self.ui_scale.px(48.0);
+        let title_scale = self.ui_scale.px(28.0);
+        let log_scale = self.ui_scale.px(13.0);
+
+        // Title - "EXECUTING" in accent color
+        self.text_queue.push(
+            "EXECUTING",
+            margin,
+            margin,
+            title_scale,
+            [0.8, 0.6, 1.0, 1.0], // Purple accent like PalaceLoop
+        );
+
+        // Status line
+        let status_text = match status {
+            crate::state::ExecutionStatus::Pending => "⏳ Waiting to start...".to_string(),
+            crate::state::ExecutionStatus::Running { current_card, total_cards } => {
+                format!("Running task {}/{}", current_card + 1, total_cards)
+            }
+            crate::state::ExecutionStatus::Completed => "✅ Completed".to_string(),
+            crate::state::ExecutionStatus::Failed(err) => format!("❌ Failed: {}", err),
+            crate::state::ExecutionStatus::Cancelled => "⛔ Cancelled".to_string(),
+        };
+
+        let status_color = match status {
+            crate::state::ExecutionStatus::Completed => [0.2, 0.8, 0.4, 1.0],
+            crate::state::ExecutionStatus::Failed(_) => [0.9, 0.3, 0.3, 1.0],
+            crate::state::ExecutionStatus::Cancelled => [0.8, 0.6, 0.2, 1.0],
+            _ => self.text_color_dim(),
+        };
+
+        let subtitle_y = margin + title_scale + self.ui_scale.px(8.0);
+        self.text_queue.push(
+            &status_text,
+            margin,
+            subtitle_y,
+            self.ui_scale.px(16.0),
+            status_color,
+        );
+
+        // Two-column waterfall logs (same layout as PalaceLoop)
+        let log_start_y = subtitle_y + self.ui_scale.px(28.0);
+        let available_height = screen_height - log_start_y - margin;
+        let screen_mid = screen_width / 2.0;
+        let right_margin = self.ui_scale.px(40.0);
+        let plain_color = self.text_color_dim();
+
+        // Left column: Tool calls
+        // Format: [HH:MM:SS] 💻 command  summary ●
+        // Colorized: timestamp + icon + action | Plain: summary | Colored: dot
+        let left_col_width = screen_mid - margin - self.ui_scale.px(20.0);
+        if !tool_log.is_empty() {
+            let visible_start = log_scroll.min(tool_log.len().saturating_sub(1));
+            let mut y_offset = 0.0;
+            let mut entry_idx = 0;
+            for entry in tool_log.iter().skip(visible_start) {
+                if y_offset >= available_height { break; }
+
+                // Check for error prefix
+                let (is_error, clean_entry) = if entry.starts_with("ERR:") {
+                    (true, &entry[4..])
+                } else {
+                    (false, entry.as_str())
+                };
+
+                // Measure full text height for layout
+                let (_w, h, _lines) = crate::renderer::text::measure_text(
+                    &mut self.font_system,
+                    clean_entry,
+                    log_scale,
+                    left_col_width,
+                );
+                let alpha = (0.85 - (entry_idx as f32 * 0.03)).max(0.25);
+                let y = log_start_y + y_offset;
+
+                // Parse entry: [HH:MM:SS] icon action  summary dot
+                // Split at double-space to separate colored part from plain part
+                if let Some(double_space_pos) = clean_entry.find("  ") {
+                    let colored_part = &clean_entry[..double_space_pos];
+                    let plain_part = &clean_entry[double_space_pos + 2..];
+
+                    // Get rainbow color for timestamp
+                    let rainbow = self.temporal_rainbow_color(clean_entry, alpha);
+
+                    // Render colored part (timestamp + icon + action)
+                    self.text_queue.push_bounded(
+                        colored_part,
+                        margin,
+                        y,
+                        log_scale,
+                        rainbow,
+                        left_col_width,
+                        h,
+                    );
+
+                    // Calculate x position after colored part
+                    let (colored_w, _, _) = crate::renderer::text::measure_text(
+                        &mut self.font_system,
+                        &format!("{}  ", colored_part),
+                        log_scale,
+                        left_col_width,
+                    );
+
+                    // Check if there's a status dot at the end
+                    // " ●" is 4 bytes: 1 (space) + 3 (● in UTF-8)
+                    let (summary, maybe_dot) = if plain_part.ends_with(" ●") {
+                        (&plain_part[..plain_part.len() - 4], Some("●"))
+                    } else {
+                        (plain_part, None)
+                    };
+
+                    // Render plain summary
+                    self.text_queue.push_bounded(
+                        summary,
+                        margin + colored_w,
+                        y,
+                        log_scale,
+                        [plain_color[0], plain_color[1], plain_color[2], alpha],
+                        left_col_width - colored_w,
+                        h,
+                    );
+
+                    // Render colored dot if present
+                    if let Some(dot) = maybe_dot {
+                        let (summary_w, _, _) = crate::renderer::text::measure_text(
+                            &mut self.font_system,
+                            &format!("{} ", summary),
+                            log_scale,
+                            left_col_width,
+                        );
+                        let dot_color = if is_error {
+                            [0.9, 0.3, 0.3, alpha] // Red
+                        } else {
+                            [0.3, 0.8, 0.4, alpha] // Green
+                        };
+                        self.text_queue.push(
+                            dot,
+                            margin + colored_w + summary_w,
+                            y,
+                            log_scale,
+                            dot_color,
+                        );
+                    }
+                } else {
+                    // No double-space separator, render whole thing with rainbow
+                    let rainbow = self.temporal_rainbow_color(clean_entry, alpha);
+                    self.text_queue.push_bounded(
+                        clean_entry,
+                        margin,
+                        y,
+                        log_scale,
+                        rainbow,
+                        left_col_width,
+                        h,
+                    );
+                }
+
+                y_offset += h;
+                entry_idx += 1;
+            }
+        }
+
+        // Right column: Thoughts/commentary
+        // Format: [HH:MM:SS] text
+        // Colorized: timestamp | Plain: commentary
+        let right_col_width = screen_mid - right_margin;
+        if !thought_log.is_empty() {
+            let visible_start = log_scroll.min(thought_log.len().saturating_sub(1));
+            let mut y_offset = 0.0;
+            let mut entry_idx = 0;
+            for entry in thought_log.iter().skip(visible_start) {
+                if y_offset >= available_height { break; }
+                let (_w, h, _lines) = crate::renderer::text::measure_text(
+                    &mut self.font_system,
+                    entry,
+                    log_scale,
+                    right_col_width,
+                );
+                let alpha = (0.85 - (entry_idx as f32 * 0.03)).max(0.25);
+                let y = log_start_y + y_offset;
+                let x = screen_mid + self.ui_scale.px(10.0);
+
+                // Parse: [HH:MM:SS] rest
+                // Colorized timestamp, plain rest
+                if entry.starts_with('[') && entry.len() > 10 && entry.chars().nth(9) == Some(']') {
+                    let timestamp_part = &entry[..10]; // "[HH:MM:SS]"
+                    let rest = entry[10..].trim_start();
+
+                    // Rainbow color for timestamp
+                    let rainbow = self.temporal_rainbow_color(entry, alpha);
+
+                    // Render timestamp in color
+                    self.text_queue.push(
+                        timestamp_part,
+                        x,
+                        y,
+                        log_scale,
+                        rainbow,
+                    );
+
+                    // Calculate x after timestamp
+                    let (ts_w, _, _) = crate::renderer::text::measure_text(
+                        &mut self.font_system,
+                        &format!("{} ", timestamp_part),
+                        log_scale,
+                        right_col_width,
+                    );
+
+                    // Render rest in plain color for readability
+                    self.text_queue.push_bounded(
+                        rest,
+                        x + ts_w,
+                        y,
+                        log_scale,
+                        [plain_color[0], plain_color[1], plain_color[2], alpha],
+                        right_col_width - ts_w,
+                        h,
+                    );
+                } else {
+                    // No timestamp, render plain
+                    self.text_queue.push_bounded(
+                        entry,
+                        x,
+                        y,
+                        log_scale,
+                        [plain_color[0], plain_color[1], plain_color[2], alpha],
+                        right_col_width,
+                        h,
+                    );
+                }
+
+                y_offset += h;
+                entry_idx += 1;
+            }
+        }
+
+        // Build help state for this view
+        let help_state = AppState::Executing {
+            project_path: std::path::PathBuf::new(),
+            executing_cards: Vec::new(),
+            status: status.clone(),
+            tool_log: Vec::new(),
+            thought_log: Vec::new(),
+            log_scroll_offset: 0,
+            executor: _executor,
+            previous_state: Box::new(AppState::ProjectChooser { selected_index: 0 }),
         };
         self.queue_help_legend(&help_state);
     }
@@ -2414,6 +3098,34 @@ impl Renderer {
                 (XboxButton::X, "Run"),
                 (XboxButton::Y, "Filter"),
             ],
+            AppState::Survey { multi_select, .. } => {
+                if *multi_select {
+                    vec![
+                        (XboxButton::LeftStick, "Navigate"),
+                        (XboxButton::A, "Toggle"),
+                        (XboxButton::B, "Cancel"),
+                        (XboxButton::X, "Confirm"),
+                    ]
+                } else {
+                    vec![
+                        (XboxButton::LeftStick, "Navigate"),
+                        (XboxButton::A, "Select"),
+                        (XboxButton::B, "Cancel"),
+                    ]
+                }
+            },
+            AppState::Executing { status, .. } => {
+                if status.is_done() {
+                    vec![
+                        (XboxButton::B, "Back"),
+                    ]
+                } else {
+                    vec![
+                        (XboxButton::B, "Cancel"),
+                        (XboxButton::RightStick, "Scroll"),
+                    ]
+                }
+            },
         }
     }
 
@@ -2510,4 +3222,21 @@ impl Renderer {
     pub fn poll_screenshots(&self, capture: &mut crate::debug::ScreenshotCapture) {
         capture.poll_pending(&self.device);
     }
+}
+
+/// Convert HSL to RGB (helper for temporal rainbow colors)
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let h_prime = h / 60.0;
+    let x = c * (1.0 - (h_prime % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match h_prime as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    (r1 + m, g1 + m, b1 + m)
 }

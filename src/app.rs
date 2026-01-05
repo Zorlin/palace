@@ -2,7 +2,7 @@ use crate::debug::{DebugCommand, DebugResponse, ScreenshotCapture};
 use crate::display::DisplayScaling;
 use crate::projects::ProjectsConfig;
 use crate::renderer::Renderer;
-use crate::state::{AppState, MainMenuItem, SettingsItem, SuggestionCard, UiScaleOption};
+use crate::state::{AppState, ExecuteOption, ExecutionStatus, MainMenuItem, SettingsItem, SuggestionCard, UiScaleOption};
 use gilrs::Button;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,6 +48,24 @@ pub enum AppEvent {
     SuggestionsDone,
     /// AI error
     AiError(String),
+    /// Execution tool call (left column) - format: "[HH:MM:SS] icon action"
+    ExecutionToolCall(String),
+    /// Execution thought/commentary (right column)
+    ExecutionThought(String),
+    /// Execution progress update
+    ExecutionProgress { current: usize, total: usize },
+    /// Execution completed successfully
+    ExecutionComplete,
+    /// Execution failed
+    ExecutionError(String),
+    /// Survey request from AI (ask_user tool) - show survey UI and return response
+    SurveyRequest {
+        question: String,
+        header: String,
+        options: Vec<crate::state::SurveyOption>,
+        multi_select: bool,
+        response_tx: std::sync::mpsc::Sender<crate::state::SurveyResponse>,
+    },
     /// Permission request from AI - requires user approval
     PermissionRequest {
         /// Unique ID for this request
@@ -82,6 +100,8 @@ pub struct App {
     /// Track held buttons for combos (L3, R3)
     l3_held: bool,
     r3_held: bool,
+    /// Right stick Y position for continuous scrolling
+    right_stick_y: f32,
     /// Event loop proxy for sending events from background threads
     event_proxy: Arc<EventLoopProxy<AppEvent>>,
     /// Pending permission response sender (set when permission modal is shown)
@@ -90,6 +110,12 @@ pub struct App {
     detected_scale: f32,
     /// User's scale override (None = use auto-detected)
     user_scale_override: Option<f32>,
+    /// Flag to track if hover state changed (to minimize redraws)
+    hover_changed: bool,
+    /// Touch hold tracking: (start_time, start_x, start_y, card_index)
+    touch_hold: Option<(std::time::Instant, f32, f32, Option<usize>)>,
+    /// Whether touch hold has triggered (to prevent tap on release)
+    touch_hold_triggered: bool,
 }
 
 impl App {
@@ -109,9 +135,13 @@ impl App {
             gamepad_passthrough: false,
             l3_held: false,
             r3_held: false,
+            right_stick_y: 0.0,
             event_proxy: Arc::new(event_proxy),
             detected_scale: 1.0, // Will be set when display is detected
             user_scale_override: None, // Auto-detect by default
+            hover_changed: false,
+            touch_hold: None,
+            touch_hold_triggered: false,
         }
     }
 
@@ -282,35 +312,75 @@ impl App {
         }
     }
 
-    /// Handle right thumbstick for scrolling activity log
+    /// Handle right thumbstick for scrolling (logs when no cards, description when cards exist)
+    /// Analog: scroll speed proportional to stick deflection, continuous while held
     fn handle_gamepad_right_stick(&mut self, y: f32) {
-        const DEADZONE: f32 = 0.3;
-        const THRESHOLD: f32 = 0.7;
+        const DEADZONE: f32 = 0.15;
+        const MAX_SCROLL_SPEED: f32 = 12.0; // Max pixels per frame at full deflection
 
         if self.gamepad_passthrough {
             return;
         }
 
-        static mut LAST_Y: i8 = 0;
+        if y.abs() < DEADZONE {
+            return;
+        }
 
-        let new_y = if y > THRESHOLD { 1 } else if y < -THRESHOLD { -1 } else if y.abs() < DEADZONE { 0 } else { unsafe { LAST_Y } };
+        let scroll_amount = -y * MAX_SCROLL_SPEED; // Invert: push up = positive scroll
 
-        unsafe {
-            if new_y != LAST_Y {
-                if let AppState::PalaceLoop { tool_log, thought_log, log_scroll_offset, .. } = &mut self.state {
-                    let max_scroll = tool_log.len().max(thought_log.len()).saturating_sub(1);
-                    if new_y > 0 {
-                        // Up - scroll to older entries
-                        *log_scroll_offset = (*log_scroll_offset + 1).min(max_scroll);
-                        self.request_redraw();
-                    } else if new_y < 0 {
-                        // Down - scroll to newer entries
-                        *log_scroll_offset = log_scroll_offset.saturating_sub(1);
+        // Phase 1: Extract info we need for calculation
+        enum ScrollAction {
+            LogScroll,
+            CardScroll { card: crate::state::SuggestionCard, current: f32 },
+            None,
+        }
+
+        let action = if let AppState::PalaceLoop { cards, focused_index, tool_log, thought_log, log_scroll_offset, detail_scroll_offset, .. } = &mut self.state {
+            if cards.is_empty() {
+                let max_scroll = tool_log.len().max(thought_log.len()).saturating_sub(1);
+                if scroll_amount > 2.0 {
+                    *log_scroll_offset = (*log_scroll_offset + 1).min(max_scroll);
+                    ScrollAction::LogScroll
+                } else if scroll_amount < -2.0 {
+                    *log_scroll_offset = log_scroll_offset.saturating_sub(1);
+                    ScrollAction::LogScroll
+                } else {
+                    ScrollAction::None
+                }
+            } else if let Some(card) = cards.get(*focused_index) {
+                ScrollAction::CardScroll { card: card.clone(), current: *detail_scroll_offset }
+            } else {
+                ScrollAction::None
+            }
+        } else {
+            ScrollAction::None
+        };
+
+        // Phase 2: Calculate max scroll (needs renderer)
+        let new_offset = match &action {
+            ScrollAction::CardScroll { card, current } => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    let max_scroll = renderer.calculate_card_max_scroll(card);
+                    Some((*current + scroll_amount).clamp(0.0, max_scroll))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        // Phase 3: Write back to state
+        match action {
+            ScrollAction::LogScroll => self.request_redraw(),
+            ScrollAction::CardScroll { .. } => {
+                if let Some(offset) = new_offset {
+                    if let AppState::PalaceLoop { detail_scroll_offset, .. } = &mut self.state {
+                        *detail_scroll_offset = offset;
                         self.request_redraw();
                     }
                 }
-                LAST_Y = new_y;
             }
+            ScrollAction::None => {}
         }
     }
 
@@ -521,12 +591,14 @@ impl App {
                                     project_path: project_path.clone(),
                                     cards: Vec::new(),
                                     focused_index: 0,
+                                    hovered_index: None,
                                     generating: true,
                                     current_tool: None,
                                     tool_log: Vec::new(),
                                     thought_log: Vec::new(),
                                     log_scroll_offset: 0,
                                     detail_scroll_offset: 0.0,
+                                    detail_max_scroll: 0.0,
                                 };
 
                                 // Spawn AI suggestion thread
@@ -681,9 +753,10 @@ impl App {
                         self.user_scale_override = scale_option.value();
                         // Use override if set, otherwise use detected
                         let actual_scale = self.user_scale_override.unwrap_or(self.detected_scale);
+                        let is_auto = self.user_scale_override.is_none();
                         tracing::info!("Setting UI scale to {} ({})", scale_option.label(), actual_scale);
                         if let Some(renderer) = &mut self.renderer {
-                            renderer.set_ui_scale(actual_scale);
+                            renderer.set_ui_scale(actual_scale, is_auto);
                         }
                         // Go back to settings menu
                         self.state = *previous_state.clone();
@@ -763,6 +836,7 @@ impl App {
             AppState::PalaceLoop {
                 cards,
                 focused_index,
+                detail_scroll_offset,
                 generating,
                 ..
             } => {
@@ -774,11 +848,13 @@ impl App {
                         // Move up one row
                         if *focused_index >= palace_columns {
                             *focused_index -= palace_columns;
+                            *detail_scroll_offset = 0.0; // Reset scroll on focus change
                         } else if card_count > 0 {
                             // Wrap to last row (same column or nearest)
                             let last_row_start = (card_count.saturating_sub(1) / palace_columns) * palace_columns;
                             let target = last_row_start + (*focused_index % palace_columns);
                             *focused_index = target.min(card_count - 1);
+                            *detail_scroll_offset = 0.0;
                         }
                     }
                     KeyCode::ArrowDown | KeyCode::KeyS => {
@@ -786,26 +862,32 @@ impl App {
                         let next = *focused_index + palace_columns;
                         if next < card_count {
                             *focused_index = next;
+                            *detail_scroll_offset = 0.0; // Reset scroll on focus change
                         } else if card_count > 0 {
                             // Wrap to first row (same column)
                             *focused_index = *focused_index % palace_columns;
                             if *focused_index >= card_count {
                                 *focused_index = 0;
                             }
+                            *detail_scroll_offset = 0.0;
                         }
                     }
                     KeyCode::ArrowLeft | KeyCode::KeyA => {
                         if *focused_index > 0 {
                             *focused_index -= 1;
+                            *detail_scroll_offset = 0.0; // Reset scroll on focus change
                         } else if card_count > 0 {
                             *focused_index = card_count - 1;
+                            *detail_scroll_offset = 0.0;
                         }
                     }
                     KeyCode::ArrowRight | KeyCode::KeyD => {
                         if card_count > 0 && *focused_index < card_count - 1 {
                             *focused_index += 1;
+                            *detail_scroll_offset = 0.0; // Reset scroll on focus change
                         } else {
                             *focused_index = 0;
+                            *detail_scroll_offset = 0.0;
                         }
                     }
                     KeyCode::Enter | KeyCode::Space => {
@@ -862,13 +944,204 @@ impl App {
                     KeyCode::Enter | KeyCode::Space => {
                         let option = ExecuteOption::all()[*selected_option];
                         tracing::info!("Execute option selected: {:?}", option);
-                        // TODO: Implement actual execution
-                        // For now, just return to previous state
-                        self.state = *previous_state;
+
+                        // Extract project path and selected cards from PalaceLoop
+                        if let AppState::PalaceLoop { project_path, cards, .. } = &*previous_state {
+                            let selected_cards: Vec<SuggestionCard> = cards
+                                .iter()
+                                .filter(|c| c.selected)
+                                .cloned()
+                                .collect();
+
+                            if selected_cards.is_empty() {
+                                tracing::warn!("No cards selected for execution");
+                                self.state = *previous_state;
+                                return;
+                            }
+
+                            let project_path = project_path.clone();
+                            let card_count = selected_cards.len();
+                            tracing::info!(
+                                "Starting execution of {} cards with {:?}",
+                                card_count,
+                                option
+                            );
+
+                            // Transition to Executing state
+                            self.state = AppState::Executing {
+                                project_path: project_path.clone(),
+                                executing_cards: selected_cards.clone(),
+                                status: ExecutionStatus::Running {
+                                    current_card: 0,
+                                    total_cards: card_count,
+                                },
+                                tool_log: Vec::new(),
+                                thought_log: Vec::new(),
+                                log_scroll_offset: 0,
+                                executor: option,
+                                previous_state: previous_state.clone(),
+                            };
+
+                            // Spawn the executor in a background thread
+                            let proxy = (*self.event_proxy).clone();
+                            crate::ai::spawn_execution(
+                                option,
+                                project_path,
+                                selected_cards,
+                                proxy,
+                            );
+                        } else {
+                            // Shouldn't happen, but handle gracefully
+                            tracing::error!("ExecuteModal previous_state is not PalaceLoop");
+                            self.state = *previous_state;
+                        }
                     }
                     KeyCode::Backspace | KeyCode::Escape => {
                         // Go back to PalaceLoop
                         self.state = *previous_state;
+                    }
+                    _ => {}
+                }
+            }
+            AppState::Survey {
+                options,
+                focused_index,
+                custom_input,
+                custom_active,
+                multi_select,
+                selected_indices,
+                previous_state,
+                response_tx,
+                ..
+            } => {
+                use crate::state::SurveyResponse;
+                let option_count = options.len();
+                let previous_state = previous_state.clone();
+                let has_custom = true; // Always have "Other" option
+
+                match key {
+                    KeyCode::ArrowUp | KeyCode::KeyW => {
+                        if !*custom_active {
+                            let total = option_count + if has_custom { 1 } else { 0 };
+                            if *focused_index > 0 {
+                                *focused_index -= 1;
+                            } else {
+                                *focused_index = total - 1;
+                            }
+                        }
+                    }
+                    KeyCode::ArrowDown | KeyCode::KeyS => {
+                        if !*custom_active {
+                            let total = option_count + if has_custom { 1 } else { 0 };
+                            if *focused_index < total - 1 {
+                                *focused_index += 1;
+                            } else {
+                                *focused_index = 0;
+                            }
+                        }
+                    }
+                    // A button / Enter / Space → Select option 0 directly, or focused option
+                    KeyCode::Enter | KeyCode::Space => {
+                        if *custom_active {
+                            // In custom mode, submit if there's input
+                            if !custom_input.is_empty() {
+                                if let Some(tx) = response_tx.take() {
+                                    let _ = tx.send(SurveyResponse::Custom(custom_input.clone()));
+                                }
+                                self.state = *previous_state;
+                            }
+                        } else if *focused_index >= option_count {
+                            // Focused on "Other" option - activate custom input
+                            *custom_active = true;
+                        } else if *multi_select {
+                            // Toggle selection in multi-select mode
+                            if selected_indices.contains(focused_index) {
+                                selected_indices.retain(|&i| i != *focused_index);
+                            } else {
+                                selected_indices.push(*focused_index);
+                            }
+                        } else {
+                            // Single select - submit immediately
+                            if let Some(tx) = response_tx.take() {
+                                let _ = tx.send(SurveyResponse::Selected(vec![*focused_index]));
+                            }
+                            self.state = *previous_state;
+                        }
+                    }
+                    // X button → Select option 1 directly (in single-select) or confirm (in multi-select)
+                    KeyCode::KeyX => {
+                        if *custom_active {
+                            // Ignore in custom mode
+                        } else if *multi_select {
+                            // Confirm multi-selection
+                            if !selected_indices.is_empty() {
+                                if let Some(tx) = response_tx.take() {
+                                    let _ = tx.send(SurveyResponse::Selected(selected_indices.clone()));
+                                }
+                                self.state = *previous_state;
+                            }
+                        } else if option_count > 1 {
+                            // Direct select option 1
+                            if let Some(tx) = response_tx.take() {
+                                let _ = tx.send(SurveyResponse::Selected(vec![1]));
+                            }
+                            self.state = *previous_state;
+                        }
+                    }
+                    // B button / Backspace → Select option 2 directly, or backspace in custom mode
+                    KeyCode::Backspace => {
+                        if *custom_active {
+                            custom_input.pop();
+                        } else if !*multi_select && option_count > 2 {
+                            // Direct select option 2
+                            if let Some(tx) = response_tx.take() {
+                                let _ = tx.send(SurveyResponse::Selected(vec![2]));
+                            }
+                            self.state = *previous_state;
+                        }
+                        // If < 3 options, B does nothing (user must navigate)
+                    }
+                    // Y button → Select option 3 directly
+                    KeyCode::KeyY => {
+                        if !*custom_active && !*multi_select && option_count > 3 {
+                            // Direct select option 3
+                            if let Some(tx) = response_tx.take() {
+                                let _ = tx.send(SurveyResponse::Selected(vec![3]));
+                            }
+                            self.state = *previous_state;
+                        }
+                    }
+                    // Escape → Cancel survey or exit custom mode
+                    KeyCode::Escape => {
+                        if *custom_active {
+                            *custom_active = false;
+                        } else {
+                            // Cancel the survey
+                            if let Some(tx) = response_tx.take() {
+                                let _ = tx.send(SurveyResponse::Cancelled);
+                            }
+                            self.state = *previous_state;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            AppState::Executing { status, previous_state, log_scroll_offset, .. } => {
+                match key {
+                    KeyCode::Escape | KeyCode::Backspace => {
+                        // Cancel execution if running, or go back if done
+                        if status.is_done() {
+                            self.state = *previous_state.clone();
+                        } else {
+                            // Mark as cancelled
+                            *status = crate::state::ExecutionStatus::Cancelled;
+                        }
+                    }
+                    KeyCode::ArrowUp | KeyCode::KeyW => {
+                        *log_scroll_offset = log_scroll_offset.saturating_sub(1);
+                    }
+                    KeyCode::ArrowDown | KeyCode::KeyS => {
+                        *log_scroll_offset += 1;
                     }
                     _ => {}
                 }
@@ -899,18 +1172,179 @@ impl App {
         match touch.phase {
             TouchPhase::Started => {
                 tracing::info!("Touch started at ({:.0}, {:.0}), id: {:?}", x, y, touch.id);
+                // Record touch start for hold detection
+                let card_under_touch = self.card_at_position(x, y);
+                self.touch_hold = Some((std::time::Instant::now(), x, y, card_under_touch));
+                self.touch_hold_triggered = false;
             }
             TouchPhase::Ended => {
                 tracing::info!("Touch ended at ({:.0}, {:.0}), id: {:?}", x, y, touch.id);
-                // Treat touch end as a tap - find what was touched
-                self.handle_tap(x, y);
+
+                // Check if this was a tap (short hold, minimal movement)
+                let should_tap = if let Some((start_time, start_x, start_y, _)) = self.touch_hold {
+                    let held_ms = start_time.elapsed().as_millis();
+                    let dx = (x - start_x).abs();
+                    let dy = (y - start_y).abs();
+                    let moved = dx > 20.0 || dy > 20.0;
+
+                    // Tap = short hold AND didn't move much AND hold didn't already trigger
+                    held_ms < 300 && !moved && !self.touch_hold_triggered
+                } else {
+                    false
+                };
+
+                if should_tap {
+                    self.handle_tap(x, y);
+                }
+
+                // Clear touch state and hover
+                self.touch_hold = None;
+                self.touch_hold_triggered = false;
+
+                // Clear hover when touch ends (in PalaceLoop)
+                if let AppState::PalaceLoop { hovered_index, .. } = &mut self.state {
+                    if hovered_index.is_some() {
+                        *hovered_index = None;
+                        self.hover_changed = true;
+                    }
+                }
             }
             TouchPhase::Moved => {
-                // Could implement swipe gestures here
                 tracing::debug!("Touch moved to ({:.0}, {:.0})", x, y);
+
+                // Check for hold-to-reveal (300ms threshold for initial trigger)
+                if let Some((start_time, start_x, start_y, _)) = self.touch_hold {
+                    // If already triggered, immediately update hovered card (no delay)
+                    if self.touch_hold_triggered {
+                        let card_under = self.card_at_position(x, y);
+                        if let AppState::PalaceLoop { hovered_index, .. } = &mut self.state {
+                            if *hovered_index != card_under {
+                                *hovered_index = card_under;
+                                self.hover_changed = true;
+                            }
+                        }
+                    } else {
+                        // Not yet triggered - check if we should trigger
+                        let held_ms = start_time.elapsed().as_millis();
+                        let dx = (x - start_x).abs();
+                        let dy = (y - start_y).abs();
+                        let moved_enough = dx > 20.0 || dy > 20.0;
+
+                        // After 300ms hold, or after moving 20px: trigger reveal mode
+                        if held_ms >= 300 || moved_enough {
+                            self.touch_hold_triggered = true;
+
+                            // Immediately show description of card under finger
+                            let card_under = self.card_at_position(x, y);
+                            if let AppState::PalaceLoop { hovered_index, .. } = &mut self.state {
+                                if *hovered_index != card_under {
+                                    *hovered_index = card_under;
+                                    self.hover_changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             TouchPhase::Cancelled => {
                 tracing::debug!("Touch cancelled");
+                self.touch_hold = None;
+                self.touch_hold_triggered = false;
+
+                // Clear hover on cancel
+                if let AppState::PalaceLoop { hovered_index, .. } = &mut self.state {
+                    if hovered_index.is_some() {
+                        *hovered_index = None;
+                        self.hover_changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Find which card (if any) is at the given screen position
+    fn card_at_position(&self, x: f32, y: f32) -> Option<usize> {
+        if let AppState::PalaceLoop { cards, .. } = &self.state {
+            let window_size = self.window.as_ref().map(|w| w.inner_size());
+            let Some(size) = window_size else { return None };
+
+            // Must match CardGrid::for_palace_loop() in gpu.rs
+            let ui_scale = self.renderer.as_ref().map(|r| r.ui_scale()).unwrap_or(1.0);
+            let scale = |v: f32| v * ui_scale;
+
+            let target_columns = 5usize;
+            let base_gap = 16.0;
+            let base_margin = 40.0;
+            let screen_width = size.width as f32;
+
+            let gap = scale(base_gap);
+            let margin_x = scale(base_margin);
+            let margin_y = scale(base_margin + 80.0); // Extra space for title + subtitle
+
+            // Calculate card width to fit exactly 5 columns
+            let available_width = screen_width - margin_x * 2.0;
+            let card_width = (available_width - gap * (target_columns - 1) as f32) / target_columns as f32;
+            let card_height = card_width * 0.6; // Same aspect ratio as renderer
+
+            for (i, _card) in cards.iter().enumerate() {
+                let col = i % target_columns;
+                let row = i / target_columns;
+                let card_x = margin_x + col as f32 * (card_width + gap);
+                let card_y = margin_y + row as f32 * (card_height + gap);
+
+                if x >= card_x && x <= card_x + card_width
+                   && y >= card_y && y <= card_y + card_height {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Handle cursor movement for hover detection
+    fn handle_cursor_moved(&mut self, x: f32, y: f32) {
+        // Only handle hover in PalaceLoop state
+        if let AppState::PalaceLoop { cards, hovered_index, .. } = &mut self.state {
+            let window_size = self.window.as_ref().map(|w| w.inner_size());
+            let Some(size) = window_size else { return };
+
+            // Must match CardGrid::for_palace_loop() in gpu.rs
+            let ui_scale = self.renderer.as_ref().map(|r| r.ui_scale()).unwrap_or(1.0);
+            let scale = |v: f32| v * ui_scale;
+
+            let target_columns = 5usize;
+            let base_gap = 16.0;
+            let base_margin = 40.0;
+            let screen_width = size.width as f32;
+
+            let gap = scale(base_gap);
+            let margin_x = scale(base_margin);
+            let margin_y = scale(base_margin + 80.0); // Extra space for title + subtitle
+
+            // Calculate card width to fit exactly 5 columns
+            let available_width = screen_width - margin_x * 2.0;
+            let card_width = (available_width - gap * (target_columns - 1) as f32) / target_columns as f32;
+            let card_height = card_width * 0.6; // Same aspect ratio as renderer
+
+            // Find which card (if any) the cursor is over
+            let mut new_hovered = None;
+            for (i, _card) in cards.iter().enumerate() {
+                let col = i % target_columns;
+                let row = i / target_columns;
+                let card_x = margin_x + col as f32 * (card_width + gap);
+                let card_y = margin_y + row as f32 * (card_height + gap);
+
+                if x >= card_x && x <= card_x + card_width
+                   && y >= card_y && y <= card_y + card_height {
+                    new_hovered = Some(i);
+                    break;
+                }
+            }
+
+            // Only set hover_changed if the hovered card actually changed
+            if *hovered_index != new_hovered {
+                *hovered_index = new_hovered;
+                self.hover_changed = true;
             }
         }
     }
@@ -1173,6 +1607,40 @@ impl App {
                     }
                 }
             }
+            AppState::Survey { options, focused_index, .. } => {
+                // Tap on survey option items
+                let ui_scale = self.renderer.as_ref().map(|r| r.ui_scale()).unwrap_or(1.0);
+                let scale = |v: f32| v * ui_scale;
+
+                let modal_width = scale(500.0).min(size.width as f32 - 40.0);
+                let option_count = options.len() + 1; // +1 for "Other"
+                let card_height = scale(60.0);
+                let card_gap = scale(10.0);
+                let inner_padding = scale(20.0);
+                let title_height = scale(80.0); // Question area
+                let modal_height = title_height + inner_padding + option_count as f32 * (card_height + card_gap);
+                let modal_x = (size.width as f32 - modal_width) / 2.0;
+                let modal_y = (size.height as f32 - modal_height) / 2.0;
+
+                let card_start_y = modal_y + title_height;
+                for i in 0..option_count {
+                    let card_y = card_start_y + i as f32 * (card_height + card_gap);
+                    let card_width = modal_width - inner_padding * 2.0;
+                    let card_x = modal_x + inner_padding;
+
+                    if x >= card_x && x <= card_x + card_width
+                       && y >= card_y && y <= card_y + card_height {
+                        tracing::info!("Tapped survey option {}", i);
+                        *focused_index = i;
+                        self.handle_input(KeyCode::Enter);
+                        return;
+                    }
+                }
+            }
+            AppState::Executing { .. } => {
+                // Tap anywhere to go back when done, or show cancel confirmation
+                self.handle_input(KeyCode::Escape);
+            }
         }
     }
 
@@ -1269,7 +1737,8 @@ impl ApplicationHandler<AppEvent> for App {
                         self.detected_scale = detected;
                         // Use user override if set, otherwise auto-detected
                         let scale = self.user_scale_override.unwrap_or(detected);
-                        renderer.set_ui_scale(scale);
+                        let is_auto = self.user_scale_override.is_none();
+                        renderer.set_ui_scale(scale, is_auto);
 
                         // Set initial gamepad connection state
                         renderer.set_gamepad_connected(self.gamepad_connected);
@@ -1329,6 +1798,15 @@ impl ApplicationHandler<AppEvent> for App {
                 self.request_redraw();
             }
 
+            WindowEvent::CursorMoved { position, .. } => {
+                self.handle_cursor_moved(position.x as f32, position.y as f32);
+                // Only redraw if hover state changed
+                if self.hover_changed {
+                    self.hover_changed = false;
+                    self.request_redraw();
+                }
+            }
+
             WindowEvent::RedrawRequested => {
                 // Clear redraw flag - we're rendering now
                 self.needs_redraw = false;
@@ -1385,8 +1863,14 @@ impl ApplicationHandler<AppEvent> for App {
         // Check if we have pending screenshot captures that need GPU polling
         let has_pending_captures = self.screenshot_capture.has_pending();
 
+        // Process continuous right stick scrolling
+        let stick_active = self.right_stick_y.abs() > 0.15;
+        if stick_active && !self.gamepad_passthrough {
+            self.handle_gamepad_right_stick(self.right_stick_y);
+        }
+
         // Request redraw if needed
-        if self.needs_redraw || self.pending_screenshot.is_some() || has_pending_captures {
+        if self.needs_redraw || self.pending_screenshot.is_some() || has_pending_captures || stick_active {
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
@@ -1413,7 +1897,8 @@ impl ApplicationHandler<AppEvent> for App {
                 self.handle_gamepad_stick(x, y);
             }
             AppEvent::GamepadRightStick { x: _, y } => {
-                self.handle_gamepad_right_stick(y);
+                // Store stick position for continuous scrolling in about_to_wait
+                self.right_stick_y = y;
             }
             AppEvent::GamepadConnected => {
                 tracing::info!("Gamepad connected");
@@ -1530,6 +2015,65 @@ impl ApplicationHandler<AppEvent> for App {
                     command_prefix: cmd_prefix,
                     selected_choice: 0,
                     previous_state: Box::new(self.state.clone()),
+                };
+                self.request_redraw();
+            }
+            AppEvent::ExecutionToolCall(line) => {
+                // Add tool call to left column
+                if let AppState::Executing { tool_log, .. } = &mut self.state {
+                    tool_log.insert(0, line); // Newest at top
+                    if tool_log.len() > 500 { tool_log.truncate(500); }
+                    self.request_redraw();
+                }
+            }
+            AppEvent::ExecutionThought(line) => {
+                // Add thought/commentary to right column
+                if let AppState::Executing { thought_log, .. } = &mut self.state {
+                    thought_log.insert(0, line); // Newest at top
+                    if thought_log.len() > 500 { thought_log.truncate(500); }
+                    self.request_redraw();
+                }
+            }
+            AppEvent::ExecutionProgress { current, total } => {
+                // Update execution progress
+                if let AppState::Executing { status, .. } = &mut self.state {
+                    *status = ExecutionStatus::Running {
+                        current_card: current,
+                        total_cards: total,
+                    };
+                    self.request_redraw();
+                }
+            }
+            AppEvent::ExecutionComplete => {
+                // Mark execution as complete
+                if let AppState::Executing { status, tool_log, .. } = &mut self.state {
+                    *status = ExecutionStatus::Completed;
+                    tool_log.insert(0, "✅ All tasks completed".to_string());
+                    self.request_redraw();
+                }
+            }
+            AppEvent::ExecutionError(error) => {
+                // Mark execution as failed
+                if let AppState::Executing { status, tool_log, .. } = &mut self.state {
+                    *status = ExecutionStatus::Failed(error.clone());
+                    tool_log.insert(0, format!("❌ Failed: {}", error));
+                    self.request_redraw();
+                }
+            }
+            AppEvent::SurveyRequest { question, header, options, multi_select, response_tx } => {
+                // Show survey UI - store response channel and transition to Survey state
+                tracing::info!("Survey request: {}", question);
+                self.state = AppState::Survey {
+                    question,
+                    header,
+                    options,
+                    focused_index: 0,
+                    custom_input: String::new(),
+                    custom_active: false,
+                    multi_select,
+                    selected_indices: Vec::new(),
+                    previous_state: Box::new(self.state.clone()),
+                    response_tx: Some(response_tx),
                 };
                 self.request_redraw();
             }
@@ -1651,6 +2195,21 @@ impl App {
                 // Execute modal is transient - just return to chooser on restart
                 serde_json::json!({
                     "view": "chooser",
+                    "selected": 0
+                })
+            }
+            AppState::Survey { .. } => {
+                // Survey is transient - just return to chooser on restart
+                serde_json::json!({
+                    "view": "chooser",
+                    "selected": 0
+                })
+            }
+            AppState::Executing { project_path, .. } => {
+                // Executing is transient - return to project view on restart
+                serde_json::json!({
+                    "view": "project",
+                    "project_path": project_path.to_string_lossy(),
                     "selected": 0
                 })
             }
