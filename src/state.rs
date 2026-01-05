@@ -322,8 +322,8 @@ pub enum AppState {
         tool_log: Vec<String>,
         /// Right column: Claude's commentary/thoughts with timestamps
         thought_log: Vec<String>,
-        /// Scroll offset for logs
-        log_scroll_offset: usize,
+        /// Scroll offset for logs (pixels)
+        log_scroll_offset: f32,
         /// Which executor is running (Claude, ZAi, etc)
         executor: ExecuteOption,
         /// Previous state to return to (PalaceLoop)
@@ -488,6 +488,336 @@ impl AppState {
         Self::ProjectView {
             project_path: path,
             selected_action: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ============== Settings Tests ==============
+    #[test]
+    fn test_settings_default() {
+        let settings = Settings::default();
+        assert!(settings.dark_mode, "Default should be dark mode");
+        assert!(settings.ui_scale.is_none(), "Default UI scale should be None (auto)");
+    }
+
+    // ============== MainMenuItem Tests ==============
+    #[test]
+    fn test_main_menu_items() {
+        let items = MainMenuItem::all();
+        assert_eq!(items.len(), 3, "Should have 3 main menu items");
+
+        assert_eq!(MainMenuItem::Resume.label(), "Resume");
+        assert_eq!(MainMenuItem::Settings.label(), "Settings");
+        assert_eq!(MainMenuItem::Exit.label(), "Exit");
+    }
+
+    // ============== SettingsItem Tests ==============
+    #[test]
+    fn test_settings_items() {
+        let items = SettingsItem::all();
+        assert_eq!(items.len(), 2, "Should have 2 settings items");
+
+        assert_eq!(SettingsItem::DarkMode.label(), "Dark Mode");
+        assert_eq!(SettingsItem::UiScale.label(), "UI Scale");
+    }
+
+    // ============== UiScaleOption Tests ==============
+    #[test]
+    fn test_ui_scale_options() {
+        let options = UiScaleOption::all();
+        assert_eq!(options.len(), 7, "Should have 7 scale options");
+    }
+
+    #[test]
+    fn test_ui_scale_labels() {
+        assert_eq!(UiScaleOption::Auto.label(), "Auto-detect");
+        assert_eq!(UiScaleOption::Scale50.label(), "50%");
+        assert_eq!(UiScaleOption::Scale100.label(), "100%");
+        assert_eq!(UiScaleOption::Scale150.label(), "150%");
+        assert_eq!(UiScaleOption::Scale200.label(), "200%");
+        assert_eq!(UiScaleOption::Scale300.label(), "300%");
+        assert_eq!(UiScaleOption::Scale400.label(), "400%");
+    }
+
+    #[test]
+    fn test_ui_scale_values() {
+        assert_eq!(UiScaleOption::Auto.value(), None);
+        assert_eq!(UiScaleOption::Scale50.value(), Some(0.5));
+        assert_eq!(UiScaleOption::Scale100.value(), Some(1.0));
+        assert_eq!(UiScaleOption::Scale150.value(), Some(1.5));
+        assert_eq!(UiScaleOption::Scale200.value(), Some(2.0));
+        assert_eq!(UiScaleOption::Scale300.value(), Some(3.0));
+        assert_eq!(UiScaleOption::Scale400.value(), Some(4.0));
+    }
+
+    #[test]
+    fn test_ui_scale_from_setting() {
+        // None -> Auto
+        assert_eq!(UiScaleOption::from_setting(None), UiScaleOption::Auto);
+
+        // Specific values
+        assert_eq!(UiScaleOption::from_setting(Some(0.5)), UiScaleOption::Scale50);
+        assert_eq!(UiScaleOption::from_setting(Some(1.0)), UiScaleOption::Scale100);
+        assert_eq!(UiScaleOption::from_setting(Some(1.5)), UiScaleOption::Scale150);
+        assert_eq!(UiScaleOption::from_setting(Some(2.0)), UiScaleOption::Scale200);
+        assert_eq!(UiScaleOption::from_setting(Some(3.0)), UiScaleOption::Scale300);
+
+        // Boundary tests - should map to nearest option
+        assert_eq!(UiScaleOption::from_setting(Some(0.6)), UiScaleOption::Scale50);
+        assert_eq!(UiScaleOption::from_setting(Some(0.74)), UiScaleOption::Scale50);
+        assert_eq!(UiScaleOption::from_setting(Some(0.75)), UiScaleOption::Scale100);
+        assert_eq!(UiScaleOption::from_setting(Some(1.24)), UiScaleOption::Scale100);
+        assert_eq!(UiScaleOption::from_setting(Some(1.25)), UiScaleOption::Scale150);
+        assert_eq!(UiScaleOption::from_setting(Some(1.74)), UiScaleOption::Scale150);
+        assert_eq!(UiScaleOption::from_setting(Some(1.75)), UiScaleOption::Scale200);
+        assert_eq!(UiScaleOption::from_setting(Some(2.49)), UiScaleOption::Scale200);
+        assert_eq!(UiScaleOption::from_setting(Some(2.5)), UiScaleOption::Scale300);
+        assert_eq!(UiScaleOption::from_setting(Some(3.49)), UiScaleOption::Scale300);
+        assert_eq!(UiScaleOption::from_setting(Some(3.5)), UiScaleOption::Scale400);
+        assert_eq!(UiScaleOption::from_setting(Some(5.0)), UiScaleOption::Scale400);
+    }
+
+    // ============== ProjectAction Tests ==============
+    #[test]
+    fn test_project_actions() {
+        let actions = ProjectAction::all();
+        assert_eq!(actions.len(), 4, "Should have 4 project actions");
+    }
+
+    #[test]
+    fn test_project_action_labels() {
+        assert_eq!(ProjectAction::StartPalaceLoop.label(), "Start Palace Loop");
+        assert_eq!(ProjectAction::Build.label(), "Build");
+        assert_eq!(ProjectAction::Run.label(), "Run");
+        assert_eq!(ProjectAction::ViewGitHistory.label(), "View Git History");
+    }
+
+    #[test]
+    fn test_project_action_descriptions() {
+        assert!(ProjectAction::StartPalaceLoop.description().contains("AI-assisted"));
+        assert!(ProjectAction::Build.description().contains("Compile"));
+        assert!(ProjectAction::Run.description().contains("Execute"));
+        assert!(ProjectAction::ViewGitHistory.description().contains("Git"));
+    }
+
+    // ============== SuggestionCard Tests ==============
+    #[test]
+    fn test_suggestion_card_new() {
+        let card = SuggestionCard::new(42);
+        assert_eq!(card.id, 42);
+        assert!(card.title.is_empty());
+        assert!(card.category.is_empty());
+        assert!(card.description.is_empty());
+        assert!(card.command.is_none());
+        assert!(!card.selected);
+        assert!(card.streaming);
+    }
+
+    #[test]
+    fn test_suggestion_card_colors() {
+        let mut card = SuggestionCard::new(0);
+
+        // Test each category color
+        card.category = "fix".to_string();
+        assert_eq!(card.color(), [1.0, 0.4, 0.4, 1.0]);
+
+        card.category = "test".to_string();
+        assert_eq!(card.color(), [0.4, 0.8, 1.0, 1.0]);
+
+        card.category = "build".to_string();
+        assert_eq!(card.color(), [1.0, 0.7, 0.2, 1.0]);
+
+        card.category = "refactor".to_string();
+        assert_eq!(card.color(), [0.7, 0.5, 1.0, 1.0]);
+
+        card.category = "docs".to_string();
+        assert_eq!(card.color(), [0.5, 0.9, 0.5, 1.0]);
+
+        card.category = "unknown".to_string();
+        assert_eq!(card.color(), [0.5, 0.5, 0.6, 1.0]);
+    }
+
+    // ============== SurveyOption Tests ==============
+    #[test]
+    fn test_survey_option_new() {
+        let option = SurveyOption::new("Test Label", "Test Description");
+        assert_eq!(option.label, "Test Label");
+        assert_eq!(option.description, "Test Description");
+    }
+
+    #[test]
+    fn test_survey_option_with_string_conversions() {
+        let option = SurveyOption::new(String::from("Label"), String::from("Desc"));
+        assert_eq!(option.label, "Label");
+        assert_eq!(option.description, "Desc");
+    }
+
+    // ============== ExecuteOption Tests ==============
+    #[test]
+    fn test_execute_options() {
+        let options = ExecuteOption::all();
+        assert_eq!(options.len(), 3, "Should have 3 execute options");
+    }
+
+    #[test]
+    fn test_execute_option_labels() {
+        assert_eq!(ExecuteOption::Claude.label(), "Run with Claude");
+        assert_eq!(ExecuteOption::ZAi.label(), "Run with Z.ai");
+        assert_eq!(ExecuteOption::ZAiTurbo.label(), "Run with Z.ai (turbo)");
+    }
+
+    // ============== ExecutionStatus Tests ==============
+    #[test]
+    fn test_execution_status_pending() {
+        let status = ExecutionStatus::Pending;
+        assert!(!status.is_running());
+        assert!(!status.is_done());
+    }
+
+    #[test]
+    fn test_execution_status_running() {
+        let status = ExecutionStatus::Running {
+            current_card: 2,
+            total_cards: 5,
+        };
+        assert!(status.is_running());
+        assert!(!status.is_done());
+    }
+
+    #[test]
+    fn test_execution_status_completed() {
+        let status = ExecutionStatus::Completed;
+        assert!(!status.is_running());
+        assert!(status.is_done());
+    }
+
+    #[test]
+    fn test_execution_status_failed() {
+        let status = ExecutionStatus::Failed("Test error".to_string());
+        assert!(!status.is_running());
+        assert!(status.is_done());
+    }
+
+    #[test]
+    fn test_execution_status_cancelled() {
+        let status = ExecutionStatus::Cancelled;
+        assert!(!status.is_running());
+        assert!(status.is_done());
+    }
+
+    // ============== PermissionChoice Tests ==============
+    #[test]
+    fn test_permission_choices() {
+        let choices = PermissionChoice::all();
+        assert_eq!(choices.len(), 4, "Should have 4 permission choices");
+    }
+
+    #[test]
+    fn test_permission_choice_labels() {
+        assert_eq!(PermissionChoice::YesOnce.label("prefix"), "Yes (once)");
+        assert_eq!(
+            PermissionChoice::YesAlways.label("cargo"),
+            "Yes (always for 'cargo')"
+        );
+        assert_eq!(PermissionChoice::No.label("prefix"), "No");
+        assert_eq!(
+            PermissionChoice::SuggestElse.label("prefix"),
+            "Suggest something else"
+        );
+    }
+
+    #[test]
+    fn test_permission_choice_short_labels() {
+        assert_eq!(PermissionChoice::YesOnce.short_label(), "Yes");
+        assert_eq!(PermissionChoice::YesAlways.short_label(), "Always");
+        assert_eq!(PermissionChoice::No.short_label(), "No");
+        assert_eq!(PermissionChoice::SuggestElse.short_label(), "Suggest");
+    }
+
+    // ============== PermissionResponse Tests ==============
+    #[test]
+    fn test_permission_response_approved() {
+        let response = PermissionResponse::Approved;
+        assert!(response.is_approved());
+    }
+
+    #[test]
+    fn test_permission_response_approved_always() {
+        let response = PermissionResponse::ApprovedAlways("cargo".to_string());
+        assert!(response.is_approved());
+    }
+
+    #[test]
+    fn test_permission_response_denied() {
+        let response = PermissionResponse::Denied;
+        assert!(!response.is_approved());
+    }
+
+    #[test]
+    fn test_permission_response_suggest_else() {
+        let response = PermissionResponse::SuggestElse {
+            original_command: "rm -rf /".to_string(),
+        };
+        assert!(!response.is_approved());
+    }
+
+    // ============== AppState Tests ==============
+    #[test]
+    fn test_app_state_project_chooser() {
+        let state = AppState::project_chooser();
+        match state {
+            AppState::ProjectChooser { selected_index } => {
+                assert_eq!(selected_index, 0);
+            }
+            _ => panic!("Expected ProjectChooser state"),
+        }
+    }
+
+    #[test]
+    fn test_app_state_project_view() {
+        let path = PathBuf::from("/test/project");
+        let state = AppState::project_view(path.clone());
+        match state {
+            AppState::ProjectView {
+                project_path,
+                selected_action,
+            } => {
+                assert_eq!(project_path, path);
+                assert_eq!(selected_action, 0);
+            }
+            _ => panic!("Expected ProjectView state"),
+        }
+    }
+
+    #[test]
+    fn test_survey_response_variants() {
+        // Selected variant
+        let response = SurveyResponse::Selected(vec![0, 2]);
+        match response {
+            SurveyResponse::Selected(indices) => {
+                assert_eq!(indices, vec![0, 2]);
+            }
+            _ => panic!("Expected Selected variant"),
+        }
+
+        // Custom variant
+        let response = SurveyResponse::Custom("custom input".to_string());
+        match response {
+            SurveyResponse::Custom(text) => {
+                assert_eq!(text, "custom input");
+            }
+            _ => panic!("Expected Custom variant"),
+        }
+
+        // Cancelled variant
+        let response = SurveyResponse::Cancelled;
+        match response {
+            SurveyResponse::Cancelled => {}
+            _ => panic!("Expected Cancelled variant"),
         }
     }
 }

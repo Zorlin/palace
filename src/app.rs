@@ -977,7 +977,7 @@ impl App {
                                 },
                                 tool_log: Vec::new(),
                                 thought_log: Vec::new(),
-                                log_scroll_offset: 0,
+                                log_scroll_offset: 0.0,
                                 executor: option,
                                 previous_state: previous_state.clone(),
                             };
@@ -1177,10 +1177,10 @@ impl App {
                         }
                     }
                     KeyCode::ArrowUp | KeyCode::KeyW => {
-                        *log_scroll_offset = log_scroll_offset.saturating_sub(1);
+                        *log_scroll_offset = (*log_scroll_offset - 40.0).max(0.0);
                     }
                     KeyCode::ArrowDown | KeyCode::KeyS => {
-                        *log_scroll_offset += 1;
+                        *log_scroll_offset += 40.0;
                     }
                     _ => {}
                 }

@@ -394,6 +394,76 @@ mod tests {
         PalaceDB { db }
     }
 
+    // ============== TaskStatus Tests ==============
+    #[test]
+    fn test_task_status_default() {
+        let status = TaskStatus::default();
+        assert_eq!(status, TaskStatus::Pending);
+    }
+
+    #[test]
+    fn test_task_status_equality() {
+        assert_eq!(TaskStatus::Pending, TaskStatus::Pending);
+        assert_eq!(TaskStatus::Running, TaskStatus::Running);
+        assert_eq!(TaskStatus::Complete, TaskStatus::Complete);
+        assert_eq!(TaskStatus::Failed, TaskStatus::Failed);
+
+        assert_ne!(TaskStatus::Pending, TaskStatus::Running);
+        assert_ne!(TaskStatus::Complete, TaskStatus::Failed);
+    }
+
+    // ============== Task Tests ==============
+    #[test]
+    fn test_task_new() {
+        let task = Task::new(1, "Test task".to_string(), "/test/project".to_string());
+
+        assert_eq!(task.id, 1);
+        assert_eq!(task.title, "Test task");
+        assert_eq!(task.project_path, "/test/project");
+        assert!(task.category.is_empty());
+        assert!(task.description.is_empty());
+        assert!(task.command.is_none());
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert_eq!(task.progress, 0.0);
+        assert!(task.completed_at.is_none());
+        assert!(!task.archived);
+    }
+
+    #[test]
+    fn test_task_from_suggestion() {
+        let task = Task::from_suggestion(
+            1,
+            "Fix bug",
+            "fix",
+            "Fix the critical bug in main",
+            Some("cargo fix"),
+            "/project",
+        );
+
+        assert_eq!(task.id, 1);
+        assert_eq!(task.title, "Fix bug");
+        assert_eq!(task.category, "fix");
+        assert_eq!(task.description, "Fix the critical bug in main");
+        assert_eq!(task.command, Some("cargo fix".to_string()));
+        assert_eq!(task.project_path, "/project");
+        assert_eq!(task.status, TaskStatus::Pending);
+    }
+
+    #[test]
+    fn test_task_from_suggestion_no_command() {
+        let task = Task::from_suggestion(
+            2,
+            "Read docs",
+            "docs",
+            "Read the documentation",
+            None,
+            "/project",
+        );
+
+        assert!(task.command.is_none());
+    }
+
+    // ============== Task CRUD Tests ==============
     #[test]
     fn test_task_crud() {
         let db = test_db();
@@ -418,6 +488,164 @@ mod tests {
         assert!(db.load_task(1).unwrap().is_none());
     }
 
+    #[test]
+    fn test_task_update() {
+        let db = test_db();
+
+        // Create and save
+        let mut task = Task::new(1, "Original title".to_string(), "/project".to_string());
+        db.save_task(&task).unwrap();
+
+        // Modify and save
+        task.title = "Updated title".to_string();
+        task.status = TaskStatus::Complete;
+        db.save_task(&task).unwrap();
+
+        // Load and verify
+        let loaded = db.load_task(1).unwrap().unwrap();
+        assert_eq!(loaded.title, "Updated title");
+        assert_eq!(loaded.status, TaskStatus::Complete);
+    }
+
+    #[test]
+    fn test_load_nonexistent_task() {
+        let db = test_db();
+        let result = db.load_task(999);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_load_current_tasks_empty() {
+        let db = test_db();
+        let tasks = db.load_current_tasks("/test/project").unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn test_load_current_tasks_filters_by_project() {
+        let db = test_db();
+
+        // Add tasks for different projects
+        let task1 = Task::new(1, "Task 1".to_string(), "/project1".to_string());
+        let task2 = Task::new(2, "Task 2".to_string(), "/project2".to_string());
+        let task3 = Task::new(3, "Task 3".to_string(), "/project1".to_string());
+
+        db.save_task(&task1).unwrap();
+        db.save_task(&task2).unwrap();
+        db.save_task(&task3).unwrap();
+
+        // Load tasks for project1
+        let tasks = db.load_current_tasks("/project1").unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().any(|t| t.id == 1));
+        assert!(tasks.iter().any(|t| t.id == 3));
+        assert!(!tasks.iter().any(|t| t.id == 2));
+    }
+
+    #[test]
+    fn test_load_current_tasks_excludes_archived() {
+        let db = test_db();
+
+        let task1 = Task::new(1, "Task 1".to_string(), "/project".to_string());
+        let task2 = Task::new(2, "Task 2".to_string(), "/project".to_string());
+
+        db.save_task(&task1).unwrap();
+        db.save_task(&task2).unwrap();
+
+        // Archive one task
+        db.archive_task(1).unwrap();
+
+        let tasks = db.load_current_tasks("/project").unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, 2);
+    }
+
+    #[test]
+    fn test_load_current_tasks_sorting() {
+        let db = test_db();
+
+        // Create tasks with different timestamps
+        let mut task1 = Task::new(1, "Task 1".to_string(), "/project".to_string());
+        task1.created_at = 1000;
+
+        let mut task2 = Task::new(2, "Task 2".to_string(), "/project".to_string());
+        task2.created_at = 3000;
+
+        let mut task3 = Task::new(3, "Task 3".to_string(), "/project".to_string());
+        task3.created_at = 2000;
+
+        db.save_task(&task1).unwrap();
+        db.save_task(&task2).unwrap();
+        db.save_task(&task3).unwrap();
+
+        let tasks = db.load_current_tasks("/project").unwrap();
+        assert_eq!(tasks.len(), 3);
+        // Should be sorted newest first
+        assert_eq!(tasks[0].id, 2); // created_at = 3000
+        assert_eq!(tasks[1].id, 3); // created_at = 2000
+        assert_eq!(tasks[2].id, 1); // created_at = 1000
+    }
+
+    #[test]
+    fn test_load_archived_tasks() {
+        let db = test_db();
+
+        let task1 = Task::new(1, "Task 1".to_string(), "/project".to_string());
+        let task2 = Task::new(2, "Task 2".to_string(), "/project".to_string());
+
+        db.save_task(&task1).unwrap();
+        db.save_task(&task2).unwrap();
+
+        // Archive both
+        db.archive_task(1).unwrap();
+        db.archive_task(2).unwrap();
+
+        let archived = db.load_archived_tasks().unwrap();
+        assert_eq!(archived.len(), 2);
+        assert!(archived.iter().all(|t| t.archived));
+    }
+
+    #[test]
+    fn test_unarchive_task() {
+        let db = test_db();
+
+        let task = Task::new(1, "Task".to_string(), "/project".to_string());
+        db.save_task(&task).unwrap();
+
+        db.archive_task(1).unwrap();
+        let loaded = db.load_task(1).unwrap().unwrap();
+        assert!(loaded.archived);
+
+        db.unarchive_task(1).unwrap();
+        let loaded = db.load_task(1).unwrap().unwrap();
+        assert!(!loaded.archived);
+    }
+
+    #[test]
+    fn test_next_task_id_empty_db() {
+        let db = test_db();
+        let next_id = db.next_task_id().unwrap();
+        assert_eq!(next_id, 1);
+    }
+
+    #[test]
+    fn test_next_task_id_existing_tasks() {
+        let db = test_db();
+
+        let task1 = Task::new(1, "Task 1".to_string(), "/project".to_string());
+        let task2 = Task::new(5, "Task 2".to_string(), "/project".to_string());
+        let task3 = Task::new(3, "Task 3".to_string(), "/project".to_string());
+
+        db.save_task(&task1).unwrap();
+        db.save_task(&task2).unwrap();
+        db.save_task(&task3).unwrap();
+
+        let next_id = db.next_task_id().unwrap();
+        assert_eq!(next_id, 6); // max_id (5) + 1
+    }
+
+    // ============== Permission Tests ==============
     #[test]
     fn test_permissions() {
         let db = test_db();
@@ -447,6 +675,78 @@ mod tests {
     }
 
     #[test]
+    fn test_permission_key_format() {
+        let key = PalaceDB::permission_key("/my/project", "cargo build");
+        assert_eq!(key, "/my/project:cargo build");
+    }
+
+    #[test]
+    fn test_multiple_permissions_same_project() {
+        let db = test_db();
+        let project = "/test/project";
+
+        db.approve_prefix(project, "cargo build").unwrap();
+        db.approve_prefix(project, "cargo test").unwrap();
+        db.approve_prefix(project, "git push").unwrap();
+
+        let prefixes = db.get_approved_prefixes(project).unwrap();
+        assert_eq!(prefixes.len(), 3);
+        assert!(prefixes.contains(&"cargo build".to_string()));
+        assert!(prefixes.contains(&"cargo test".to_string()));
+        assert!(prefixes.contains(&"git push".to_string()));
+    }
+
+    #[test]
+    fn test_command_matching_with_prefixes() {
+        let db = test_db();
+        let project = "/test/project";
+
+        // Approve "cargo"
+        db.approve_prefix(project, "cargo").unwrap();
+
+        // All these should match
+        assert!(db.is_command_approved(project, "cargo build").unwrap());
+        assert!(db.is_command_approved(project, "cargo test").unwrap());
+        assert!(db.is_command_approved(project, "cargo run --bin foo").unwrap());
+
+        // These should not match
+        assert!(!db.is_command_approved(project, "git status").unwrap());
+        assert!(!db.is_command_approved(project, "cargox build").unwrap());
+    }
+
+    #[test]
+    fn test_get_approved_prefixes_empty() {
+        let db = test_db();
+        let prefixes = db.get_approved_prefixes("/nonexistent").unwrap();
+        assert!(prefixes.is_empty());
+    }
+
+    #[test]
+    fn test_get_all_permissions() {
+        let db = test_db();
+
+        db.approve_prefix("/project1", "cargo build").unwrap();
+        db.approve_prefix("/project1", "cargo test").unwrap();
+        db.approve_prefix("/project2", "npm install").unwrap();
+
+        let perms = db.get_all_permissions().unwrap();
+        assert_eq!(perms.len(), 3);
+
+        assert!(perms.contains(&("/project1".to_string(), "cargo build".to_string())));
+        assert!(perms.contains(&("/project1".to_string(), "cargo test".to_string())));
+        assert!(perms.contains(&("/project2".to_string(), "npm install".to_string())));
+    }
+
+    #[test]
+    fn test_revoke_nonexistent_permission() {
+        let db = test_db();
+        // Should not error even if permission doesn't exist
+        let result = db.revoke_prefix("/project", "nonexistent command");
+        assert!(result.is_ok());
+    }
+
+    // ============== User Preferences Tests ==============
+    #[test]
     fn test_user_prefs() {
         let db = test_db();
 
@@ -464,5 +764,144 @@ mod tests {
         // Delete one
         db.delete_pref("dark_mode").unwrap();
         assert!(db.get_pref::<bool>("dark_mode").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_pref_update() {
+        let db = test_db();
+
+        db.set_pref("counter", &42i32).unwrap();
+        let value: i32 = db.get_pref("counter").unwrap().unwrap();
+        assert_eq!(value, 42);
+
+        // Update
+        db.set_pref("counter", &100i32).unwrap();
+        let value: i32 = db.get_pref("counter").unwrap().unwrap();
+        assert_eq!(value, 100);
+    }
+
+    #[test]
+    fn test_get_nonexistent_pref() {
+        let db = test_db();
+        let result: Option<String> = db.get_pref("nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_pref_complex_types() {
+        use serde_json::json;
+
+        let db = test_db();
+
+        // Test with JSON value
+        let value = json!({
+            "name": "test",
+            "items": vec![1, 2, 3]
+        });
+
+        db.set_pref("complex", &value).unwrap();
+        let loaded: serde_json::Value = db.get_pref("complex").unwrap().unwrap();
+        assert_eq!(loaded, value);
+    }
+
+    #[test]
+    fn test_pref_string() {
+        let db = test_db();
+
+        db.set_pref("api_key", &"secret-key-123").unwrap();
+        let key: String = db.get_pref("api_key").unwrap().unwrap();
+        assert_eq!(key, "secret-key-123");
+    }
+
+    #[test]
+    fn test_pref_option() {
+        let db = test_db();
+
+        db.set_pref("optional", &Some(42i32)).unwrap();
+        let value: Option<i32> = db.get_pref("optional").unwrap().unwrap();
+        assert_eq!(value, Some(42));
+
+        db.set_pref("none", &Option::<i32>::None).unwrap();
+        let value: Option<i32> = db.get_pref("none").unwrap().unwrap();
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn test_delete_nonexistent_pref() {
+        let db = test_db();
+        // Should not error
+        let result = db.delete_pref("nonexistent");
+        assert!(result.is_ok());
+    }
+
+    // ============== Integration Tests ==============
+    #[test]
+    fn test_task_workflow() {
+        let db = test_db();
+
+        // Create a task from suggestion
+        let task = Task::from_suggestion(
+            1,
+            "Run tests",
+            "test",
+            "Run the full test suite",
+            Some("cargo test"),
+            "/myproject",
+        );
+        db.save_task(&task).unwrap();
+
+        // Verify it's in current tasks
+        let current = db.load_current_tasks("/myproject").unwrap();
+        assert_eq!(current.len(), 1);
+
+        // Simulate execution
+        let mut loaded = db.load_task(1).unwrap().unwrap();
+        loaded.status = TaskStatus::Running;
+        db.save_task(&loaded).unwrap();
+
+        loaded.status = TaskStatus::Complete;
+        loaded.completed_at = Some(12345);
+        db.save_task(&loaded).unwrap();
+
+        // Verify completion
+        let final_task = db.load_task(1).unwrap().unwrap();
+        assert_eq!(final_task.status, TaskStatus::Complete);
+        assert_eq!(final_task.completed_at, Some(12345));
+
+        // Archive it
+        db.archive_task(1).unwrap();
+        let current = db.load_current_tasks("/myproject").unwrap();
+        assert!(current.is_empty());
+
+        let archived = db.load_archived_tasks().unwrap();
+        assert_eq!(archived.len(), 1);
+    }
+
+    #[test]
+    fn test_permission_workflow() {
+        let db = test_db();
+
+        // First time: check permission (not approved)
+        assert!(!db.is_command_approved("/project", "cargo build --release").unwrap());
+
+        // User approves "cargo" prefix
+        db.approve_prefix("/project", "cargo").unwrap();
+
+        // Now all cargo commands are approved
+        assert!(db.is_command_approved("/project", "cargo build").unwrap());
+        assert!(db.is_command_approved("/project", "cargo test").unwrap());
+        assert!(db.is_command_approved("/project", "cargo build --release").unwrap());
+
+        // But other commands still need approval
+        assert!(!db.is_command_approved("/project", "git push").unwrap());
+
+        // Check all permissions
+        let all = db.get_all_permissions().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0], ("/project".to_string(), "cargo".to_string()));
+
+        // Later, user revokes
+        db.revoke_prefix("/project", "cargo").unwrap();
+        assert!(!db.is_command_approved("/project", "cargo build").unwrap());
     }
 }

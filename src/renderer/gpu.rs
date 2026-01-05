@@ -2862,7 +2862,7 @@ impl Renderer {
         &mut self,
         tool_log: &[String],
         thought_log: &[String],
-        log_scroll: usize,
+        log_scroll: f32,
         status: &crate::state::ExecutionStatus,
         _executor: crate::state::ExecuteOption,
     ) {
@@ -2919,14 +2919,12 @@ impl Renderer {
         // Left column: Tool calls
         // Format: [HH:MM:SS] 💻 command  summary ●
         // Colorized: timestamp + icon + action | Plain: summary | Colored: dot
+        // Uses pixel-based scrolling
         let left_col_width = screen_mid - margin - self.ui_scale.px(20.0);
         if !tool_log.is_empty() {
-            let visible_start = log_scroll.min(tool_log.len().saturating_sub(1));
             let mut y_offset = 0.0;
-            let mut entry_idx = 0;
-            for entry in tool_log.iter().skip(visible_start) {
-                if y_offset >= available_height { break; }
 
+            for entry in tool_log.iter() {
                 // Check for error prefix
                 let (is_error, clean_entry) = if entry.starts_with("ERR:") {
                     (true, &entry[4..])
@@ -2941,8 +2939,21 @@ impl Renderer {
                     log_scale,
                     left_col_width,
                 );
+
+                // Apply scroll offset
+                let y = log_start_y + y_offset - log_scroll;
+
+                // Skip entries above viewport
+                if y + h < log_start_y {
+                    y_offset += h;
+                    continue;
+                }
+                // Stop rendering entries below viewport
+                if y >= log_start_y + available_height {
+                    break;
+                }
+
                 let alpha = 0.9; // No fade - clarity over aesthetics
-                let y = log_start_y + y_offset;
 
                 // Parse entry: [HH:MM:SS] icon action  summary dot
                 // Split at double-space to separate colored part from plain part
@@ -3027,32 +3038,43 @@ impl Renderer {
                 }
 
                 y_offset += h;
-                entry_idx += 1;
             }
         }
 
         // Right column: Thoughts/commentary
         // Format: [HH:MM:SS] text
-        // Colorized: timestamp | Plain: commentary
+        // Colorized: timestamp | Markdown: commentary
+        // Uses pixel-based scrolling - offset all entries by scroll amount
         let right_col_width = screen_mid - right_margin;
         if !thought_log.is_empty() {
-            let visible_start = log_scroll.min(thought_log.len().saturating_sub(1));
             let mut y_offset = 0.0;
-            let mut entry_idx = 0;
-            for entry in thought_log.iter().skip(visible_start) {
-                if y_offset >= available_height { break; }
+            let x = screen_mid + self.ui_scale.px(10.0);
+
+            for entry in thought_log.iter() {
                 let (_w, h, _lines) = crate::renderer::text::measure_text(
                     &mut self.font_system,
                     entry,
                     log_scale,
                     right_col_width,
                 );
+
+                // Apply scroll offset
+                let y = log_start_y + y_offset - log_scroll;
+
+                // Skip entries above viewport
+                if y + h < log_start_y {
+                    y_offset += h;
+                    continue;
+                }
+                // Stop rendering entries below viewport
+                if y >= log_start_y + available_height {
+                    break;
+                }
+
                 let alpha = 0.9; // No fade - clarity over aesthetics
-                let y = log_start_y + y_offset;
-                let x = screen_mid + self.ui_scale.px(10.0);
 
                 // Parse: [HH:MM:SS] rest
-                // Colorized timestamp, plain rest
+                // Colorized timestamp, markdown rest
                 if entry.starts_with('[') && entry.len() > 10 && entry.chars().nth(9) == Some(']') {
                     let timestamp_part = &entry[..10]; // "[HH:MM:SS]"
                     let rest = entry[10..].trim_start();
@@ -3077,8 +3099,8 @@ impl Renderer {
                         right_col_width,
                     );
 
-                    // Render rest in plain color for readability
-                    self.text_queue.push_bounded(
+                    // Render rest as markdown for rich formatting
+                    self.text_queue.push_markdown_bounded(
                         rest,
                         x + ts_w,
                         y,
@@ -3088,8 +3110,8 @@ impl Renderer {
                         h,
                     );
                 } else {
-                    // No timestamp, render plain
-                    self.text_queue.push_bounded(
+                    // No timestamp, render as markdown
+                    self.text_queue.push_markdown_bounded(
                         entry,
                         x,
                         y,
@@ -3101,7 +3123,6 @@ impl Renderer {
                 }
 
                 y_offset += h;
-                entry_idx += 1;
             }
         }
 
@@ -3112,7 +3133,7 @@ impl Renderer {
             status: status.clone(),
             tool_log: Vec::new(),
             thought_log: Vec::new(),
-            log_scroll_offset: 0,
+            log_scroll_offset: 0.0,
             executor: _executor,
             previous_state: Box::new(AppState::ProjectChooser { selected_index: 0 }),
         };

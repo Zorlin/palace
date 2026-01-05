@@ -1217,8 +1217,9 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    // ============== ProjectType Detection Tests ==============
     #[test]
-    fn test_project_type_detection() {
+    fn test_project_type_detection_rust() {
         let mut files = HashMap::new();
         files.insert("Cargo.toml".to_string(), FileInfo { size: 100, is_dir: false });
 
@@ -1231,9 +1232,113 @@ mod tests {
             project_type: ProjectType::Unknown,
         };
 
-        assert_eq!(ProjectContext::detect_type(&ctx.root, &ctx.files), ProjectType::Rust);
+        assert_eq!(
+            ProjectContext::detect_type(&ctx.root, &ctx.files),
+            ProjectType::Rust
+        );
     }
 
+    #[test]
+    fn test_project_type_detection_python() {
+        let mut files = HashMap::new();
+        files.insert("pyproject.toml".to_string(), FileInfo { size: 100, is_dir: false });
+
+        let ctx = ProjectContext {
+            root: PathBuf::from("/test"),
+            files,
+            git_status: None,
+            git_branch: None,
+            recent_history: vec![],
+            project_type: ProjectType::Unknown,
+        };
+
+        assert_eq!(
+            ProjectContext::detect_type(&ctx.root, &ctx.files),
+            ProjectType::Python
+        );
+    }
+
+    #[test]
+    fn test_project_type_detection_typescript() {
+        let mut files = HashMap::new();
+        files.insert("package.json".to_string(), FileInfo { size: 100, is_dir: false });
+        files.insert("tsconfig.json".to_string(), FileInfo { size: 50, is_dir: false });
+
+        let ctx = ProjectContext {
+            root: PathBuf::from("/test"),
+            files,
+            git_status: None,
+            git_branch: None,
+            recent_history: vec![],
+            project_type: ProjectType::Unknown,
+        };
+
+        assert_eq!(
+            ProjectContext::detect_type(&ctx.root, &ctx.files),
+            ProjectType::TypeScript
+        );
+    }
+
+    #[test]
+    fn test_project_type_detection_javascript() {
+        let mut files = HashMap::new();
+        files.insert("package.json".to_string(), FileInfo { size: 100, is_dir: false });
+
+        let ctx = ProjectContext {
+            root: PathBuf::from("/test"),
+            files,
+            git_status: None,
+            git_branch: None,
+            recent_history: vec![],
+            project_type: ProjectType::Unknown,
+        };
+
+        assert_eq!(
+            ProjectContext::detect_type(&ctx.root, &ctx.files),
+            ProjectType::JavaScript
+        );
+    }
+
+    #[test]
+    fn test_project_type_detection_go() {
+        let mut files = HashMap::new();
+        files.insert("go.mod".to_string(), FileInfo { size: 100, is_dir: false });
+
+        let ctx = ProjectContext {
+            root: PathBuf::from("/test"),
+            files,
+            git_status: None,
+            git_branch: None,
+            recent_history: vec![],
+            project_type: ProjectType::Unknown,
+        };
+
+        assert_eq!(
+            ProjectContext::detect_type(&ctx.root, &ctx.files),
+            ProjectType::Go
+        );
+    }
+
+    #[test]
+    fn test_project_type_detection_unknown() {
+        let files = HashMap::new();
+
+        let ctx = ProjectContext {
+            root: PathBuf::from("/test"),
+            files,
+            git_status: None,
+            git_branch: None,
+            recent_history: vec![],
+            project_type: ProjectType::Unknown,
+        };
+
+        assert_eq!(
+            ProjectContext::detect_type(&ctx.root, &ctx.files),
+            ProjectType::Unknown
+        );
+    }
+
+    // ============== ProjectContext Summary Tests ==============
     #[test]
     fn test_context_summary() {
         let mut files = HashMap::new();
@@ -1255,6 +1360,47 @@ mod tests {
         assert!(summary.contains("src/main.rs"));
     }
 
+    #[test]
+    fn test_context_summary_with_clean_git() {
+        let mut files = HashMap::new();
+        files.insert("src/main.rs".to_string(), FileInfo { size: 1000, is_dir: false });
+
+        let ctx = ProjectContext {
+            root: PathBuf::from("/test/project"),
+            files,
+            git_status: Some("".to_string()), // Clean status
+            git_branch: Some("main".to_string()),
+            recent_history: vec![],
+            project_type: ProjectType::Rust,
+        };
+
+        let summary = ctx.summary();
+        assert!(summary.contains("clean"));
+    }
+
+    #[test]
+    fn test_context_summary_with_history() {
+        let mut files = HashMap::new();
+        files.insert("src/main.rs".to_string(), FileInfo { size: 1000, is_dir: false });
+
+        let mut history = Vec::new();
+        history.push(serde_json::json!({"action": "ran tests"}));
+        history.push(serde_json::json!({"action": "built project"}));
+
+        let ctx = ProjectContext {
+            root: PathBuf::from("/test/project"),
+            files,
+            git_status: None,
+            git_branch: None,
+            recent_history: history,
+            project_type: ProjectType::Rust,
+        };
+
+        let summary = ctx.summary();
+        assert!(summary.contains("Recent actions"));
+    }
+
+    // ============== Suggestion Parsing Tests ==============
     #[test]
     fn test_parse_suggestions() {
         let engine = SuggestionEngine::new(Some("test-key"), Some("test-model")).unwrap();
@@ -1279,37 +1425,204 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_description_has_emoji() {
-        // Read tool should have 📖
+    fn test_parse_multiple_suggestions() {
+        let engine = SuggestionEngine::new(Some("test-key"), Some("test-model")).unwrap();
+
+        let response = r#"[
+  {
+    "title": "Run tests",
+    "description": "Ensure all tests pass",
+    "category": "test",
+    "priority": 1,
+    "command": "cargo test"
+  },
+  {
+    "title": "Fix linting",
+    "description": "Fix clippy warnings",
+    "category": "fix",
+    "priority": 2,
+    "command": "cargo clippy --fix"
+  },
+  {
+    "title": "Update docs",
+    "description": "Update README with new features",
+    "category": "docs",
+    "priority": 3
+  }
+]"#;
+
+        let suggestions = engine.parse_suggestions(response).unwrap();
+        assert_eq!(suggestions.len(), 3);
+        assert_eq!(suggestions[0].title, "Run tests");
+        assert_eq!(suggestions[1].category, "fix");
+        assert_eq!(suggestions[2].category, "docs");
+        assert!(suggestions[2].command.is_none());
+    }
+
+    #[test]
+    fn test_parse_suggestions_with_markdown() {
+        let engine = SuggestionEngine::new(Some("test-key"), Some("test-model")).unwrap();
+
+        // Response with markdown code blocks
+        let response = r#"Here are my suggestions for your project:
+
+```json
+[
+  {
+    "title": "Add tests",
+    "description": "Write unit tests",
+    "category": "test",
+    "priority": 1
+  }
+]
+```
+
+Let me know if you need more!"#;
+
+        let suggestions = engine.parse_suggestions(response).unwrap();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].title, "Add tests");
+    }
+
+    #[test]
+    fn test_parse_invalid_json() {
+        let engine = SuggestionEngine::new(Some("test-key"), Some("test-model")).unwrap();
+
+        let response = "This is not valid JSON {][}";
+
+        let result = engine.parse_suggestions(response);
+        assert!(result.is_err());
+    }
+
+    // ============== Tool Description Tests ==============
+    #[test]
+    fn test_tool_description_read() {
         let desc = tool_description("Read", r#"{"file_path": "/test.rs"}"#);
         assert!(desc.starts_with("📖"), "Read tool should start with 📖, got: {}", desc);
         assert!(desc.contains("/test.rs"));
+    }
 
-        // Bash tool should have 💻
+    #[test]
+    fn test_tool_description_bash() {
         let desc = tool_description("Bash", r#"{"command": "cargo build"}"#);
         assert!(desc.starts_with("💻"), "Bash tool should start with 💻, got: {}", desc);
 
-        // Grep tool should have 🔍
+        // Test truncation of long commands
+        let long_cmd = "cargo build --release --features all --target x86_64-unknown-linux-gnu && echo done";
+        let desc_long = tool_description("Bash", &serde_json::json!({"command": long_cmd}).to_string());
+        assert!(desc_long.len() <= 55); // Should be truncated
+        assert!(desc_long.ends_with("..."));
+    }
+
+    #[test]
+    fn test_tool_description_grep() {
         let desc = tool_description("Grep", r#"{"pattern": "TODO"}"#);
         assert!(desc.starts_with("🔍"), "Grep tool should start with 🔍, got: {}", desc);
+    }
 
-        // Glob tool should have 📁
+    #[test]
+    fn test_tool_description_glob() {
         let desc = tool_description("Glob", r#"{"pattern": "*.rs"}"#);
         assert!(desc.starts_with("📁"), "Glob tool should start with 📁, got: {}", desc);
+    }
 
-        // Edit tool should have ✏️
+    #[test]
+    fn test_tool_description_edit() {
         let desc = tool_description("Edit", r#"{"file_path": "/test.rs"}"#);
         assert!(desc.starts_with("✏️"), "Edit tool should start with ✏️, got: {}", desc);
+    }
 
-        // Write tool should have 📝
+    #[test]
+    fn test_tool_description_write() {
         let desc = tool_description("Write", r#"{"file_path": "/new.rs"}"#);
         assert!(desc.starts_with("📝"), "Write tool should start with 📝, got: {}", desc);
+    }
 
-        // Unknown tool should have 🔧
+    #[test]
+    fn test_tool_description_unknown() {
         let desc = tool_description("SomeRandomTool", r#"{}"#);
         assert!(desc.starts_with("🔧"), "Unknown tool should start with 🔧, got: {}", desc);
     }
 
+    // ============== Result Preview Tests ==============
+    #[test]
+    fn test_result_preview_single_line() {
+        let result = "Error: something went wrong";
+        let preview = result_preview(result);
+        assert_eq!(preview, "Error: something went wrong");
+    }
+
+    #[test]
+    fn test_result_preview_two_lines() {
+        let result = "line one\nline two";
+        let preview = result_preview(result);
+        assert_eq!(preview, "line one line two");
+    }
+
+    #[test]
+    fn test_result_preview_many_lines() {
+        let result = "line one\nline two\nline three\nline four";
+        let preview = result_preview(result);
+        // Should only take first 2 lines
+        assert_eq!(preview, "line one line two");
+    }
+
+    #[test]
+    fn test_result_preview_with_prefix() {
+        let result = "read_file: This is the content";
+        let preview = result_preview(result);
+        assert_eq!(preview, "This is the content");
+    }
+
+    #[test]
+    fn test_result_preview_truncation() {
+        let long_content = "a".repeat(100);
+        let result = format!("read_file: {}", long_content);
+        let preview = result_preview(&result);
+        assert!(preview.len() <= 83); // 80 chars + "..."
+        assert!(preview.ends_with("..."));
+    }
+
+    // ============== Tool Emoji Tests ==============
+    #[test]
+    fn test_tool_emoji_read_file() {
+        assert_eq!(tool_emoji("read_file"), "📖");
+    }
+
+    #[test]
+    fn test_tool_emoji_list_directory() {
+        assert_eq!(tool_emoji("list_directory"), "📁");
+    }
+
+    #[test]
+    fn test_tool_emoji_search_files() {
+        assert_eq!(tool_emoji("search_files"), "🔍");
+    }
+
+    #[test]
+    fn test_tool_emoji_run_command() {
+        assert_eq!(tool_emoji("run_command"), "💻");
+    }
+
+    #[test]
+    fn test_tool_emoji_unknown() {
+        assert_eq!(tool_emoji("unknown_tool"), "⚙");
+    }
+
+    // ============== SuggestionEngine Creation Tests ==============
+    #[test]
+    fn test_suggestion_engine_new_with_key() {
+        let engine = SuggestionEngine::new(Some("test-api-key"), Some("claude-3-5-sonnet-4"));
+        assert!(engine.is_ok());
+    }
+
+    #[test]
+    fn test_suggestion_engine_new_default_model() {
+        let engine = SuggestionEngine::new(Some("test-api-key"), None);
+        assert!(engine.is_ok());
+    }
+
+    // ============== Chatter Event Tests ==============
     #[test]
     fn test_chatter_event_generated() {
         use std::sync::{Arc, Mutex};
@@ -1326,15 +1639,24 @@ mod tests {
             for line in text_before_suggestions.lines() {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() && !trimmed.starts_with("```") {
-                    events_clone.lock().unwrap().push(SuggestionEvent::Chatter(trimmed.to_string()));
+                    events_clone
+                        .lock()
+                        .unwrap()
+                        .push(SuggestionEvent::Chatter(trimmed.to_string()));
                 }
             }
         }
 
         let collected = events.lock().unwrap();
         assert_eq!(collected.len(), 2, "Should have 2 chatter events");
-        assert!(matches!(&collected[0], SuggestionEvent::Chatter(s) if s == "Let me analyze your project."));
-        assert!(matches!(&collected[1], SuggestionEvent::Chatter(s) if s == "Looking at the codebase structure."));
+        assert!(matches!(
+            &collected[0],
+            SuggestionEvent::Chatter(s) if s == "Let me analyze your project."
+        ));
+        assert!(matches!(
+            &collected[1],
+            SuggestionEvent::Chatter(s) if s == "Looking at the codebase structure."
+        ));
     }
 
     #[test]
@@ -1352,12 +1674,141 @@ mod tests {
             for line in text_after_suggestions.lines() {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() && !trimmed.starts_with("```") {
-                    events_clone.lock().unwrap().push(SuggestionEvent::Chatter(trimmed.to_string()));
+                    events_clone
+                        .lock()
+                        .unwrap()
+                        .push(SuggestionEvent::Chatter(trimmed.to_string()));
                 }
             }
         }
 
         let collected = events.lock().unwrap();
         assert_eq!(collected.len(), 0, "No chatter events after suggestions start");
+    }
+
+    // ============== FileInfo Tests ==============
+    #[test]
+    fn test_file_info_directory() {
+        let info = FileInfo {
+            size: 4096,
+            is_dir: true,
+        };
+        assert!(info.is_dir);
+        assert_eq!(info.size, 4096);
+    }
+
+    #[test]
+    fn test_file_info_file() {
+        let info = FileInfo {
+            size: 1024,
+            is_dir: false,
+        };
+        assert!(!info.is_dir);
+        assert_eq!(info.size, 1024);
+    }
+
+    // ============== ProjectContext JSON Tests ==============
+    #[test]
+    fn test_project_context_to_json() {
+        let mut files = HashMap::new();
+        files.insert(
+            "Cargo.toml".to_string(),
+            FileInfo { size: 100, is_dir: false },
+        );
+
+        let ctx = ProjectContext {
+            root: PathBuf::from("/test"),
+            files,
+            git_status: None,
+            git_branch: None,
+            recent_history: vec![],
+            project_type: ProjectType::Rust,
+        };
+
+        let json = ctx.to_json();
+        assert!(json.contains("\"root\""));
+        assert!(json.contains("\"files\""));
+        assert!(json.contains("\"Rust\""));
+    }
+
+    // ============== YAML Parsing State Tests ==============
+    #[test]
+    fn test_yaml_parser_state_default() {
+        let state = YamlParserState::default();
+        assert_eq!(state.processed_lines, 0);
+        assert!(state.current_card_id.is_none());
+        assert_eq!(state.next_card_id, 0);
+        assert!(state.emitted_fields.is_empty());
+    }
+
+    // ============== SuggestionEvent Variant Tests ==============
+    #[test]
+    fn test_suggestion_event_variants() {
+        // Test ToolCall
+        let event = SuggestionEvent::ToolCall("Reading file".to_string());
+        match event {
+            SuggestionEvent::ToolCall(desc) => {
+                assert_eq!(desc, "Reading file");
+            }
+            _ => panic!("Expected ToolCall variant"),
+        }
+
+        // Test Chatter
+        let event = SuggestionEvent::Chatter("Thinking...".to_string());
+        match event {
+            SuggestionEvent::Chatter(text) => {
+                assert_eq!(text, "Thinking...");
+            }
+            _ => panic!("Expected Chatter variant"),
+        }
+
+        // Test CardStart
+        let event = SuggestionEvent::CardStart { id: 5 };
+        match event {
+            SuggestionEvent::CardStart { id } => {
+                assert_eq!(id, 5);
+            }
+            _ => panic!("Expected CardStart variant"),
+        }
+
+        // Test CardUpdate
+        let event = SuggestionEvent::CardUpdate {
+            id: 5,
+            field: "title".to_string(),
+            value: "Fix bug".to_string(),
+        };
+        match event {
+            SuggestionEvent::CardUpdate { id, field, value } => {
+                assert_eq!(id, 5);
+                assert_eq!(field, "title");
+                assert_eq!(value, "Fix bug");
+            }
+            _ => panic!("Expected CardUpdate variant"),
+        }
+
+        // Test CardComplete
+        let event = SuggestionEvent::CardComplete { id: 5 };
+        match event {
+            SuggestionEvent::CardComplete { id } => {
+                assert_eq!(id, 5);
+            }
+            _ => panic!("Expected CardComplete variant"),
+        }
+
+        // Test Done
+        let event = SuggestionEvent::Done;
+        match event {
+            SuggestionEvent::Done => {}
+            _ => panic!("Expected Done variant"),
+        }
+
+        // Test Error
+        let event = SuggestionEvent::Error("Test error".to_string());
+        match event {
+            SuggestionEvent::Error(msg) => {
+                assert_eq!(msg, "Test error");
+            }
+            _ => panic!("Expected Error variant"),
+        }
     }
 }

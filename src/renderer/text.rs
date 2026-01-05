@@ -105,6 +105,23 @@ impl TextQueue {
         );
     }
 
+    /// Push markdown text with bounds (no scroll)
+    pub fn push_markdown_bounded(
+        &mut self,
+        markdown: &str,
+        x: f32,
+        y: f32,
+        scale: f32,
+        color: [f32; 4],
+        bounds_width: f32,
+        bounds_height: f32,
+    ) {
+        self.markdown_requests.push(
+            MarkdownRequest::new(markdown, x, y, scale, color)
+                .with_bounds(bounds_width, bounds_height),
+        );
+    }
+
     /// Push markdown text with bounds and scroll
     pub fn push_markdown_scroll(
         &mut self,
