@@ -1823,6 +1823,7 @@ impl ApplicationHandler<AppEvent> for App {
                     KeyEvent {
                         physical_key: PhysicalKey::Code(key),
                         state: ElementState::Pressed,
+                        text,
                         ..
                     },
                 ..
@@ -1832,6 +1833,17 @@ impl ApplicationHandler<AppEvent> for App {
                     self.open_main_menu();
                     self.request_redraw();
                 } else {
+                    // Handle text input for custom survey input
+                    if let AppState::Survey { custom_active: true, custom_input, .. } = &mut self.state {
+                        // Add typed characters to custom input
+                        if let Some(txt) = text {
+                            if !txt.is_empty() && !txt.chars().next().map(|c| c.is_control()).unwrap_or(true) {
+                                custom_input.push_str(&txt);
+                                self.request_redraw();
+                                return; // Don't process as a key code
+                            }
+                        }
+                    }
                     self.handle_input(key);
                     self.request_redraw();
                 }
