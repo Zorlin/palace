@@ -1439,11 +1439,6 @@ impl App {
                     }
                 }
 
-                // Check if tap is in back area (bottom left)
-                if y > size.height as f32 - 100.0 && x < 200.0 {
-                    tracing::info!("Tapped back area");
-                    self.handle_input(KeyCode::Backspace);
-                }
             }
             AppState::MainMenu { selected_item, .. } => {
                 // Tap on menu items
