@@ -714,7 +714,7 @@ impl Renderer {
         enum ModalType {
             MainMenu(usize),
             Settings(usize),
-            UiScale(usize),
+            UiScale { selected: usize, user_scale_override: Option<f32> },
             Permission { selected: usize, command: String, prefix: String },
             Execute(usize),
         }
@@ -731,7 +731,7 @@ impl Renderer {
                 };
                 (actual_base, Some(ModalType::Settings(*selected_item)))
             }
-            AppState::UiScaleMenu { previous_state, selected_item } => {
+            AppState::UiScaleMenu { previous_state, selected_item, user_scale_override } => {
                 // Navigate back to find the actual base state
                 let actual_base = match previous_state.as_ref() {
                     AppState::SettingsMenu { previous_state, .. } => {
@@ -742,7 +742,7 @@ impl Renderer {
                     }
                     other => other,
                 };
-                (actual_base, Some(ModalType::UiScale(*selected_item)))
+                (actual_base, Some(ModalType::UiScale { selected: *selected_item, user_scale_override: *user_scale_override }))
             }
             AppState::PermissionModal { previous_state, selected_choice, command, command_prefix, .. } => {
                 (previous_state.as_ref(), Some(ModalType::Permission {
@@ -860,7 +860,7 @@ impl Renderer {
             match modal {
                 ModalType::MainMenu(selected) => self.queue_main_menu_text(*selected),
                 ModalType::Settings(selected) => self.queue_settings_modal_text(*selected),
-                ModalType::UiScale(selected) => self.queue_ui_scale_modal_text(*selected),
+                ModalType::UiScale { selected, user_scale_override } => self.queue_ui_scale_modal_text(*selected, *user_scale_override),
                 ModalType::Permission { selected, command, prefix } => self.queue_permission_modal_text(*selected, command, prefix),
                 ModalType::Execute(selected) => self.queue_execute_modal_text(*selected),
             }
@@ -878,7 +878,7 @@ impl Renderer {
             match modal {
                 ModalType::MainMenu(selected) => modal_cards.extend(self.build_main_menu_cards(*selected)),
                 ModalType::Settings(selected) => modal_cards.extend(self.build_settings_modal_cards(*selected)),
-                ModalType::UiScale(selected) => modal_cards.extend(self.build_ui_scale_modal_cards(*selected)),
+                ModalType::UiScale { selected, .. } => modal_cards.extend(self.build_ui_scale_modal_cards(*selected)),
                 ModalType::Permission { selected, command, prefix: _ } => modal_cards.extend(self.build_permission_modal_cards(*selected, command)),
                 ModalType::Execute(selected) => modal_cards.extend(self.build_execute_modal_cards(*selected)),
             }
@@ -1699,7 +1699,7 @@ impl Renderer {
         sprites
     }
 
-    fn queue_ui_scale_modal_text(&mut self, selected: usize) {
+    fn queue_ui_scale_modal_text(&mut self, selected: usize, user_scale_override: Option<f32>) {
         use crate::state::UiScaleOption;
 
         let items = UiScaleOption::all();
@@ -1749,8 +1749,9 @@ impl Renderer {
                 label_color,
             );
 
-            // Show current indicator if this is the current scale
-            if item.value() == self.ui_scale.dpi_scale {
+            // Show current indicator if this matches user's setting
+            let is_current = item.value() == user_scale_override;
+            if is_current {
                 self.text_queue.push(
                     "(current)",
                     modal_x + modal_width - inner_padding - self.ui_scale.px(80.0),
@@ -1764,6 +1765,7 @@ impl Renderer {
         // Add help legend for modal state
         let help_state = AppState::UiScaleMenu {
             selected_item: selected,
+            user_scale_override,
             previous_state: Box::new(AppState::SettingsMenu {
                 selected_item: 0,
                 previous_state: Box::new(AppState::MainMenu {

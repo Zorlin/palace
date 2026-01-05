@@ -5,15 +5,15 @@ use std::path::PathBuf;
 pub struct Settings {
     /// Dark mode enabled (true = dark, false = light)
     pub dark_mode: bool,
-    /// UI scale factor (1.0 = 100%, 1.5 = 150%, etc.)
-    pub ui_scale: f32,
+    /// UI scale setting (None = auto-detect, Some = user override)
+    pub ui_scale: Option<f32>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             dark_mode: true, // Default to dark mode (OLED-friendly)
-            ui_scale: 1.0,
+            ui_scale: None,  // Auto-detect by default
         }
     }
 }
@@ -63,6 +63,7 @@ impl SettingsItem {
 /// UI Scale options
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiScaleOption {
+    Auto,
     Scale50,
     Scale100,
     Scale150,
@@ -74,6 +75,7 @@ pub enum UiScaleOption {
 impl UiScaleOption {
     pub fn all() -> &'static [UiScaleOption] {
         &[
+            UiScaleOption::Auto,
             UiScaleOption::Scale50,
             UiScaleOption::Scale100,
             UiScaleOption::Scale150,
@@ -85,6 +87,7 @@ impl UiScaleOption {
 
     pub fn label(&self) -> &'static str {
         match self {
+            UiScaleOption::Auto => "Auto-detect",
             UiScaleOption::Scale50 => "50%",
             UiScaleOption::Scale100 => "100%",
             UiScaleOption::Scale150 => "150%",
@@ -94,31 +97,29 @@ impl UiScaleOption {
         }
     }
 
-    pub fn value(&self) -> f32 {
+    /// Get the scale value (None for Auto)
+    pub fn value(&self) -> Option<f32> {
         match self {
-            UiScaleOption::Scale50 => 0.5,
-            UiScaleOption::Scale100 => 1.0,
-            UiScaleOption::Scale150 => 1.5,
-            UiScaleOption::Scale200 => 2.0,
-            UiScaleOption::Scale300 => 3.0,
-            UiScaleOption::Scale400 => 4.0,
+            UiScaleOption::Auto => None,
+            UiScaleOption::Scale50 => Some(0.5),
+            UiScaleOption::Scale100 => Some(1.0),
+            UiScaleOption::Scale150 => Some(1.5),
+            UiScaleOption::Scale200 => Some(2.0),
+            UiScaleOption::Scale300 => Some(3.0),
+            UiScaleOption::Scale400 => Some(4.0),
         }
     }
 
-    /// Get the option closest to a given scale value
-    pub fn from_value(scale: f32) -> Self {
-        if scale < 0.75 {
-            UiScaleOption::Scale50
-        } else if scale < 1.25 {
-            UiScaleOption::Scale100
-        } else if scale < 1.75 {
-            UiScaleOption::Scale150
-        } else if scale < 2.5 {
-            UiScaleOption::Scale200
-        } else if scale < 3.5 {
-            UiScaleOption::Scale300
-        } else {
-            UiScaleOption::Scale400
+    /// Get the option from a settings value (None = Auto)
+    pub fn from_setting(scale: Option<f32>) -> Self {
+        match scale {
+            None => UiScaleOption::Auto,
+            Some(s) if s < 0.75 => UiScaleOption::Scale50,
+            Some(s) if s < 1.25 => UiScaleOption::Scale100,
+            Some(s) if s < 1.75 => UiScaleOption::Scale150,
+            Some(s) if s < 2.5 => UiScaleOption::Scale200,
+            Some(s) if s < 3.5 => UiScaleOption::Scale300,
+            Some(_) => UiScaleOption::Scale400,
         }
     }
 }
@@ -255,6 +256,8 @@ pub enum AppState {
         selected_item: usize,
         /// Previous state (SettingsMenu) to return to
         previous_state: Box<AppState>,
+        /// Current user scale override (None = auto)
+        user_scale_override: Option<f32>,
     },
     /// Permission modal - AI is waiting for user approval
     PermissionModal {

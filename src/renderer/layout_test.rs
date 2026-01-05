@@ -201,7 +201,7 @@ pub const TEST_SCREEN_HEIGHT: f32 = 1080.0;
 
 /// All scales to test
 pub fn all_test_scales() -> Vec<f32> {
-    UiScaleOption::all().iter().map(|s| s.value()).collect()
+    UiScaleOption::all().iter().filter_map(|s| s.value()).collect()
 }
 
 /// Card grid layout calculator (mirrors CardGrid in gpu.rs)

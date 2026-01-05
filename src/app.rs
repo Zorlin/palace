@@ -86,6 +86,10 @@ pub struct App {
     event_proxy: Arc<EventLoopProxy<AppEvent>>,
     /// Pending permission response sender (set when permission modal is shown)
     permission_response_tx: Option<tokio::sync::oneshot::Sender<PermissionResponse>>,
+    /// System-detected UI scale (from display settings)
+    detected_scale: f32,
+    /// User's scale override (None = use auto-detected)
+    user_scale_override: Option<f32>,
 }
 
 impl App {
@@ -106,6 +110,8 @@ impl App {
             l3_held: false,
             r3_held: false,
             event_proxy: Arc::new(event_proxy),
+            detected_scale: 1.0, // Will be set when display is detected
+            user_scale_override: None, // Auto-detect by default
         }
     }
 
@@ -159,7 +165,7 @@ impl App {
         let current_scale = self.renderer.as_ref()
             .map(|r| r.ui_scale())
             .unwrap_or(1.0);
-        let current_option = UiScaleOption::from_value(current_scale);
+        let current_option = UiScaleOption::from_setting(self.user_scale_override);
         UiScaleOption::all().iter()
             .position(|o| *o == current_option)
             .unwrap_or(1) // Default to 100% (index 1)
@@ -635,6 +641,7 @@ impl App {
                                 self.state = AppState::UiScaleMenu {
                                     selected_item: self.get_current_scale_index(),
                                     previous_state: Box::new(self.state.clone()),
+                                    user_scale_override: self.user_scale_override,
                                 };
                             }
                         }
@@ -649,6 +656,7 @@ impl App {
             AppState::UiScaleMenu {
                 selected_item,
                 previous_state,
+                ..
             } => {
                 let scale_count = UiScaleOption::all().len();
 
@@ -670,10 +678,12 @@ impl App {
                     KeyCode::Enter | KeyCode::Space => {
                         // Apply the selected scale
                         let scale_option = UiScaleOption::all()[*selected_item];
-                        let scale_value = scale_option.value();
-                        tracing::info!("Setting UI scale to {}", scale_option.label());
+                        self.user_scale_override = scale_option.value();
+                        // Use override if set, otherwise use detected
+                        let actual_scale = self.user_scale_override.unwrap_or(self.detected_scale);
+                        tracing::info!("Setting UI scale to {} ({})", scale_option.label(), actual_scale);
                         if let Some(renderer) = &mut self.renderer {
-                            renderer.set_ui_scale(scale_value);
+                            renderer.set_ui_scale(actual_scale);
                         }
                         // Go back to settings menu
                         self.state = *previous_state.clone();
@@ -1251,11 +1261,14 @@ impl ApplicationHandler<AppEvent> for App {
                             .unwrap_or_else(|| "unknown".to_string());
 
                         let scaling_config = DisplayScaling::load();
-                        let scale = scaling_config.get_scale_for_display(
+                        let detected = scaling_config.get_scale_for_display(
                             &display_name,
                             size.width,
                             size.height,
                         );
+                        self.detected_scale = detected;
+                        // Use user override if set, otherwise auto-detected
+                        let scale = self.user_scale_override.unwrap_or(detected);
                         renderer.set_ui_scale(scale);
 
                         // Set initial gamepad connection state
