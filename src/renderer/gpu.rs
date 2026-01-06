@@ -1,8 +1,9 @@
+#![allow(dead_code)]
 use crate::projects::ProjectsConfig;
 use crate::renderer::cards::{CardInstance, CardRenderer};
 use crate::renderer::sprites::{SpriteInstance, SpriteRenderer, XboxButton};
-use crate::renderer::text::{PreparedText, TextQueue, TextRequest};
-use crate::state::{AppState, ExecutionStatus, SuggestionCard, TaskStatus};
+use crate::renderer::text::{PreparedText, TextQueue};
+use crate::state::{AppState, SuggestionCard, TaskStatus};
 use anyhow::{Context, Result};
 use glyphon::{
     Cache, FontSystem, Resolution, SwashCache, TextAtlas, TextRenderer, Viewport,
@@ -2743,7 +2744,7 @@ impl Renderer {
         // Two-column waterfall logs (tools left, thoughts right)
         // Only show logs when cards haven't appeared yet (during analysis phase)
         if cards.is_empty() {
-            let line_height = self.ui_scale.px(16.0);
+            let _line_height = self.ui_scale.px(16.0);
             let log_scale = self.ui_scale.px(13.0);
             let log_y_start = subtitle_y + self.ui_scale.px(28.0);
 

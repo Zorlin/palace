@@ -2,6 +2,7 @@
 //!
 //! Provides a simple API for rendering text with color emoji support.
 //! Includes basic markdown rendering support (bold, italic, code, headings, bullets).
+#![allow(dead_code)]
 
 use glyphon::{
     Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache,

@@ -14,6 +14,7 @@ use crate::app::AppEvent;
 use crate::state::{ExecuteOption, SuggestionCard};
 
 /// Execute tasks using the streaming agentic loop
+#[allow(dead_code)]
 pub struct TaskExecutor {
     client: AnthropicClient,
     model: String,

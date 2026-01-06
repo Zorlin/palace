@@ -3,6 +3,7 @@
 //! Handles:
 //! - Detecting system UI scaling from Wayland/X11
 //! - Estimating physical display size from model names
+#![allow(dead_code)]
 //! - Per-display scaling preferences
 //! - Computing appropriate UI scale based on DPI
 
@@ -321,7 +322,7 @@ fn detect_kscreen_scaling(display_name: &str) -> Option<f32> {
 }
 
 /// Detect scaling from X11 using xrandr
-fn detect_x11_scaling(display_name: &str) -> Option<f32> {
+fn detect_x11_scaling(_display_name: &str) -> Option<f32> {
     // X11 doesn't have native scaling, but we can detect:
     // 1. Xft.dpi setting
     // 2. GNOME/KDE scaling applied via Xresources
@@ -476,7 +477,7 @@ fn estimate_scale_from_resolution(width: u32, height: u32) -> f32 {
 
 /// Get current display info from the system
 pub fn get_display_info() -> Vec<DisplayInfo> {
-    let mut displays = Vec::new();
+    let displays = Vec::new();
 
     // Try Wayland first
     if std::env::var("WAYLAND_DISPLAY").is_ok() {

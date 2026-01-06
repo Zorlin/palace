@@ -2,7 +2,7 @@ use crate::debug::{DebugCommand, DebugResponse, ScreenshotCapture};
 use crate::display::DisplayScaling;
 use crate::projects::ProjectsConfig;
 use crate::renderer::Renderer;
-use crate::state::{AppState, ExecuteOption, ExecutionStatus, MainMenuItem, SettingsItem, SuggestionCard, TaskStatus, UiScaleOption};
+use crate::state::{AppState, ExecutionStatus, SuggestionCard, TaskStatus, UiScaleOption};
 use gilrs::Button;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,6 +15,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 /// Custom events sent to the main event loop from background threads
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum AppEvent {
     /// Gamepad button pressed
     GamepadButton(Button),
@@ -23,6 +24,7 @@ pub enum AppEvent {
     /// Gamepad left stick moved (axis, value -1.0 to 1.0)
     GamepadStick { x: f32, y: f32 },
     /// Gamepad right stick moved (for scrolling)
+    #[allow(dead_code)]
     GamepadRightStick { x: f32, y: f32 },
     /// Gamepad connected
     GamepadConnected,
@@ -69,6 +71,7 @@ pub enum AppEvent {
     /// Permission request from AI - requires user approval
     PermissionRequest {
         /// Unique ID for this request
+        #[allow(dead_code)]
         id: usize,
         /// The command or action requesting permission
         command: String,
@@ -198,7 +201,7 @@ impl App {
 
     /// Get the index of the current UI scale in UiScaleOption::all()
     fn get_current_scale_index(&self) -> usize {
-        let current_scale = self.renderer.as_ref()
+        let _current_scale = self.renderer.as_ref()
             .map(|r| r.ui_scale())
             .unwrap_or(1.0);
         let current_option = UiScaleOption::from_setting(self.user_scale_override);
@@ -449,6 +452,7 @@ impl App {
     }
 
     /// Check if a command is approved (prefix match)
+    #[allow(dead_code)]
     pub fn is_command_approved(cmd: &str) -> bool {
         use std::sync::{OnceLock, Mutex as StdMutex};
         static APPROVED: OnceLock<StdMutex<Vec<String>>> = OnceLock::new();
@@ -2471,6 +2475,7 @@ impl App {
 
 /// Testable gamepad focus state machine (no window dependencies)
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub struct GamepadFocusTracker {
     /// Whether we're in passthrough mode (Palace ignores gamepad)
     pub passthrough: bool,
@@ -2482,6 +2487,7 @@ pub struct GamepadFocusTracker {
 
 /// Result of processing a gamepad button
 #[derive(Debug, PartialEq)]
+#[allow(dead_code)]
 pub enum FocusAction {
     /// No focus change needed
     None,
@@ -2494,11 +2500,13 @@ pub enum FocusAction {
 }
 
 impl GamepadFocusTracker {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Process a button press, returns action to take
+    #[allow(dead_code)]
     pub fn button_pressed(&mut self, button: Button) -> FocusAction {
         match button {
             Button::LeftThumb => {
@@ -2536,6 +2544,7 @@ impl GamepadFocusTracker {
     }
 
     /// Process a button release
+    #[allow(dead_code)]
     pub fn button_released(&mut self, button: Button) {
         match button {
             Button::LeftThumb => self.l3_held = false,

@@ -558,6 +558,7 @@ impl ProjectContext {
     }
 
     /// Convert to JSON for API call
+    #[allow(dead_code)]
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_default()
     }
@@ -633,6 +634,7 @@ impl SuggestionEngine {
 
     /// Generate suggestions with streaming output in YAML format
     /// Streams plain text directly to stdout as it arrives
+    #[allow(dead_code)]
     pub fn suggest_streaming(&self, context: &ProjectContext) -> Result<()> {
         let prompt = self.build_streaming_prompt(context);
         let system = "You are Palace, an AI assistant that analyzes software projects and suggests actionable next steps. Output clean YAML only, no markdown fences.";
@@ -858,6 +860,7 @@ suggestions:
         ]"#.to_string()
     }
 
+    #[allow(dead_code)]
     fn build_streaming_prompt(&self, context: &ProjectContext) -> String {
         format!(r#"Analyze this project and suggest possible next actions.
 
@@ -1059,7 +1062,7 @@ suggestions:
                             in_tool = false;
                         }
                     }
-                    StreamEvent::ToolResult(result) => {
+                    StreamEvent::ToolResult(_result) => {
                         if let Some((name, input)) = pending_clone.lock().unwrap().pop_front() {
                             let desc = tool_description(&name, &input);
                             send_tool(SuggestionEvent::ToolCall(desc));

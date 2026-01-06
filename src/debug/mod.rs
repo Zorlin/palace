@@ -26,6 +26,7 @@ pub enum DebugCommand {
 /// Response from the renderer
 #[derive(Debug)]
 pub enum DebugResponse {
+    #[allow(dead_code)]
     ScreenshotSaved { path: PathBuf },
     ScreenshotPending { path: PathBuf },
     Error { message: String },

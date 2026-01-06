@@ -1,6 +1,7 @@
 //! Layout testing framework for detecting overlapping UI elements
 //!
 //! Tests all screens at 1080p resolution across all UI scales.
+#![allow(dead_code)]
 
 use crate::state::{ProjectAction, UiScaleOption};
 
@@ -258,7 +259,7 @@ impl CardGrid {
 pub fn layout_project_chooser(
     scale: &TestUiScale,
     screen_width: f32,
-    screen_height: f32,
+    _screen_height: f32,
     project_count: usize,
 ) -> Vec<LayoutElement> {
     let mut elements = Vec::new();
