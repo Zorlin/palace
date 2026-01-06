@@ -107,6 +107,40 @@ enum DisplayAction {
 }
 
 fn main() -> Result<()> {
+    // Install SIGSEGV handler for segfaults (GPU driver crashes, etc)
+    install_signal_handlers();
+
+    // Install custom panic hook for better crash output
+    std::panic::set_hook(Box::new(|panic_info| {
+        eprintln!("\n\x1b[31m╔═══════════════════════════════════════════════════════════════╗\x1b[0m");
+        eprintln!("\x1b[31m║                     PALACE CRASHED                             ║\x1b[0m");
+        eprintln!("\x1b[31m╚═══════════════════════════════════════════════════════════════╝\x1b[0m\n");
+
+        // Print panic message
+        if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            eprintln!("\x1b[1;33mPanic:\x1b[0m {}", s);
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            eprintln!("\x1b[1;33mPanic:\x1b[0m {}", s);
+        } else {
+            eprintln!("\x1b[1;33mPanic:\x1b[0m Unknown error");
+        }
+
+        // Print location
+        if let Some(location) = panic_info.location() {
+            eprintln!("\x1b[1;36mLocation:\x1b[0m {}:{}:{}", location.file(), location.line(), location.column());
+        }
+
+        // Print backtrace
+        let backtrace = std::backtrace::Backtrace::capture();
+        if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+            eprintln!("\n\x1b[1;35mBacktrace:\x1b[0m\n{}", backtrace);
+        } else {
+            eprintln!("\n\x1b[1;33mNote:\x1b[0m Set RUST_BACKTRACE=1 for full backtrace");
+        }
+
+        eprintln!("\n\x1b[2mPlease report this issue at: https://github.com/yourrepo/palace/issues\x1b[0m");
+    }));
+
     // Load .env file if present (silently)
     let _ = dotenvy::dotenv();
 
@@ -880,5 +914,40 @@ fn run_gamepad_thread(proxy: winit::event_loop::EventLoopProxy<app::AppEvent>) {
                 _ => {}
             }
         }
+    }
+}
+
+/// Install signal handlers for SIGSEGV and other crash signals
+fn install_signal_handlers() {
+    extern "C" fn crash_handler(sig: libc::c_int) {
+        // Use write() directly since we can't use allocation in signal handler
+        let msg: &[u8] = match sig {
+            libc::SIGSEGV => b"\n\x1b[31m=== PALACE SEGFAULT (SIGSEGV) ===\x1b[0m\n\nMemory access violation - likely GPU driver issue or invalid memory access.\nSet RUST_BACKTRACE=full and run again for more details.\n\n",
+            libc::SIGBUS => b"\n\x1b[31m=== PALACE BUS ERROR (SIGBUS) ===\x1b[0m\n\nBus error - memory alignment or I/O issue.\nSet RUST_BACKTRACE=full and run again for more details.\n\n",
+            libc::SIGFPE => b"\n\x1b[31m=== PALACE FLOATING POINT EXCEPTION ===\x1b[0m\n\nArithmetic error (division by zero, etc).\n\n",
+            libc::SIGILL => b"\n\x1b[31m=== PALACE ILLEGAL INSTRUCTION ===\x1b[0m\n\nIllegal CPU instruction - possibly corrupted code.\n\n",
+            libc::SIGABRT => b"\n\x1b[31m=== PALACE ABORTED (SIGABRT) ===\x1b[0m\n\nProcess aborted - assertion failure or abort() called.\n\n",
+            _ => b"\n\x1b[31m=== PALACE CRASHED ===\x1b[0m\n\nUnexpected signal received.\n\n",
+        };
+
+        // Write directly to stderr (fd 2)
+        unsafe {
+            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        }
+
+        // Re-raise the signal with default handler to get core dump if enabled
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+
+    // Install handlers for crash signals
+    unsafe {
+        libc::signal(libc::SIGSEGV, crash_handler as libc::sighandler_t);
+        libc::signal(libc::SIGBUS, crash_handler as libc::sighandler_t);
+        libc::signal(libc::SIGFPE, crash_handler as libc::sighandler_t);
+        libc::signal(libc::SIGILL, crash_handler as libc::sighandler_t);
+        libc::signal(libc::SIGABRT, crash_handler as libc::sighandler_t);
     }
 }
