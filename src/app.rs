@@ -1,14 +1,18 @@
 use crate::debug::{DebugCommand, DebugResponse, ScreenshotCapture};
 use crate::display::DisplayScaling;
+use crate::persistence::PalaceDB;
 use crate::projects::ProjectsConfig;
 use crate::renderer::Renderer;
 use crate::state::{AppState, ExecutionStatus, SuggestionCard, TaskStatus, UiScaleOption};
+
+/// User preference keys
+const PREF_UI_SCALE: &str = "ui_scale";
 use gilrs::Button;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseScrollDelta, Touch, TouchPhase, WindowEvent};
+use winit::event::{ElementState, KeyEvent, Modifiers, MouseScrollDelta, Touch, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
@@ -125,6 +129,14 @@ pub struct App {
     touch_hold: Option<(std::time::Instant, f32, f32, Option<usize>)>,
     /// Whether touch hold has triggered (to prevent tap on release)
     touch_hold_triggered: bool,
+    /// Current keyboard modifiers (for Alt+F, Ctrl+, etc.)
+    modifiers: Modifiers,
+    /// Whether window is currently fullscreen
+    is_fullscreen: bool,
+    /// Whether window is currently focused (for focus-gated inputs)
+    window_focused: bool,
+    /// Database for persistent storage (preferences, tasks, etc.)
+    db: Option<PalaceDB>,
 }
 
 impl App {
@@ -151,6 +163,30 @@ impl App {
             hover_changed: false,
             touch_hold: None,
             touch_hold_triggered: false,
+            modifiers: Modifiers::default(),
+            is_fullscreen: true, // Palace starts fullscreen
+            window_focused: true, // Assume focused on start
+            db: PalaceDB::open().ok(), // Open database (or None if failed)
+        }
+    }
+
+    /// Load saved preferences from database
+    fn load_preferences(&mut self) {
+        if let Some(ref db) = self.db {
+            // Load UI scale preference
+            if let Ok(Some(scale)) = db.get_pref::<Option<f32>>(PREF_UI_SCALE) {
+                self.user_scale_override = scale;
+                tracing::info!("Loaded UI scale preference: {:?}", scale);
+            }
+        }
+    }
+
+    /// Save UI scale preference to database
+    fn save_scale_preference(&self) {
+        if let Some(ref db) = self.db {
+            if let Err(e) = db.set_pref(PREF_UI_SCALE, &self.user_scale_override) {
+                tracing::warn!("Failed to save UI scale preference: {}", e);
+            }
         }
     }
 
@@ -197,6 +233,21 @@ impl App {
         let base_gap = 16.0;
         let gap = base_gap * ui_scale;
         self.palace_loop_card_height() + gap
+    }
+
+    /// Toggle between fullscreen and windowed mode (Alt+F)
+    fn toggle_fullscreen(&mut self) {
+        if let Some(window) = &self.window {
+            if self.is_fullscreen {
+                window.set_fullscreen(None);
+                tracing::info!("Switched to windowed mode");
+            } else {
+                window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                tracing::info!("Switched to fullscreen mode");
+            }
+            self.is_fullscreen = !self.is_fullscreen;
+            self.request_redraw();
+        }
     }
 
     /// Open the main menu (Start menu)
@@ -818,8 +869,11 @@ impl App {
                         if let Some(renderer) = &mut self.renderer {
                             renderer.set_ui_scale(actual_scale, is_auto);
                         }
-                        // Go back to settings menu
-                        self.state = *previous_state.clone();
+                        // Clone state to exit borrow before saving
+                        let new_state = *previous_state.clone();
+                        self.state = new_state;
+                        // Persist the preference (after mutable borrow ends)
+                        self.save_scale_preference();
                     }
                     KeyCode::Backspace | KeyCode::Escape => {
                         // Go back to settings menu
@@ -985,9 +1039,23 @@ impl App {
                             self.state = AppState::project_view(project_path.clone());
                         }
                     }
+                    // ZXCV quick-select: toggle first 4 cards (1-4 keys on keyboard)
+                    KeyCode::KeyZ => {
+                        // Quick-select card 1 (index 0)
+                        if let Some(card) = cards.get_mut(0) {
+                            card.selected = !card.selected;
+                            tracing::debug!("Quick-select Z: card 0 = {}", card.selected);
+                        }
+                    }
                     KeyCode::KeyX => {
-                        // Show execute options modal (only when done generating and has selections)
-                        if !*generating {
+                        if *generating {
+                            // Quick-select card 2 (index 1) while generating
+                            if let Some(card) = cards.get_mut(1) {
+                                card.selected = !card.selected;
+                                tracing::debug!("Quick-select X: card 1 = {}", card.selected);
+                            }
+                        } else {
+                            // Show execute options modal (only when done generating and has selections)
                             let has_selected = cards.iter().any(|c| c.selected);
                             if has_selected {
                                 self.state = AppState::ExecuteModal {
@@ -995,6 +1063,20 @@ impl App {
                                     previous_state: Box::new(self.state.clone()),
                                 };
                             }
+                        }
+                    }
+                    KeyCode::KeyC => {
+                        // Quick-select card 3 (index 2)
+                        if let Some(card) = cards.get_mut(2) {
+                            card.selected = !card.selected;
+                            tracing::debug!("Quick-select C: card 2 = {}", card.selected);
+                        }
+                    }
+                    KeyCode::KeyV => {
+                        // Quick-select card 4 (index 3)
+                        if let Some(card) = cards.get_mut(3) {
+                            card.selected = !card.selected;
+                            tracing::debug!("Quick-select V: card 3 = {}", card.selected);
                         }
                     }
                     _ => {}
@@ -1262,21 +1344,29 @@ impl App {
                 let columns = 5; // Same as PalaceLoop grid
 
                 match key {
+                    KeyCode::Enter | KeyCode::Space => {
+                        // When execution is done, Enter/Space returns to quest log
+                        if status.is_done() && !*quest_log_visible {
+                            self.state = *previous_state.clone();
+                        }
+                    }
                     KeyCode::Escape | KeyCode::Backspace => {
                         if *quest_log_visible {
                             // If quest log is visible, go back to executor view
                             *quest_log_visible = false;
                         } else if status.is_done() {
-                            // Cancel execution if running, or go back if done
+                            // Go back when done
                             self.state = *previous_state.clone();
                         } else {
-                            // Mark as cancelled
+                            // Mark as cancelled while running
                             *status = crate::state::ExecutionStatus::Cancelled;
                         }
                     }
                     KeyCode::Tab => {
-                        // Toggle quest log view
-                        *quest_log_visible = !*quest_log_visible;
+                        // Toggle quest log view (focus-gated to prevent accidental triggers)
+                        if self.window_focused {
+                            *quest_log_visible = !*quest_log_visible;
+                        }
                     }
                     KeyCode::ArrowUp | KeyCode::KeyW => {
                         if *quest_log_visible {
@@ -1929,6 +2019,9 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         }
 
+        // Load saved preferences (including UI scale)
+        self.load_preferences();
+
         tracing::info!("Creating fullscreen window...");
 
         // Find the target monitor (from config or default to primary)
@@ -2006,6 +2099,12 @@ impl ApplicationHandler<AppEvent> for App {
                     },
                 ..
             } => {
+                // Alt+F toggles fullscreen (works in any state)
+                if key == KeyCode::KeyF && self.modifiers.state().alt_key() {
+                    self.toggle_fullscreen();
+                    return;
+                }
+
                 // Escape opens the main menu (instead of exiting)
                 if key == KeyCode::Escape {
                     self.open_main_menu();
@@ -2051,6 +2150,15 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 self.handle_mouse_wheel(delta);
                 self.request_redraw();
+            }
+
+            WindowEvent::ModifiersChanged(new_modifiers) => {
+                self.modifiers = new_modifiers;
+            }
+
+            WindowEvent::Focused(focused) => {
+                self.window_focused = focused;
+                tracing::debug!("Window focus changed: {}", focused);
             }
 
             WindowEvent::RedrawRequested => {
@@ -2549,6 +2657,12 @@ impl App {
         // Create permission requester that sends events to the GUI
         let permission_proxy = proxy.clone();
         let permission_requester: crate::ai::PermissionRequester = Box::new(move |command: &str| {
+            // Skip empty commands - auto-approve (nothing to show user)
+            if command.trim().is_empty() {
+                tracing::debug!("Auto-approving empty permission request");
+                return PermissionResponse::Approved;
+            }
+
             // Create oneshot channel for response
             let (tx, rx) = tokio::sync::oneshot::channel::<PermissionResponse>();
 
