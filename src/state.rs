@@ -314,10 +314,14 @@ pub enum AppState {
     Executing {
         /// Project path
         project_path: PathBuf,
-        /// Cards being executed
+        /// Cards being executed (selected subset)
         executing_cards: Vec<SuggestionCard>,
+        /// All cards from the deck (for quest log view)
+        all_cards: Vec<SuggestionCard>,
         /// Current execution status
         status: ExecutionStatus,
+        /// Per-task status (synced from Claude's task_update tool)
+        task_statuses: Vec<TaskStatus>,
         /// Left column: tool calls with timestamps (format: "[HH:MM:SS] icon action")
         tool_log: Vec<String>,
         /// Right column: Claude's commentary/thoughts with timestamps
@@ -328,6 +332,10 @@ pub enum AppState {
         executor: ExecuteOption,
         /// Previous state to return to (PalaceLoop)
         previous_state: Box<AppState>,
+        /// Quest log view visible (Select toggles)
+        quest_log_visible: bool,
+        /// Focused card index in quest log view
+        quest_log_focus: usize,
     },
     /// Survey/Question UI - for Claude's AskUserQuestion tool
     Survey {
@@ -414,6 +422,50 @@ impl ExecutionStatus {
 
     pub fn is_done(&self) -> bool {
         matches!(self, ExecutionStatus::Completed | ExecutionStatus::Failed(_) | ExecutionStatus::Cancelled)
+    }
+}
+
+/// Per-task execution status (for quest log badges)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskStatus {
+    /// Task not yet started
+    #[default]
+    Pending,
+    /// Task is currently being executed
+    InProgress,
+    /// Task completed successfully (by AI)
+    Completed,
+    /// Task verified by user
+    Verified,
+    /// Task blocked - needs attention
+    Blocked,
+    /// Task needs user review
+    NeedsReview,
+}
+
+impl TaskStatus {
+    /// Badge text for display
+    pub fn badge_text(&self) -> &'static str {
+        match self {
+            TaskStatus::Pending => "PENDING",
+            TaskStatus::InProgress => "IN PROGRESS",
+            TaskStatus::Completed => "DONE",
+            TaskStatus::Verified => "VERIFIED",
+            TaskStatus::Blocked => "BLOCKED",
+            TaskStatus::NeedsReview => "REVIEW",
+        }
+    }
+
+    /// Badge color [R, G, B, A]
+    pub fn badge_color(&self) -> [f32; 4] {
+        match self {
+            TaskStatus::Pending => [0.5, 0.5, 0.5, 0.7],       // Gray
+            TaskStatus::InProgress => [0.4, 0.7, 1.0, 0.9],    // Blue
+            TaskStatus::Completed => [0.2, 1.0, 0.4, 0.9],     // Green
+            TaskStatus::Verified => [0.7, 0.4, 1.0, 0.9],      // Purple
+            TaskStatus::Blocked => [1.0, 0.4, 0.3, 0.9],       // Red
+            TaskStatus::NeedsReview => [1.0, 0.7, 0.2, 0.9],   // Orange/Yellow
+        }
     }
 }
 
@@ -601,7 +653,7 @@ mod tests {
         assert!(ProjectAction::StartPalaceLoop.description().contains("AI-assisted"));
         assert!(ProjectAction::Build.description().to_lowercase().contains("compile"));
         assert!(ProjectAction::Run.description().to_lowercase().contains("execute"));
-        assert!(ProjectAction::ViewGitHistory.description().to_lowercase().contains("git"));
+        assert!(ProjectAction::ViewGitHistory.description().to_lowercase().contains("commit"));
     }
 
     // ============== SuggestionCard Tests ==============

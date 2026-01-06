@@ -139,5 +139,28 @@
       },
       "required": ["question", "header", "options"]
     }
+  },
+  {
+    "name": "task_update",
+    "description": "Report progress on a task. Call this when you complete a task, encounter a blocker, or need to flag something for review. The UI will update the task status accordingly.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "task_index": {
+          "type": "integer",
+          "description": "Index of the task (0-based, from the current execution batch)"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["completed", "blocked", "needs_review"],
+          "description": "New status: completed (done successfully), blocked (hit a blocker), needs_review (needs human verification)"
+        },
+        "message": {
+          "type": "string",
+          "description": "Optional message explaining the status update"
+        }
+      },
+      "required": ["task_index", "status"]
+    }
   }
 ]

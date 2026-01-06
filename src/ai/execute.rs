@@ -498,7 +498,42 @@ fn execute_tool(ctx: &ToolContext, tool_name: &str, tool_input: &str) -> String 
         "ask_user" => {
             execute_ask_user(ctx, &input)
         }
+        "task_update" => {
+            execute_task_update(ctx, &input)
+        }
         _ => format!("Unknown tool: {}", tool_name),
+    }
+}
+
+/// Execute task_update tool - report task status to UI
+fn execute_task_update(ctx: &ToolContext, input: &serde_json::Value) -> String {
+    use crate::state::TaskStatus;
+
+    let task_index = input["task_index"].as_u64().unwrap_or(0) as usize;
+    let status_str = input["status"].as_str().unwrap_or("completed");
+    let message = input["message"].as_str().map(|s| s.to_string());
+
+    let status = match status_str {
+        "completed" => TaskStatus::Completed,
+        "blocked" => TaskStatus::Blocked,
+        "needs_review" => TaskStatus::NeedsReview,
+        _ => TaskStatus::Completed,
+    };
+
+    // Send status update to UI
+    let _ = ctx.event_proxy.send_event(crate::app::AppEvent::TaskStatusUpdate {
+        task_index,
+        status,
+        message: message.clone(),
+    });
+
+    match status {
+        TaskStatus::Completed => format!("Task {} marked as completed", task_index + 1),
+        TaskStatus::Blocked => format!("Task {} marked as blocked{}", task_index + 1,
+            message.map(|m| format!(": {}", m)).unwrap_or_default()),
+        TaskStatus::NeedsReview => format!("Task {} flagged for review{}", task_index + 1,
+            message.map(|m| format!(": {}", m)).unwrap_or_default()),
+        _ => format!("Task {} status updated", task_index + 1),
     }
 }
 

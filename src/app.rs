@@ -2,7 +2,7 @@ use crate::debug::{DebugCommand, DebugResponse, ScreenshotCapture};
 use crate::display::DisplayScaling;
 use crate::projects::ProjectsConfig;
 use crate::renderer::Renderer;
-use crate::state::{AppState, ExecuteOption, ExecutionStatus, MainMenuItem, SettingsItem, SuggestionCard, UiScaleOption};
+use crate::state::{AppState, ExecuteOption, ExecutionStatus, MainMenuItem, SettingsItem, SuggestionCard, TaskStatus, UiScaleOption};
 use gilrs::Button;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -74,6 +74,12 @@ pub enum AppEvent {
         command: String,
         /// Channel to send response back
         response_tx: tokio::sync::oneshot::Sender<PermissionResponse>,
+    },
+    /// Task status update from AI (task_update tool)
+    TaskStatusUpdate {
+        task_index: usize,
+        status: TaskStatus,
+        message: Option<String>,
     },
 }
 
@@ -251,6 +257,10 @@ impl App {
                 if !self.r3_held {
                     self.release_gamepad_focus();
                 }
+            }
+            Button::Select => {
+                // Select button = toggle quest log in Executing state
+                self.handle_input(KeyCode::Tab);
             }
             _ => {
                 tracing::debug!("Unmapped button: {:?}", button);
@@ -968,18 +978,28 @@ impl App {
                             );
 
                             // Transition to Executing state
+                            // Initialize task statuses: first one is InProgress, rest Pending
+                            let mut task_statuses = vec![TaskStatus::Pending; card_count];
+                            if !task_statuses.is_empty() {
+                                task_statuses[0] = TaskStatus::InProgress;
+                            }
+
                             self.state = AppState::Executing {
                                 project_path: project_path.clone(),
                                 executing_cards: selected_cards.clone(),
+                                all_cards: cards.clone(),
                                 status: ExecutionStatus::Running {
                                     current_card: 0,
                                     total_cards: card_count,
                                 },
+                                task_statuses,
                                 tool_log: Vec::new(),
                                 thought_log: Vec::new(),
                                 log_scroll_offset: 0.0,
                                 executor: option,
                                 previous_state: previous_state.clone(),
+                                quest_log_visible: false,
+                                quest_log_focus: 0,
                             };
 
                             // Spawn the executor in a background thread
@@ -1165,22 +1185,78 @@ impl App {
                     _ => {}
                 }
             }
-            AppState::Executing { status, previous_state, log_scroll_offset, .. } => {
+            AppState::Executing { status, previous_state, log_scroll_offset, quest_log_visible, quest_log_focus, all_cards, .. } => {
+                let card_count = all_cards.len();
+                let columns = 5; // Same as PalaceLoop grid
+
                 match key {
                     KeyCode::Escape | KeyCode::Backspace => {
-                        // Cancel execution if running, or go back if done
-                        if status.is_done() {
+                        if *quest_log_visible {
+                            // If quest log is visible, go back to executor view
+                            *quest_log_visible = false;
+                        } else if status.is_done() {
+                            // Cancel execution if running, or go back if done
                             self.state = *previous_state.clone();
                         } else {
                             // Mark as cancelled
                             *status = crate::state::ExecutionStatus::Cancelled;
                         }
                     }
+                    KeyCode::Tab => {
+                        // Toggle quest log view
+                        *quest_log_visible = !*quest_log_visible;
+                    }
                     KeyCode::ArrowUp | KeyCode::KeyW => {
-                        *log_scroll_offset = (*log_scroll_offset - 40.0).max(0.0);
+                        if *quest_log_visible {
+                            // Grid navigation: move up one row
+                            if *quest_log_focus >= columns {
+                                *quest_log_focus -= columns;
+                            } else if card_count > 0 {
+                                // Wrap to last row
+                                let last_row_start = (card_count.saturating_sub(1) / columns) * columns;
+                                let target = last_row_start + (*quest_log_focus % columns);
+                                *quest_log_focus = target.min(card_count - 1);
+                            }
+                        } else {
+                            *log_scroll_offset = (*log_scroll_offset - 40.0).max(0.0);
+                        }
                     }
                     KeyCode::ArrowDown | KeyCode::KeyS => {
-                        *log_scroll_offset += 40.0;
+                        if *quest_log_visible {
+                            // Grid navigation: move down one row
+                            let next = *quest_log_focus + columns;
+                            if next < card_count {
+                                *quest_log_focus = next;
+                            } else if card_count > 0 {
+                                // Wrap to first row
+                                *quest_log_focus = *quest_log_focus % columns;
+                                if *quest_log_focus >= card_count {
+                                    *quest_log_focus = 0;
+                                }
+                            }
+                        } else {
+                            *log_scroll_offset += 40.0;
+                        }
+                    }
+                    KeyCode::ArrowLeft | KeyCode::KeyA => {
+                        if *quest_log_visible {
+                            // Grid navigation left
+                            if *quest_log_focus > 0 {
+                                *quest_log_focus -= 1;
+                            } else if card_count > 0 {
+                                *quest_log_focus = card_count - 1;
+                            }
+                        }
+                    }
+                    KeyCode::ArrowRight | KeyCode::KeyD => {
+                        if *quest_log_visible {
+                            // Grid navigation right
+                            if card_count > 0 && *quest_log_focus < card_count - 1 {
+                                *quest_log_focus += 1;
+                            } else {
+                                *quest_log_focus = 0;
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -1684,8 +1760,7 @@ impl App {
                 }
             }
             AppState::Executing { .. } => {
-                // Tap anywhere to go back when done, or show cancel confirmation
-                self.handle_input(KeyCode::Escape);
+                // No touchscreen actions during execution
             }
         }
     }
@@ -2093,29 +2168,64 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::ExecutionProgress { current, total } => {
-                // Update execution progress
-                if let AppState::Executing { status, .. } = &mut self.state {
+                // Update execution progress and task statuses
+                if let AppState::Executing { status, task_statuses, .. } = &mut self.state {
                     *status = ExecutionStatus::Running {
                         current_card: current,
                         total_cards: total,
                     };
+                    // Mark previous task as Completed (if not already set by AI)
+                    if current > 0 && current - 1 < task_statuses.len() {
+                        if task_statuses[current - 1] == TaskStatus::InProgress {
+                            task_statuses[current - 1] = TaskStatus::Completed;
+                        }
+                    }
+                    // Mark current task as InProgress (if still Pending)
+                    if current < task_statuses.len() && task_statuses[current] == TaskStatus::Pending {
+                        task_statuses[current] = TaskStatus::InProgress;
+                    }
                     self.request_redraw();
                 }
             }
             AppEvent::ExecutionComplete => {
                 // Mark execution as complete
-                if let AppState::Executing { status, tool_log, .. } = &mut self.state {
+                if let AppState::Executing { status, task_statuses, tool_log, .. } = &mut self.state {
                     *status = ExecutionStatus::Completed;
+                    // Mark all InProgress tasks as Completed
+                    for ts in task_statuses.iter_mut() {
+                        if *ts == TaskStatus::InProgress {
+                            *ts = TaskStatus::Completed;
+                        }
+                    }
                     tool_log.insert(0, "✅ All tasks completed".to_string());
                     self.request_redraw();
                 }
             }
             AppEvent::ExecutionError(error) => {
                 // Mark execution as failed
-                if let AppState::Executing { status, tool_log, .. } = &mut self.state {
+                if let AppState::Executing { status, task_statuses, tool_log, .. } = &mut self.state {
                     *status = ExecutionStatus::Failed(error.clone());
+                    // Mark current InProgress task as Blocked
+                    for ts in task_statuses.iter_mut() {
+                        if *ts == TaskStatus::InProgress {
+                            *ts = TaskStatus::Blocked;
+                            break;
+                        }
+                    }
                     tool_log.insert(0, format!("❌ Failed: {}", error));
                     self.request_redraw();
+                }
+            }
+            AppEvent::TaskStatusUpdate { task_index, status, message } => {
+                // Update individual task status from AI
+                if let AppState::Executing { task_statuses, tool_log, .. } = &mut self.state {
+                    if task_index < task_statuses.len() {
+                        task_statuses[task_index] = status;
+                        if let Some(msg) = message {
+                            tool_log.insert(0, format!("📋 Task {}: {} - {}", task_index + 1, status.badge_text(), msg));
+                        }
+                        self.request_redraw();
+                    }
                 }
             }
             AppEvent::SurveyRequest { question, header, options, multi_select, response_tx } => {

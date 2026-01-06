@@ -2,7 +2,7 @@ use crate::projects::ProjectsConfig;
 use crate::renderer::cards::{CardInstance, CardRenderer};
 use crate::renderer::sprites::{SpriteInstance, SpriteRenderer, XboxButton};
 use crate::renderer::text::{PreparedText, TextQueue, TextRequest};
-use crate::state::{AppState, SuggestionCard};
+use crate::state::{AppState, ExecutionStatus, SuggestionCard, TaskStatus};
 use anyhow::{Context, Result};
 use glyphon::{
     Cache, FontSystem, Resolution, SwashCache, TextAtlas, TextRenderer, Viewport,
@@ -547,8 +547,9 @@ impl Renderer {
         let visible_height = grid.card_height - text_margin * 2.0;
 
         // Build same text as render: description + command
-        let description = if card.description.is_empty() {
-            if card.streaming { "Loading..." } else { "No description" }
+        // Fall back to title if description is empty or whitespace-only
+        let description = if card.description.trim().is_empty() {
+            if card.streaming { "Loading..." } else { &card.title }
         } else {
             &card.description
         };
@@ -559,7 +560,8 @@ impl Renderer {
                 description.to_string()
             } else {
                 let display_cmd = if cmd.len() > 40 {
-                    format!("$ {}...", &cmd[..37])
+                    let truncated: String = cmd.chars().take(37).collect();
+                    format!("$ {}...", truncated)
                 } else {
                     format!("$ {}", cmd)
                 };
@@ -873,7 +875,12 @@ impl Renderer {
                 self.build_action_cards(*selected_action)
             }
             AppState::PalaceLoop { cards, focused_index, hovered_index, .. } => {
-                self.build_suggestion_cards(cards, *focused_index, *hovered_index)
+                self.build_suggestion_cards(cards, *focused_index, *hovered_index, None)
+            }
+            AppState::Executing { quest_log_visible: true, all_cards, quest_log_focus, executing_cards, task_statuses, .. } => {
+                // Show all cards when quest log is visible, with status badges
+                let exec_ids: Vec<usize> = executing_cards.iter().map(|c| c.id).collect();
+                self.build_suggestion_cards(all_cards, *quest_log_focus, None, Some((&exec_ids, task_statuses)))
             }
             AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } | AppState::PermissionModal { .. } | AppState::ExecuteModal { .. } | AppState::Survey { .. } | AppState::Executing { .. } => Vec::new(),
         };
@@ -917,9 +924,17 @@ impl Renderer {
                     self.queue_project_view_text(project_path, *selected_action);
                 }
                 AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, hovered_index, detail_scroll_offset, .. } => {
-                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *hovered_index, *detail_scroll_offset);
+                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *hovered_index, *detail_scroll_offset, None);
                 }
-                AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } | AppState::PermissionModal { .. } | AppState::ExecuteModal { .. } | AppState::Survey { .. } | AppState::Executing { .. } => {}
+                AppState::Executing { tool_log, thought_log, log_scroll_offset, status, executor, quest_log_visible, all_cards, quest_log_focus, executing_cards, task_statuses, .. } => {
+                    if *quest_log_visible {
+                        let exec_ids: Vec<usize> = executing_cards.iter().map(|c| c.id).collect();
+                        self.queue_palace_loop_text(all_cards, None, &[], &[], 0, *quest_log_focus, None, 0.0, Some((&exec_ids, task_statuses)));
+                    } else {
+                        self.queue_executing_text(tool_log, thought_log, *log_scroll_offset, status, *executor);
+                    }
+                }
+                AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } | AppState::PermissionModal { .. } | AppState::ExecuteModal { .. } | AppState::Survey { .. } => {}
             }
 
             // Prepare base text for Pass 1
@@ -1131,7 +1146,15 @@ impl Renderer {
                     self.queue_project_view_text(project_path, *selected_action);
                 }
                 AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, hovered_index, detail_scroll_offset, .. } => {
-                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *hovered_index, *detail_scroll_offset);
+                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *hovered_index, *detail_scroll_offset, None);
+                }
+                AppState::Executing { tool_log, thought_log, log_scroll_offset, status, executor, quest_log_visible, all_cards, quest_log_focus, executing_cards, task_statuses, .. } => {
+                    if *quest_log_visible {
+                        let exec_ids: Vec<usize> = executing_cards.iter().map(|c| c.id).collect();
+                        self.queue_palace_loop_text(all_cards, None, &[], &[], 0, *quest_log_focus, None, 0.0, Some((&exec_ids, task_statuses)));
+                    } else {
+                        self.queue_executing_text(tool_log, thought_log, *log_scroll_offset, status, *executor);
+                    }
                 }
                 AppState::MainMenu { .. } => {}
                 AppState::SettingsMenu { .. } => {}
@@ -1139,7 +1162,6 @@ impl Renderer {
                 AppState::PermissionModal { .. } => {}
                 AppState::ExecuteModal { .. } => {}
                 AppState::Survey { .. } => {}
-                AppState::Executing { .. } => {}
             }
 
             // Prepare text
@@ -1245,10 +1267,17 @@ impl Renderer {
                     self.queue_project_view_text(project_path, *selected_action);
                 }
                 AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, hovered_index, detail_scroll_offset, .. } => {
-                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *hovered_index, *detail_scroll_offset);
+                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *hovered_index, *detail_scroll_offset, None);
                 }
-                AppState::Executing { tool_log, thought_log, log_scroll_offset, status, executor, .. } => {
-                    self.queue_executing_text(tool_log, thought_log, *log_scroll_offset, status, *executor);
+                AppState::Executing { tool_log, thought_log, log_scroll_offset, status, executor, quest_log_visible, all_cards, quest_log_focus, executing_cards, task_statuses, .. } => {
+                    if *quest_log_visible {
+                        // Show card deck view with execution status
+                        let exec_ids: Vec<usize> = executing_cards.iter().map(|c| c.id).collect();
+                        self.queue_palace_loop_text(all_cards, None, &[], &[], 0, *quest_log_focus, None, 0.0, Some((&exec_ids, task_statuses)));
+                    } else {
+                        // Show executor log view
+                        self.queue_executing_text(tool_log, thought_log, *log_scroll_offset, status, *executor);
+                    }
                 }
                 AppState::MainMenu { .. } => {}
                 AppState::SettingsMenu { .. } => {}
@@ -1401,17 +1430,21 @@ impl Renderer {
             .collect()
     }
 
-    fn build_suggestion_cards(&self, cards: &[SuggestionCard], focused: usize, hovered: Option<usize>) -> Vec<CardInstance> {
+    /// Build suggestion cards with optional status badges for quest log
+    /// exec_status: (executing_card_ids, task_statuses) for badge rendering
+    fn build_suggestion_cards(&self, cards: &[SuggestionCard], focused: usize, hovered: Option<usize>, exec_status: Option<(&[usize], &[TaskStatus])>) -> Vec<CardInstance> {
         let grid = CardGrid::for_palace_loop(
             self.size.width as f32,
             self.size.height as f32,
             &self.ui_scale,
         );
 
+        let text_margin = self.ui_scale.px(12.0);
+
         cards
             .iter()
             .enumerate()
-            .map(|(i, card)| {
+            .flat_map(|(i, card)| {
                 let (x, y) = grid.card_position(i);
                 // Card is "flipped" when focused via keyboard/gamepad OR hovered via mouse
                 let is_flipped = i == focused || hovered == Some(i);
@@ -1433,7 +1466,35 @@ impl Renderer {
                     instance = instance.with_border_color([0.2, 1.0, 0.4, 0.95]);
                 }
 
-                instance
+                let mut result = vec![instance];
+
+                // Add status badge card for quest log mode
+                if let Some((exec_ids, task_statuses)) = exec_status {
+                    if let Some(exec_pos) = exec_ids.iter().position(|&id| id == card.id) {
+                        // Get status from task_statuses array
+                        let status = task_statuses.get(exec_pos).copied().unwrap_or(TaskStatus::Pending);
+                        let badge_color = status.badge_color();
+                        let badge_text = status.badge_text();
+
+                        // Badge dimensions - positioned bottom-right
+                        let badge_height = self.ui_scale.px(14.0);
+                        // Width depends on text length
+                        let badge_width = self.ui_scale.px(match badge_text.len() {
+                            0..=4 => 40.0,
+                            5..=7 => 55.0,
+                            _ => 70.0,
+                        });
+                        let badge_x = x + grid.card_width - text_margin - badge_width;
+                        let badge_y = y + grid.card_height - text_margin - badge_height;
+
+                        let badge = CardInstance::new(badge_x, badge_y, badge_width, badge_height, badge_color)
+                            .with_border_width(self.ui_scale.px(1.0))
+                            .with_corner_radius(self.ui_scale.px(3.0));
+                        result.push(badge);
+                    }
+                }
+
+                result
             })
             .collect()
     }
@@ -2652,7 +2713,8 @@ impl Renderer {
         self.queue_help_legend(&help_state);
     }
 
-    fn queue_palace_loop_text(&mut self, cards: &[SuggestionCard], current_tool: Option<&str>, tool_log: &[String], thought_log: &[String], log_scroll: usize, focused_index: usize, hovered_index: Option<usize>, detail_scroll: f32) {
+    /// exec_status: Optional (executing_card_ids, task_statuses) for quest log status indicators
+    fn queue_palace_loop_text(&mut self, cards: &[SuggestionCard], current_tool: Option<&str>, tool_log: &[String], thought_log: &[String], log_scroll: usize, focused_index: usize, hovered_index: Option<usize>, detail_scroll: f32, exec_status: Option<(&[usize], &[TaskStatus])>) {
         let title_scale = self.ui_scale.px(42.0);
         let left_margin = self.ui_scale.px(60.0);
         let top_margin = self.ui_scale.px(40.0);
@@ -2763,8 +2825,9 @@ impl Renderer {
                 let scroll_offset = if i == focused_index { detail_scroll } else { 0.0 };
 
                 // Build combined content: description + command
-                let description = if card.description.is_empty() {
-                    if card.streaming { "Loading..." } else { "No description" }
+                // Fall back to title if description is empty or whitespace-only
+                let description = if card.description.trim().is_empty() {
+                    if card.streaming { "Loading..." } else { &card.title }
                 } else {
                     &card.description
                 };
@@ -2775,7 +2838,8 @@ impl Renderer {
                         description.to_string()
                     } else {
                         let display_cmd = if cmd.len() > 40 {
-                            format!("$ {}...", &cmd[..37])
+                            let truncated: String = cmd.chars().take(37).collect();
+                            format!("$ {}...", truncated)
                         } else {
                             format!("$ {}", cmd)
                         };
@@ -2833,15 +2897,38 @@ impl Renderer {
                 }
             }
 
-            // Selected indicator (checkmark) - always visible
-            if card.selected {
-                self.text_queue.push(
-                    "✓",
-                    x + grid.card_width - text_margin - self.ui_scale.px(16.0),
-                    y + grid.card_height - text_margin - self.ui_scale.px(14.0),
-                    self.ui_scale.px(18.0),
-                    [0.2, 1.0, 0.4, 1.0],
-                );
+            // Status badge text in bottom-right corner (quest log mode only)
+            // Badge rect is rendered by build_suggestion_cards, this adds the text
+            if let Some((exec_ids, task_statuses)) = exec_status {
+                if let Some(exec_pos) = exec_ids.iter().position(|&id| id == card.id) {
+                    // Get status from task_statuses array
+                    let status = task_statuses.get(exec_pos).copied().unwrap_or(TaskStatus::Pending);
+                    let status_text = status.badge_text();
+
+                    // Position text centered in badge (badge is rendered by card builder)
+                    let badge_height = self.ui_scale.px(14.0);
+                    let badge_width = self.ui_scale.px(match status_text.len() {
+                        0..=4 => 40.0,
+                        5..=7 => 55.0,
+                        _ => 70.0,
+                    });
+                    let badge_x = x + grid.card_width - text_margin - badge_width;
+                    let badge_y = y + grid.card_height - text_margin - badge_height;
+
+                    // Center text in badge
+                    let text_size = self.ui_scale.px(8.0);
+                    let text_width = status_text.len() as f32 * self.ui_scale.px(4.5);
+                    let text_x = badge_x + (badge_width - text_width) / 2.0;
+                    let text_y = badge_y + (badge_height - text_size) / 2.0 - self.ui_scale.px(1.0);
+
+                    // White text on colored badge
+                    self.text_queue.push(status_text, text_x, text_y, text_size, [1.0, 1.0, 1.0, 1.0]);
+                }
+            } else if card.selected {
+                // Normal PalaceLoop mode: show selection checkmark
+                let indicator_x = x + grid.card_width - text_margin - self.ui_scale.px(16.0);
+                let indicator_y = y + grid.card_height - text_margin - self.ui_scale.px(14.0);
+                self.text_queue.push("✓", indicator_x, indicator_y, self.ui_scale.px(18.0), [0.2, 1.0, 0.4, 1.0]);
             }
         }
 
@@ -3137,12 +3224,16 @@ impl Renderer {
         let help_state = AppState::Executing {
             project_path: std::path::PathBuf::new(),
             executing_cards: Vec::new(),
+            all_cards: Vec::new(),
             status: status.clone(),
+            task_statuses: Vec::new(),
             tool_log: Vec::new(),
             thought_log: Vec::new(),
             log_scroll_offset: 0.0,
             executor: _executor,
             previous_state: Box::new(AppState::ProjectChooser { selected_index: 0 }),
+            quest_log_visible: false,
+            quest_log_focus: 0,
         };
         self.queue_help_legend(&help_state);
     }
@@ -3199,8 +3290,13 @@ impl Renderer {
                     ]
                 }
             },
-            AppState::Executing { status, .. } => {
-                if status.is_done() {
+            AppState::Executing { status, quest_log_visible, .. } => {
+                if *quest_log_visible {
+                    vec![
+                        (XboxButton::LeftStick, "Navigate"),
+                        (XboxButton::B, "Back"),
+                    ]
+                } else if status.is_done() {
                     vec![
                         (XboxButton::B, "Back"),
                     ]
