@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, Touch, TouchPhase, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseScrollDelta, Touch, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
@@ -160,6 +160,43 @@ impl App {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    /// Calculate dynamic column count for PalaceLoop grid
+    /// Reference: 5 cards at 1920px with 1.5 scale (237px base card width)
+    fn palace_loop_columns(&self) -> usize {
+        let ui_scale = self.renderer.as_ref().map(|r| r.ui_scale()).unwrap_or(1.5);
+        let screen_width = self.window.as_ref()
+            .map(|w| w.inner_size().width as f32)
+            .unwrap_or(1920.0);
+
+        let base_card_width = 237.0;
+        let base_gap = 16.0;
+        let base_margin = 40.0;
+
+        let card_width = base_card_width * ui_scale;
+        let gap = base_gap * ui_scale;
+        let margin_x = base_margin * ui_scale;
+
+        let available_width = screen_width - margin_x * 2.0;
+        let columns = ((available_width + gap) / (card_width + gap)).floor() as usize;
+        columns.max(1)
+    }
+
+    /// Calculate card height for the current grid layout
+    fn palace_loop_card_height(&self) -> f32 {
+        let ui_scale = self.renderer.as_ref().map(|r| r.ui_scale()).unwrap_or(1.5);
+        let base_card_width = 237.0;
+        let card_width = base_card_width * ui_scale;
+        card_width * 0.6 // Same aspect ratio as renderer
+    }
+
+    /// Calculate the row height (card height + gap)
+    fn palace_loop_row_height(&self) -> f32 {
+        let ui_scale = self.renderer.as_ref().map(|r| r.ui_scale()).unwrap_or(1.5);
+        let base_gap = 16.0;
+        let gap = base_gap * ui_scale;
+        self.palace_loop_card_height() + gap
     }
 
     /// Open the main menu (Start menu)
@@ -519,8 +556,16 @@ impl App {
     }
 
     fn handle_input(&mut self, key: KeyCode) {
-        // Calculate columns first to avoid borrow issues
+        // Calculate layout values first to avoid borrow issues
         let columns = self.grid_columns();
+        let palace_columns = self.palace_loop_columns();
+        let row_height = self.palace_loop_row_height();
+        let ui_scale = self.renderer.as_ref().map(|r| r.ui_scale()).unwrap_or(1.5);
+        let screen_height = self.window.as_ref()
+            .map(|w| w.inner_size().height as f32)
+            .unwrap_or(1080.0);
+        let margin_y = (40.0 + 80.0) * ui_scale;
+        let visible_height = screen_height - margin_y;
 
         match &mut self.state {
             AppState::ProjectChooser { selected_index } => {
@@ -613,6 +658,7 @@ impl App {
                                     log_scroll_offset: 0,
                                     detail_scroll_offset: 0.0,
                                     detail_max_scroll: 0.0,
+                                    card_scroll_offset: 0.0,
                                 };
 
                                 // Spawn AI suggestion thread
@@ -851,11 +897,29 @@ impl App {
                 cards,
                 focused_index,
                 detail_scroll_offset,
+                card_scroll_offset,
                 generating,
                 ..
             } => {
                 let card_count = cards.len();
-                let palace_columns = 5; // PalaceLoop uses 5-column grid
+
+                // Helper to scroll focused card into view
+                let scroll_into_view = |focused: usize, scroll: &mut f32| {
+                    let focused_row = focused / palace_columns;
+                    let card_top = focused_row as f32 * row_height;
+                    let card_bottom = card_top + row_height;
+
+                    // Scroll up if card is above visible area
+                    if card_top < *scroll {
+                        *scroll = card_top;
+                    }
+                    // Scroll down if card is below visible area
+                    if card_bottom > *scroll + visible_height {
+                        *scroll = card_bottom - visible_height;
+                    }
+                    // Clamp scroll to valid range
+                    *scroll = scroll.max(0.0);
+                };
 
                 match key {
                     KeyCode::ArrowUp | KeyCode::KeyW => {
@@ -870,6 +934,7 @@ impl App {
                             *focused_index = target.min(card_count - 1);
                             *detail_scroll_offset = 0.0;
                         }
+                        scroll_into_view(*focused_index, card_scroll_offset);
                     }
                     KeyCode::ArrowDown | KeyCode::KeyS => {
                         // Move down one row
@@ -885,6 +950,7 @@ impl App {
                             }
                             *detail_scroll_offset = 0.0;
                         }
+                        scroll_into_view(*focused_index, card_scroll_offset);
                     }
                     KeyCode::ArrowLeft | KeyCode::KeyA => {
                         if *focused_index > 0 {
@@ -894,6 +960,7 @@ impl App {
                             *focused_index = card_count - 1;
                             *detail_scroll_offset = 0.0;
                         }
+                        scroll_into_view(*focused_index, card_scroll_offset);
                     }
                     KeyCode::ArrowRight | KeyCode::KeyD => {
                         if card_count > 0 && *focused_index < card_count - 1 {
@@ -903,6 +970,7 @@ impl App {
                             *focused_index = 0;
                             *detail_scroll_offset = 0.0;
                         }
+                        scroll_into_view(*focused_index, card_scroll_offset);
                     }
                     KeyCode::Enter | KeyCode::Space => {
                         // Toggle selection on focused card
@@ -1423,7 +1491,7 @@ impl App {
     /// Handle cursor movement for hover detection
     fn handle_cursor_moved(&mut self, x: f32, y: f32) {
         // Only handle hover in PalaceLoop state
-        if let AppState::PalaceLoop { cards, hovered_index, .. } = &mut self.state {
+        if let AppState::PalaceLoop { cards, hovered_index, card_scroll_offset, .. } = &mut self.state {
             let window_size = self.window.as_ref().map(|w| w.inner_size());
             let Some(size) = window_size else { return };
 
@@ -1431,27 +1499,30 @@ impl App {
             let ui_scale = self.renderer.as_ref().map(|r| r.ui_scale()).unwrap_or(1.0);
             let scale = |v: f32| v * ui_scale;
 
-            let target_columns = 5usize;
+            // Dynamic column calculation
+            let base_card_width = 237.0;
             let base_gap = 16.0;
             let base_margin = 40.0;
             let screen_width = size.width as f32;
 
+            let card_width = scale(base_card_width);
             let gap = scale(base_gap);
             let margin_x = scale(base_margin);
             let margin_y = scale(base_margin + 80.0); // Extra space for title + subtitle
 
-            // Calculate card width to fit exactly 5 columns
+            // Calculate columns dynamically
             let available_width = screen_width - margin_x * 2.0;
-            let card_width = (available_width - gap * (target_columns - 1) as f32) / target_columns as f32;
+            let columns = ((available_width + gap) / (card_width + gap)).floor() as usize;
+            let columns = columns.max(1);
             let card_height = card_width * 0.6; // Same aspect ratio as renderer
 
             // Find which card (if any) the cursor is over
             let mut new_hovered = None;
             for (i, _card) in cards.iter().enumerate() {
-                let col = i % target_columns;
-                let row = i / target_columns;
+                let col = i % columns;
+                let row = i / columns;
                 let card_x = margin_x + col as f32 * (card_width + gap);
-                let card_y = margin_y + row as f32 * (card_height + gap);
+                let card_y = margin_y + row as f32 * (card_height + gap) - *card_scroll_offset;
 
                 if x >= card_x && x <= card_x + card_width
                    && y >= card_y && y <= card_y + card_height {
@@ -1465,6 +1536,35 @@ impl App {
                 *hovered_index = new_hovered;
                 self.hover_changed = true;
             }
+        }
+    }
+
+    /// Handle mouse wheel scrolling
+    fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
+        // Extract scroll amount (positive = scroll up, negative = scroll down)
+        let scroll_amount = match delta {
+            MouseScrollDelta::LineDelta(_, y) => y * 50.0, // Lines to pixels
+            MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
+        };
+
+        // Pre-compute layout values to avoid borrow issues
+        let row_height = self.palace_loop_row_height();
+        let columns = self.palace_loop_columns();
+        let ui_scale = self.renderer.as_ref().map(|r| r.ui_scale()).unwrap_or(1.5);
+        let screen_height = self.window.as_ref()
+            .map(|w| w.inner_size().height as f32)
+            .unwrap_or(1080.0);
+        let margin_y = (40.0 + 80.0) * ui_scale;
+        let visible_height = screen_height - margin_y;
+
+        // Handle scroll in PalaceLoop state
+        if let AppState::PalaceLoop { cards, card_scroll_offset, .. } = &mut self.state {
+            let total_rows = (cards.len() + columns - 1) / columns;
+            let content_height = total_rows as f32 * row_height;
+            let max_scroll = (content_height - visible_height).max(0.0);
+
+            // Apply scroll (inverted: wheel up = scroll up = decrease offset)
+            *card_scroll_offset = (*card_scroll_offset - scroll_amount).clamp(0.0, max_scroll);
         }
     }
 
@@ -1575,6 +1675,7 @@ impl App {
             AppState::PalaceLoop {
                 cards,
                 focused_index,
+                card_scroll_offset,
                 ..
             } => {
                 // Tap on suggestion cards to toggle selection
@@ -1582,25 +1683,28 @@ impl App {
                 let ui_scale = self.renderer.as_ref().map(|r| r.ui_scale()).unwrap_or(1.0);
                 let scale = |v: f32| v * ui_scale;
 
-                let target_columns = 5usize;
+                // Dynamic column calculation (same as palace_loop_columns)
+                let base_card_width = 237.0;
                 let base_gap = 16.0;
                 let base_margin = 40.0;
                 let screen_width = size.width as f32;
 
+                let card_width = scale(base_card_width);
                 let gap = scale(base_gap);
                 let margin_x = scale(base_margin);
                 let margin_y = scale(base_margin + 80.0); // Extra space for title + subtitle
 
-                // Calculate card width to fit exactly 5 columns
+                // Calculate columns dynamically
                 let available_width = screen_width - margin_x * 2.0;
-                let card_width = (available_width - gap * (target_columns - 1) as f32) / target_columns as f32;
+                let columns = ((available_width + gap) / (card_width + gap)).floor() as usize;
+                let columns = columns.max(1);
                 let card_height = card_width * 0.6; // Same aspect ratio as renderer
 
                 for (i, _card) in cards.iter().enumerate() {
-                    let col = i % target_columns;
-                    let row = i / target_columns;
+                    let col = i % columns;
+                    let row = i / columns;
                     let card_x = margin_x + col as f32 * (card_width + gap);
-                    let card_y = margin_y + row as f32 * (card_height + gap);
+                    let card_y = margin_y + row as f32 * (card_height + gap) - *card_scroll_offset;
 
                     if x >= card_x && x <= card_x + card_width
                        && y >= card_y && y <= card_y + card_height {
@@ -1942,6 +2046,11 @@ impl ApplicationHandler<AppEvent> for App {
                     self.hover_changed = false;
                     self.request_redraw();
                 }
+            }
+
+            WindowEvent::MouseWheel { delta, .. } => {
+                self.handle_mouse_wheel(delta);
+                self.request_redraw();
             }
 
             WindowEvent::RedrawRequested => {

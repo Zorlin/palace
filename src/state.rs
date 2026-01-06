@@ -272,6 +272,8 @@ pub enum AppState {
         detail_scroll_offset: f32,
         /// Max scroll for current focused card (calculated from content height)
         detail_max_scroll: f32,
+        /// Scroll offset for card grid (mouse wheel / navigation)
+        card_scroll_offset: f32,
     },
     /// Main menu - opened with Start button (Resume, Settings, Exit)
     MainMenu {

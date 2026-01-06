@@ -117,9 +117,11 @@ impl CardGrid {
         }
     }
 
-    /// Grid specifically for PalaceLoop - targets 5 columns
+    /// Grid for PalaceLoop - dynamically calculates columns based on screen size
+    ///
+    /// Reference: At 1080p (1920px) with 1.5 scale on 5.5" display = 5 cards
+    /// Cards scale proportionally to screen width and UI scale setting
     fn for_palace_loop(screen_width: f32, _screen_height: f32, scale: &UiScale) -> Self {
-        let target_columns = 5;
         let base_gap = 16.0;
         let base_margin = 40.0;
 
@@ -127,12 +129,17 @@ impl CardGrid {
         let margin_x = scale.px(base_margin);
         let margin_y = scale.px(base_margin + 80.0); // Extra space for title + subtitle
 
-        // Calculate card width to fit exactly 5 columns
-        let available_width = screen_width - margin_x * 2.0;
-        let card_width = (available_width - gap * (target_columns - 1) as f32) / target_columns as f32;
+        // Reference: 5 cards at 1920px with 1.5 scale = card width ~237 base
+        // We want cards to feel consistent regardless of screen size
+        // So we use a fixed base card width and calculate columns from that
+        let base_card_width = 237.0;
+        let card_width = scale.px(base_card_width);
         let card_height = card_width * 0.6; // Maintain aspect ratio
 
-        let columns = target_columns;
+        // Calculate columns based on available width
+        let available_width = screen_width - margin_x * 2.0;
+        let columns = ((available_width + gap) / (card_width + gap)).floor() as usize;
+        let columns = columns.max(1); // At least 1 column
 
         Self {
             card_width,
@@ -875,13 +882,13 @@ impl Renderer {
             AppState::ProjectView { selected_action, .. } => {
                 self.build_action_cards(*selected_action)
             }
-            AppState::PalaceLoop { cards, focused_index, hovered_index, .. } => {
-                self.build_suggestion_cards(cards, *focused_index, *hovered_index, None)
+            AppState::PalaceLoop { cards, focused_index, hovered_index, card_scroll_offset, .. } => {
+                self.build_suggestion_cards(cards, *focused_index, *hovered_index, None, *card_scroll_offset)
             }
             AppState::Executing { quest_log_visible: true, all_cards, quest_log_focus, executing_cards, task_statuses, .. } => {
-                // Show all cards when quest log is visible, with status badges
+                // Show all cards when quest log is visible, with status badges (no scroll in this view)
                 let exec_ids: Vec<usize> = executing_cards.iter().map(|c| c.id).collect();
-                self.build_suggestion_cards(all_cards, *quest_log_focus, None, Some((&exec_ids, task_statuses)))
+                self.build_suggestion_cards(all_cards, *quest_log_focus, None, Some((&exec_ids, task_statuses)), 0.0)
             }
             AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } | AppState::PermissionModal { .. } | AppState::ExecuteModal { .. } | AppState::Survey { .. } | AppState::Executing { .. } => Vec::new(),
         };
@@ -924,13 +931,13 @@ impl Renderer {
                 AppState::ProjectView { project_path, selected_action } => {
                     self.queue_project_view_text(project_path, *selected_action);
                 }
-                AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, hovered_index, detail_scroll_offset, .. } => {
-                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *hovered_index, *detail_scroll_offset, None);
+                AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, hovered_index, detail_scroll_offset, card_scroll_offset, .. } => {
+                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *hovered_index, *detail_scroll_offset, None, *card_scroll_offset);
                 }
                 AppState::Executing { tool_log, thought_log, log_scroll_offset, status, executor, quest_log_visible, all_cards, quest_log_focus, executing_cards, task_statuses, .. } => {
                     if *quest_log_visible {
                         let exec_ids: Vec<usize> = executing_cards.iter().map(|c| c.id).collect();
-                        self.queue_palace_loop_text(all_cards, None, &[], &[], 0, *quest_log_focus, None, 0.0, Some((&exec_ids, task_statuses)));
+                        self.queue_palace_loop_text(all_cards, None, &[], &[], 0, *quest_log_focus, None, 0.0, Some((&exec_ids, task_statuses)), 0.0);
                     } else {
                         self.queue_executing_text(tool_log, thought_log, *log_scroll_offset, status, *executor);
                     }
@@ -1146,13 +1153,13 @@ impl Renderer {
                 AppState::ProjectView { project_path, selected_action } => {
                     self.queue_project_view_text(project_path, *selected_action);
                 }
-                AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, hovered_index, detail_scroll_offset, .. } => {
-                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *hovered_index, *detail_scroll_offset, None);
+                AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, hovered_index, detail_scroll_offset, card_scroll_offset, .. } => {
+                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *hovered_index, *detail_scroll_offset, None, *card_scroll_offset);
                 }
                 AppState::Executing { tool_log, thought_log, log_scroll_offset, status, executor, quest_log_visible, all_cards, quest_log_focus, executing_cards, task_statuses, .. } => {
                     if *quest_log_visible {
                         let exec_ids: Vec<usize> = executing_cards.iter().map(|c| c.id).collect();
-                        self.queue_palace_loop_text(all_cards, None, &[], &[], 0, *quest_log_focus, None, 0.0, Some((&exec_ids, task_statuses)));
+                        self.queue_palace_loop_text(all_cards, None, &[], &[], 0, *quest_log_focus, None, 0.0, Some((&exec_ids, task_statuses)), 0.0);
                     } else {
                         self.queue_executing_text(tool_log, thought_log, *log_scroll_offset, status, *executor);
                     }
@@ -1267,14 +1274,14 @@ impl Renderer {
                 AppState::ProjectView { project_path, selected_action } => {
                     self.queue_project_view_text(project_path, *selected_action);
                 }
-                AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, hovered_index, detail_scroll_offset, .. } => {
-                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *hovered_index, *detail_scroll_offset, None);
+                AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, hovered_index, detail_scroll_offset, card_scroll_offset, .. } => {
+                    self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *hovered_index, *detail_scroll_offset, None, *card_scroll_offset);
                 }
                 AppState::Executing { tool_log, thought_log, log_scroll_offset, status, executor, quest_log_visible, all_cards, quest_log_focus, executing_cards, task_statuses, .. } => {
                     if *quest_log_visible {
-                        // Show card deck view with execution status
+                        // Show card deck view with execution status (no scroll in this view)
                         let exec_ids: Vec<usize> = executing_cards.iter().map(|c| c.id).collect();
-                        self.queue_palace_loop_text(all_cards, None, &[], &[], 0, *quest_log_focus, None, 0.0, Some((&exec_ids, task_statuses)));
+                        self.queue_palace_loop_text(all_cards, None, &[], &[], 0, *quest_log_focus, None, 0.0, Some((&exec_ids, task_statuses)), 0.0);
                     } else {
                         // Show executor log view
                         self.queue_executing_text(tool_log, thought_log, *log_scroll_offset, status, *executor);
@@ -1433,7 +1440,8 @@ impl Renderer {
 
     /// Build suggestion cards with optional status badges for quest log
     /// exec_status: (executing_card_ids, task_statuses) for badge rendering
-    fn build_suggestion_cards(&self, cards: &[SuggestionCard], focused: usize, hovered: Option<usize>, exec_status: Option<(&[usize], &[TaskStatus])>) -> Vec<CardInstance> {
+    /// scroll_offset: Vertical scroll offset in pixels (cards above this are clipped)
+    fn build_suggestion_cards(&self, cards: &[SuggestionCard], focused: usize, hovered: Option<usize>, exec_status: Option<(&[usize], &[TaskStatus])>, scroll_offset: f32) -> Vec<CardInstance> {
         let grid = CardGrid::for_palace_loop(
             self.size.width as f32,
             self.size.height as f32,
@@ -1441,12 +1449,19 @@ impl Renderer {
         );
 
         let text_margin = self.ui_scale.px(12.0);
+        let screen_height = self.size.height as f32;
 
         cards
             .iter()
             .enumerate()
             .flat_map(|(i, card)| {
-                let (x, y) = grid.card_position(i);
+                let (x, base_y) = grid.card_position(i);
+                let y = base_y - scroll_offset;
+
+                // Skip cards that are completely off-screen (optimization)
+                if y + grid.card_height < 0.0 || y > screen_height {
+                    return vec![];
+                }
                 // Card is "flipped" when focused via keyboard/gamepad OR hovered via mouse
                 let is_flipped = i == focused || hovered == Some(i);
 
@@ -2116,6 +2131,7 @@ impl Renderer {
                 log_scroll_offset: 0,
                 detail_scroll_offset: 0.0,
                 detail_max_scroll: 0.0,
+                card_scroll_offset: 0.0,
             }),
         };
         self.queue_help_legend(&help_state);
@@ -2246,6 +2262,7 @@ impl Renderer {
                 log_scroll_offset: 0,
                 detail_scroll_offset: 0.0,
                 detail_max_scroll: 0.0,
+                card_scroll_offset: 0.0,
             }),
         };
         self.queue_help_legend(&help_state);
@@ -2447,6 +2464,7 @@ impl Renderer {
                 log_scroll_offset: 0,
                 detail_scroll_offset: 0.0,
                 detail_max_scroll: 0.0,
+                card_scroll_offset: 0.0,
             }),
             response_tx: None,
         };
@@ -2715,7 +2733,8 @@ impl Renderer {
     }
 
     /// exec_status: Optional (executing_card_ids, task_statuses) for quest log status indicators
-    fn queue_palace_loop_text(&mut self, cards: &[SuggestionCard], current_tool: Option<&str>, tool_log: &[String], thought_log: &[String], log_scroll: usize, focused_index: usize, hovered_index: Option<usize>, detail_scroll: f32, exec_status: Option<(&[usize], &[TaskStatus])>) {
+    /// card_scroll_offset: Vertical scroll offset for the card grid (in pixels)
+    fn queue_palace_loop_text(&mut self, cards: &[SuggestionCard], current_tool: Option<&str>, tool_log: &[String], thought_log: &[String], log_scroll: usize, focused_index: usize, hovered_index: Option<usize>, detail_scroll: f32, exec_status: Option<(&[usize], &[TaskStatus])>, card_scroll_offset: f32) {
         let title_scale = self.ui_scale.px(42.0);
         let left_margin = self.ui_scale.px(60.0);
         let top_margin = self.ui_scale.px(40.0);
@@ -2809,8 +2828,15 @@ impl Renderer {
 
         // Card text - "flip" behavior: focused cards show description, others show title
         let text_margin = self.ui_scale.px(12.0);
+        let screen_height = self.size.height as f32;
         for (i, card) in cards.iter().enumerate() {
-            let (x, y) = grid.card_position(i);
+            let (x, base_y) = grid.card_position(i);
+            let y = base_y - card_scroll_offset;
+
+            // Skip cards that are completely off-screen
+            if y + grid.card_height < 0.0 || y > screen_height {
+                continue;
+            }
 
             // Determine if this card is "flipped" (showing back face with description)
             let is_flipped = i == focused_index || hovered_index == Some(i);
@@ -2946,6 +2972,7 @@ impl Renderer {
             log_scroll_offset: 0,
             detail_scroll_offset: 0.0,
             detail_max_scroll: 0.0,
+            card_scroll_offset: 0.0,
         };
         self.queue_help_legend(&help_state);
     }
