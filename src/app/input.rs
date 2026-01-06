@@ -15,6 +15,24 @@ pub trait KeyboardInput {
 
 impl KeyboardInput for super::App {
     fn handle_input(&mut self, key: KeyCode) {
+        tracing::debug!("handle_input received key: {:?}", key);
+
+        // F2 toggles edit mode globally (works from any state)
+        if key == KeyCode::F2 {
+            self.edit_mode.toggle();
+            tracing::info!("Edit mode: {}", if self.edit_mode.active { "ON" } else { "OFF" });
+            self.request_redraw();
+            return;
+        }
+
+        // Escape exits edit mode if active
+        if key == KeyCode::Escape && self.edit_mode.active {
+            self.edit_mode.exit();
+            tracing::info!("Edit mode: OFF");
+            self.request_redraw();
+            return;
+        }
+
         // Calculate layout values first to avoid borrow issues
         let columns = self.grid_columns();
         let palace_columns = self.palace_loop_columns();

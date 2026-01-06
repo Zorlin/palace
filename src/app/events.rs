@@ -258,6 +258,48 @@ impl ApplicationHandler<AppEvent> for App {
                 self.request_redraw();
             }
 
+            WindowEvent::MouseInput { state, button, .. } => {
+                use winit::event::MouseButton;
+                use crate::panels::{UIPanel, UIPanelBounds};
+
+                if button == MouseButton::Left {
+                    match state {
+                        ElementState::Pressed => {
+                            // Handle left click in edit mode - use last known cursor position
+                            if self.edit_mode.active {
+                                if let Some(pos) = self.last_cursor_position {
+                                    // Refresh ui_panels from renderer before handling tap
+                                    if let Some(renderer) = self.focused_renderer() {
+                                        let panels = renderer.compute_ui_panels(&self.state);
+                                        self.edit_mode.ui_panels = panels
+                                            .into_iter()
+                                            .map(|(id, x, y, w, h)| UIPanel {
+                                                id,
+                                                bounds: UIPanelBounds { x, y, width: w, height: h },
+                                            })
+                                            .collect();
+                                        // Apply any saved overrides to the panel positions
+                                        self.edit_mode.apply_overrides_to_ui_panels();
+                                    }
+                                    self.handle_edit_mode_tap(pos.0, pos.1);
+                                    self.request_redraw();
+                                }
+                            }
+                        }
+                        ElementState::Released => {
+                            // Handle mouse button release for edit mode resize
+                            if self.edit_mode.active && self.edit_mode.ui_resize.is_some() {
+                                if let Some(ref resize) = self.edit_mode.ui_resize {
+                                    let (x, y) = resize.current_pos;
+                                    self.handle_edit_mode_release(x, y);
+                                    self.request_redraw();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             WindowEvent::ModifiersChanged(new_modifiers) => {
                 self.modifiers = new_modifiers;
             }
@@ -287,11 +329,41 @@ impl ApplicationHandler<AppEvent> for App {
                     // Check if we need to capture a screenshot
                     let screenshot_path = self.pending_screenshot.take();
 
+                    // Merge panel_overrides (persisted) with reflow_previews (active drag)
+                    // This ensures panels stay at their saved positions after resize completes
+                    let mut panel_positions = self.edit_mode.panel_overrides.clone();
+                    // Active reflow previews override saved positions during drag
+                    for (&id, &pos) in &self.edit_mode.reflow_previews {
+                        panel_positions.insert(id, pos);
+                    }
+
+                    // Compute resize preview bounds for the actively resizing panel
+                    // This handles all handle types correctly (including Top/Left which move x/y)
+                    let resize_preview = if let Some(ref resize) = self.edit_mode.ui_resize {
+                        let delta_x = resize.current_pos.0 - resize.start_pos.0;
+                        let delta_y = resize.current_pos.1 - resize.start_pos.1;
+                        let (new_x, new_y, new_w, new_h) = self.edit_mode.apply_resize_delta_pub(
+                            resize.original_bounds,
+                            resize.handle,
+                            delta_x,
+                            delta_y,
+                        );
+                        // Add resize preview to panel_positions so renderer draws it correctly
+                        panel_positions.insert(resize.panel_id, (new_x, new_y, new_w, new_h));
+                        None // No separate resize_preview needed - it's in panel_positions
+                    } else {
+                        None
+                    };
+
                     match palace_window.renderer.render_with_screenshot(
                         &self.state,
                         &self.projects,
                         screenshot_path.as_ref(),
                         &mut self.screenshot_capture,
+                        self.edit_mode.active,
+                        self.edit_mode.selected_panel,
+                        resize_preview,
+                        &panel_positions,
                     ) {
                         Ok(_) => {}
                         Err(wgpu::SurfaceError::Lost) => {
@@ -338,8 +410,11 @@ impl ApplicationHandler<AppEvent> for App {
             AppState::Executing { request_active: true, .. }
         );
 
+        // Edit mode has pulsing animations
+        let edit_mode_active = self.edit_mode.active;
+
         // Request redraw if needed
-        if self.needs_redraw || self.pending_screenshot.is_some() || has_pending_captures || stick_active || animation_active {
+        if self.needs_redraw || self.pending_screenshot.is_some() || has_pending_captures || stick_active || animation_active || edit_mode_active {
             for palace_window in self.windows.values() {
                 palace_window.window.request_redraw();
             }

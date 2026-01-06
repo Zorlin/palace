@@ -24,6 +24,7 @@ pub use gamepad::GamepadFocusTracker;
 
 use crate::debug::{DebugCommand, DebugResponse, ScreenshotCapture};
 use crate::palace_window::PalaceWindow;
+use crate::panels::{EditModeState, PanelLayout};
 use crate::persistence::PalaceDB;
 use crate::projects::ProjectsConfig;
 use crate::renderer::{Renderer, SharedGpuResources};
@@ -197,6 +198,12 @@ pub struct App {
     /// Pending primary monitor from saved settings (set in restore_display_settings)
     /// When CreateWindow creates a window on this monitor, it becomes the focused window
     pub(crate) pending_primary_monitor: Option<String>,
+    /// Edit mode state (overlay for panel layout customization)
+    pub(crate) edit_mode: EditModeState,
+    /// Panel layout configuration
+    pub(crate) panel_layout: PanelLayout,
+    /// Last cursor position (for mouse click handling)
+    pub(crate) last_cursor_position: Option<(f32, f32)>,
 }
 
 impl App {
@@ -236,6 +243,9 @@ impl App {
             known_monitors: Vec::new(),
             virtual_viewport,
             pending_primary_monitor: None,
+            edit_mode: EditModeState::new(),
+            panel_layout: PanelLayout::default(),
+            last_cursor_position: None,
         }
     }
 

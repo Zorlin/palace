@@ -154,28 +154,118 @@ ALL interactive elements must be clickable:
 - Click = same as Space/Enter on that element
 - Hover states for visual feedback
 
+### Modal Overlay Rule
+
+**Modals NEVER cause content behind them to disappear.**
+
+- Modals render ON TOP of existing content with semi-transparent backdrop
+- Content behind remains visible (dimmed/blurred if desired)
+- User can see context of what they were doing
+- Escape dismisses modal, revealing unchanged content behind
+
+---
+
+## Panel Architecture (Composable Workspaces)
+
+Palace is transitioning from a linear state machine to a **composable panel-based workspace**.
+
+### Core Concepts
+
+| Concept | Description |
+|---------|-------------|
+| **Panel** | A UI primitive (Quest Log, Execution, Analysis, etc.) |
+| **Screen** | A saved arrangement of panels |
+| **Grid** | Android ICS/Honeycomb-style cell-based layout |
+| **Edit Mode** | Drag-and-drop panel customization |
+
+### Panel Types
+
+| Panel | Description | Palace Loop? |
+|-------|-------------|--------------|
+| Project Chooser | Grid of all projects | No (entry) |
+| Project View | Per-project action menu | No |
+| Analysis Panel | Tool/thought logs during analysis | Yes |
+| Quest Log | Card grid for task selection | Yes |
+| Execution Panel | Live tool/thought columns | Yes |
+| Overlays | Permission, Survey, Settings | Float above |
+
+**"Palace Loop"** is the brand for all active work panels (Analysis, Quest Log, Execution).
+
+### Edit Mode Entry Points
+
+Three ways to enter edit mode (all must work):
+
+1. **F2 Key** - Direct keyboard shortcut
+2. **Main Menu** - Esc → "Edit Layout" option
+3. **Long Press** - Tap and hold empty area (500ms threshold)
+
+### Grid Layout
+
+- Panels snap to grid cells (Android widget-style)
+- Grid dimensions adapt to aspect ratio:
+  - 16:9 → 8×6 cells
+  - 21:9 → 10×6 cells
+  - 32:9 → 12×6 cells
+- Panels can span multiple cells
+- Drag handles for resize at corners/edges
+
+### Multi-Project Support
+
+Each project panel runs an **independent agent**:
+
+- Own cards, tool logs, thought logs
+- Own execution state and token usage
+- Anthropic API handles cache sharing (5min/1hr TTL)
+- L1/R1 switches focus between project panels
+
 ---
 
 ## Architecture
 
 ```
 src/
-├── main.rs           # Entry point, CLI args, VirtualViewport
-├── app.rs            # ApplicationHandler, state machine, input
-├── state.rs          # AppState enum, all state types
-├── projects.rs       # Project discovery, language detection
-├── persistence.rs    # ReDB wrapper, preferences
+├── main.rs              # Entry point, CLI args, VirtualViewport
+├── app/                 # App struct, event handling
+│   ├── mod.rs           # App struct, initialization
+│   ├── events.rs        # winit ApplicationHandler
+│   ├── input.rs         # Keyboard input routing
+│   ├── gamepad.rs       # Gamepad input thread
+│   ├── touch.rs         # Touch/mouse input
+│   └── menus.rs         # Menu navigation helpers
+├── palace_window.rs     # Per-monitor window (multi-display support)
+├── state.rs             # AppState enum, all state types
+├── projects.rs          # Project discovery, language detection
+├── persistence.rs       # ReDB wrapper, preferences
+├── ui/                  # Reusable UI components
+│   └── menu.rs          # Menu component with vertical navigation
+├── panels/              # Panel system (composable workspaces)
+│   ├── mod.rs           # Panel module root
+│   ├── trait.rs         # Panel trait definition
+│   ├── registry.rs      # Panel instance management
+│   ├── layout.rs        # Grid layout system
+│   ├── edit_mode.rs     # Edit mode state and logic
+│   └── presets.rs       # Layout presets
 └── renderer/
-    ├── mod.rs        # Public exports
-    ├── gpu.rs        # Main Renderer (~5000 lines)
-    ├── cards.rs      # CardInstance, CardRenderer
-    ├── sprites.rs    # SpriteRenderer for Xbox glyphs
-    ├── text.rs       # Text measurement utilities
-    ├── ui_scale.rs   # DPI-aware scaling
+    ├── mod.rs           # Public exports
+    ├── gpu.rs           # Main Renderer
+    ├── shared_gpu.rs    # Shared GPU resources (multi-window)
+    ├── cards.rs         # CardInstance, CardRenderer
+    ├── sprites.rs       # SpriteRenderer for Xbox glyphs
+    ├── text.rs          # Text measurement utilities
+    ├── ui_scale.rs      # DPI-aware scaling
     └── shaders/
-        ├── card.wgsl     # SDF rounded rect shader
-        └── sprite.wgsl   # Texture atlas shader
+        ├── card.wgsl    # SDF rounded rect shader
+        └── sprite.wgsl  # Texture atlas shader
 ```
+
+### Multi-Window Architecture
+
+Palace supports multiple monitors with independent windows:
+
+- **SharedGpuResources**: Device, queue, adapter shared across all windows
+- **PalaceWindow**: Per-monitor window with its own Renderer and surface
+- **Display Settings**: Persisted to ReDB, restored on startup
+- Windows are CREATED on correct monitors, NEVER moved between them
 
 ## AppState Enum
 
@@ -218,21 +308,6 @@ Palace uses zero-CPU-when-idle design:
 - **Render loop**: `ControlFlow::Wait` when idle
 
 This is critical for battery life on handheld devices like GPD Win 4.
-
----
-
-## Panel Names
-
-All active work states are branded as "Palace Loop":
-
-| Panel | Description |
-|-------|-------------|
-| Project Chooser | Grid of all projects (entry point) |
-| Project View | Per-project action menu |
-| Analysis Panel | Tool/thought logs during analysis |
-| Quest Log | Card grid for task selection |
-| Execution Panel | Live tool/thought columns during execution |
-| Overlays | Permission, Survey, Settings modals |
 
 ---
 

@@ -226,6 +226,8 @@ pub struct Renderer {
     virtual_viewport_cache: (u32, u32, u32, u32),
     /// Monitor name this renderer is on (for display identification)
     monitor_name: String,
+    /// Edit mode overlay cards (grid, handles, etc.)
+    edit_mode_cards: Vec<CardInstance>,
 }
 
 impl Renderer {
@@ -533,6 +535,7 @@ impl Renderer {
             virtual_viewport: crate::VirtualViewport::default(),
             virtual_viewport_cache: (size.width, size.height, 0, 0),
             monitor_name: String::new(),
+            edit_mode_cards: Vec::new(),
         })
     }
 
@@ -788,6 +791,7 @@ impl Renderer {
             virtual_viewport: crate::VirtualViewport::default(),
             virtual_viewport_cache: (size.width, size.height, 0, 0),
             monitor_name: String::new(),
+            edit_mode_cards: Vec::new(),
         })
     }
 
@@ -1297,7 +1301,8 @@ impl Renderer {
         state: &AppState,
         projects: &ProjectsConfig,
     ) -> Result<(), wgpu::SurfaceError> {
-        self.render_with_screenshot(state, projects, None, &mut crate::debug::ScreenshotCapture::new())
+        let empty_reflow = std::collections::HashMap::new();
+        self.render_with_screenshot(state, projects, None, &mut crate::debug::ScreenshotCapture::new(), false, None, None, &empty_reflow)
     }
 
     pub fn render_with_screenshot(
@@ -1306,7 +1311,14 @@ impl Renderer {
         projects: &ProjectsConfig,
         screenshot_path: Option<&std::path::PathBuf>,
         screenshot_capture: &mut crate::debug::ScreenshotCapture,
+        edit_mode_active: bool,
+        selected_panel: Option<&str>,
+        resize_preview: Option<(&str, f32, f32)>, // (panel_id, delta_x, delta_y)
+        reflow_positions: &std::collections::HashMap<&'static str, (f32, f32, f32, f32)>, // Panels displaced by reflow
     ) -> Result<(), wgpu::SurfaceError> {
+        // Clear edit mode cards from previous frame
+        self.edit_mode_cards.clear();
+
         let output = self.surface.get_current_texture()?;
         let surface_view = output
             .texture
@@ -1530,6 +1542,12 @@ impl Renderer {
                 AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } | AppState::PermissionModal { .. } | AppState::ExecuteModal { .. } | AppState::AddCardMenu { .. } | AppState::CustomTaskInput { .. } | AppState::Survey { .. } | AppState::MultiDisplayDialog { .. } | AppState::ProjectContextMenu { .. } | AppState::LanguageSelector { .. } | AppState::NewMonitorDialog { .. } => {}
             }
 
+            // Edit mode indicator (overlay)
+            if edit_mode_active {
+                let panels = self.compute_ui_panels(base_state);
+                self.queue_edit_mode_indicator(&panels, selected_panel, resize_preview, reflow_positions);
+            }
+
             // Prepare base text for Pass 1
             let _base_text = self.prepare_text();
 
@@ -1558,8 +1576,11 @@ impl Renderer {
                     multiview_mask: None,
                 });
 
+                // Combine base cards and edit mode cards into one draw call
+                let mut all_cards = base_cards.clone();
+                all_cards.extend(self.edit_mode_cards.iter().cloned());
                 self.card_renderer
-                    .draw(&mut render_pass, &self.queue, &base_cards);
+                    .draw(&mut render_pass, &self.queue, &all_cards);
 
                 if self.gamepad_connected {
                     let sprites = self.build_help_sprites(base_state);
@@ -1794,6 +1815,12 @@ impl Renderer {
                 AppState::NewMonitorDialog { .. } => {}
             }
 
+            // Edit mode indicator (overlay)
+            if edit_mode_active {
+                let panels = self.compute_ui_panels(base_state);
+                self.queue_edit_mode_indicator(&panels, selected_panel, resize_preview, reflow_positions);
+            }
+
             // Prepare text
             let _prepared = self.prepare_text();
 
@@ -1824,8 +1851,11 @@ impl Renderer {
                     multiview_mask: None,
                 });
 
+                // Combine base cards and edit mode cards into one draw call
+                let mut all_cards = base_cards.clone();
+                all_cards.extend(self.edit_mode_cards.iter().cloned());
                 self.card_renderer
-                    .draw(&mut render_pass, &self.queue, &base_cards);
+                    .draw(&mut render_pass, &self.queue, &all_cards);
 
                 if self.gamepad_connected {
                     let sprites = self.build_help_sprites(state);
@@ -1924,6 +1954,12 @@ impl Renderer {
                 AppState::NewMonitorDialog { .. } => {}
             }
 
+            // Edit mode indicator (overlay)
+            if edit_mode_active {
+                let panels = self.compute_ui_panels(base_state);
+                self.queue_edit_mode_indicator(&panels, selected_panel, resize_preview, reflow_positions);
+            }
+
             // Prepare text
             let _prepared = self.prepare_text();
 
@@ -1951,8 +1987,12 @@ impl Renderer {
                     multiview_mask: None,
                 });
 
+                // Combine base cards and edit mode cards into one draw call
+                // (Drawing twice overwrites the instance buffer - race condition)
+                let mut all_cards = base_cards;
+                all_cards.extend(self.edit_mode_cards.iter().cloned());
                 self.card_renderer
-                    .draw(&mut render_pass, &self.queue, &base_cards);
+                    .draw(&mut render_pass, &self.queue, &all_cards);
 
                 if self.gamepad_connected {
                     let sprites = self.build_help_sprites(state);
@@ -5390,6 +5430,198 @@ impl Renderer {
             self.size.height,
             path,
         )
+    }
+
+    /// Compute UI panel bounds for the current state
+    ///
+    /// Returns a vector of (panel_id, x, y, width, height) for each visible panel.
+    /// These are the actual UI elements that can be selected/resized in edit mode.
+    /// This is public so the App can call it to populate edit_mode.ui_panels for hit testing.
+    pub fn compute_ui_panels(&self, state: &AppState) -> Vec<(&'static str, f32, f32, f32, f32)> {
+        let (content_w, _content_h) = self.content_size();
+        let (offset_x, offset_y) = self.content_offset();
+
+        match state {
+            AppState::ProjectView { .. } => {
+                use crate::state::ProjectAction;
+
+                let left_margin = self.ui_scale.px(60.0);
+                let top_margin = self.ui_scale.px(40.0);
+                let title_scale = self.ui_scale.px(36.0);
+
+                // Panel 1: Project context widget (top-left info box)
+                let context_x = offset_x + left_margin - self.ui_scale.px(10.0);
+                let context_y = offset_y + top_margin - self.ui_scale.px(5.0);
+                let context_w = self.ui_scale.px(300.0); // Reasonable width for project name
+                let context_h = title_scale + self.ui_scale.px(30.0); // Title + path
+
+                // Panel 2: Action menu (the 4 buttons)
+                let menu_start_y = top_margin + title_scale + self.ui_scale.px(60.0);
+                let card_height = self.ui_scale.px(70.0);
+                let card_gap = self.ui_scale.px(16.0);
+                let actions_count = ProjectAction::all().len();
+                let menu_height = actions_count as f32 * (card_height + card_gap) - card_gap;
+                let menu_x = offset_x + left_margin - self.ui_scale.px(5.0);
+                let menu_y = offset_y + menu_start_y - self.ui_scale.px(5.0);
+                let menu_w = content_w - left_margin * 2.0 + self.ui_scale.px(10.0);
+
+                vec![
+                    ("context_widget", context_x, context_y, context_w, context_h),
+                    ("action_menu", menu_x, menu_y, menu_w, menu_height + self.ui_scale.px(10.0)),
+                ]
+            }
+            AppState::ProjectChooser { .. } => {
+                // For now, treat the whole project grid as one panel
+                let margin = self.ui_scale.px(20.0);
+                vec![(
+                    "project_grid",
+                    offset_x + margin,
+                    offset_y + margin,
+                    content_w - margin * 2.0,
+                    _content_h - margin * 2.0,
+                )]
+            }
+            AppState::PalaceLoop { .. } => {
+                // Cards panel takes most of the screen
+                let margin = self.ui_scale.px(20.0);
+                vec![(
+                    "quest_log",
+                    offset_x + margin,
+                    offset_y + margin,
+                    content_w - margin * 2.0,
+                    _content_h - margin * 2.0,
+                )]
+            }
+            // Other states - no editable panels for now
+            _ => vec![],
+        }
+    }
+
+    /// Queue edit mode UI - selection borders and resize handles around actual UI panels
+    ///
+    /// Android ICS/Honeycomb style: each panel gets a blue selection border with
+    /// draggable handles at corners and edges. No grid overlay - just handles on real content.
+    ///
+    /// Panels in `reflow_positions` are rendered at their new positions (ICS-style dynamic reflow).
+    fn queue_edit_mode_indicator(
+        &mut self,
+        panels: &[(&'static str, f32, f32, f32, f32)],
+        selected: Option<&str>,
+        resize_preview: Option<(&str, f32, f32)>, // (panel_id, delta_x, delta_y)
+        reflow_positions: &std::collections::HashMap<&'static str, (f32, f32, f32, f32)>,
+    ) {
+        let (content_w, content_h) = self.content_size();
+        let (offset_x, offset_y) = self.content_offset();
+
+        // Subtle glow animation for handles (slow, gentle)
+        let anim_time = self.animation_time();
+        let glow = 0.85 + 0.15 * (anim_time * 1.5 * std::f32::consts::PI).sin();
+
+        // Colors - steady selection border, subtle glow on handles
+        let selection_color = [0.2, 0.6, 1.0, 0.9]; // Blue selection border (no animation)
+        let unselected_color = [0.4, 0.4, 0.5, 0.6]; // Dimmer for unselected (no animation)
+        // Handle color: base blue with subtle brightness variation via glow
+        let handle_color = [0.3 * glow, 0.6 * glow, 1.0 * glow, 0.95]; // Subtle internal glow
+        let handle_size = self.ui_scale.px(16.0);
+        let border_width = self.ui_scale.px(3.0);
+        let unselected_border = self.ui_scale.px(2.0);
+
+        // Draw selection + handles for each panel
+        for &(panel_id, orig_x, orig_y, orig_w, orig_h) in panels {
+            let is_selected = selected == Some(panel_id);
+            let color = if is_selected { selection_color } else { unselected_color };
+            let bw = if is_selected { border_width } else { unselected_border };
+
+            // Use reflow position if this panel was displaced, otherwise use original
+            let (x, y, w, h) = if let Some(&(rx, ry, rw, rh)) = reflow_positions.get(panel_id) {
+                (rx, ry, rw, rh) // Panel displaced by reflow - use new position
+            } else {
+                (orig_x, orig_y, orig_w, orig_h) // Not displaced - use original
+            };
+
+            // Check if this panel is being resized - if so, draw at new size
+            let (x, y, w, h) = if let Some((resize_id, delta_x, delta_y)) = resize_preview {
+                if panel_id == resize_id {
+                    // Apply resize delta to the panel being resized
+                    let new_w = (w + delta_x).max(100.0);
+                    let new_h = (h + delta_y).max(50.0);
+                    (x, y, new_w, new_h)
+                } else {
+                    (x, y, w, h)
+                }
+            } else {
+                (x, y, w, h)
+            };
+
+            // Selection border around this panel
+            self.edit_mode_cards.push(
+                CardInstance::new(x, y, w, h, color)
+                    .with_border_width(bw)
+                    .with_corner_radius(self.ui_scale.px(8.0))
+            );
+
+            // Only draw handles on selected panel (or all if none selected)
+            if is_selected || selected.is_none() {
+                // Corner resize handles
+                let corners = [
+                    (x - handle_size / 2.0, y - handle_size / 2.0),                 // Top-left
+                    (x + w - handle_size / 2.0, y - handle_size / 2.0),             // Top-right
+                    (x - handle_size / 2.0, y + h - handle_size / 2.0),             // Bottom-left
+                    (x + w - handle_size / 2.0, y + h - handle_size / 2.0),         // Bottom-right
+                ];
+
+                for (hx, hy) in corners {
+                    self.edit_mode_cards.push(
+                        CardInstance::new(hx, hy, handle_size, handle_size, handle_color)
+                            .with_border_width(self.ui_scale.px(2.0))
+                            .with_corner_radius(self.ui_scale.px(4.0))
+                            .selected()
+                    );
+                }
+
+                // Edge handles (midpoint bars)
+                let edge_width = handle_size * 1.5;
+                let edge_height = handle_size * 0.7;
+
+                // Top and bottom edges (horizontal bars)
+                let h_edges = [
+                    (x + w / 2.0 - edge_width / 2.0, y - edge_height / 2.0),        // Top
+                    (x + w / 2.0 - edge_width / 2.0, y + h - edge_height / 2.0),    // Bottom
+                ];
+                for (hx, hy) in h_edges {
+                    self.edit_mode_cards.push(
+                        CardInstance::new(hx, hy, edge_width, edge_height, handle_color)
+                            .with_border_width(self.ui_scale.px(2.0))
+                            .with_corner_radius(self.ui_scale.px(3.0))
+                            .selected()
+                    );
+                }
+
+                // Left and right edges (vertical bars)
+                let v_edges = [
+                    (x - edge_height / 2.0, y + h / 2.0 - edge_width / 2.0),        // Left
+                    (x + w - edge_height / 2.0, y + h / 2.0 - edge_width / 2.0),    // Right
+                ];
+                for (hx, hy) in v_edges {
+                    self.edit_mode_cards.push(
+                        CardInstance::new(hx, hy, edge_height, edge_width, handle_color)
+                            .with_border_width(self.ui_scale.px(2.0))
+                            .with_corner_radius(self.ui_scale.px(3.0))
+                            .selected()
+                    );
+                }
+            }
+        }
+
+        // Help text at bottom
+        let help_text = "Click panel to select • Drag handles to resize • F2/ESC to exit";
+        self.text_queue.push(
+            help_text,
+            offset_x + content_w / 2.0 - self.ui_scale.px(200.0),
+            offset_y + content_h - self.ui_scale.px(30.0),
+            self.ui_scale.px(14.0),
+            [0.5, 0.7, 1.0, 0.9],
+        );
     }
 
     /// Poll pending screenshot captures (call each frame)

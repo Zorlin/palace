@@ -5,12 +5,17 @@
 //! - Mouse cursor hover detection
 //! - Mouse wheel scrolling
 //! - Hit testing for card positions
+//! - Edit mode panel selection and resize
 
-use crate::state::{AppState, UiScaleOption};
+use crate::panels::{ResizeHandle, UIPanel, UIPanelBounds, UIPanelResizeState};
+use crate::state::{AppState, ProjectAction, UiScaleOption};
 use winit::event::{MouseScrollDelta, Touch, TouchPhase};
 use winit::keyboard::KeyCode;
 
 use super::input::KeyboardInput;
+
+/// Edge detection threshold for ICS-style resize (pixels)
+const EDGE_THRESHOLD: f32 = 20.0;
 
 /// Touch and mouse input handling methods for App
 pub trait TouchInput {
@@ -54,6 +59,14 @@ impl TouchInput for super::App {
             }
             TouchPhase::Ended => {
                 tracing::info!("Touch ended at ({:.0}, {:.0}), id: {:?}", x, y, touch.id);
+
+                // Handle edit mode resize release
+                if self.edit_mode.active && self.edit_mode.ui_resize.is_some() {
+                    self.handle_edit_mode_release(x, y);
+                    self.touch_hold = None;
+                    self.touch_hold_triggered = false;
+                    return;
+                }
 
                 // Handle Primary pill drag drop (state is inside MultiDisplayDialog)
                 // Get values before mutable borrow of self.state
@@ -146,6 +159,12 @@ impl TouchInput for super::App {
             }
             TouchPhase::Moved => {
                 tracing::debug!("Touch moved to ({:.0}, {:.0})", x, y);
+
+                // Handle edit mode resize dragging
+                if self.edit_mode.active && self.edit_mode.ui_resize.is_some() {
+                    self.handle_edit_mode_move(x, y);
+                    return;
+                }
 
                 // Check for hold-to-reveal (300ms threshold for initial trigger)
                 if let Some((start_time, start_x, start_y, _)) = self.touch_hold {
@@ -241,6 +260,15 @@ impl TouchInput for super::App {
 
     /// Handle cursor movement for hover detection
     fn handle_cursor_moved(&mut self, x: f32, y: f32) {
+        // Store cursor position for click handling
+        self.last_cursor_position = Some((x, y));
+
+        // Handle edit mode resize dragging
+        if self.edit_mode.active && self.edit_mode.ui_resize.is_some() {
+            self.handle_edit_mode_move(x, y);
+            return;
+        }
+
         // Handle Primary pill drag in MultiDisplayDialog
         if let AppState::MultiDisplayDialog { primary_pill_drag, .. } = &mut self.state {
             if let Some((source_idx, _, _)) = *primary_pill_drag {
@@ -332,6 +360,23 @@ impl TouchInput for super::App {
     }
 
     fn handle_tap(&mut self, x: f32, y: f32) {
+        // Handle edit mode taps first (panel selection / handle clicks)
+        if self.edit_mode.active {
+            // Refresh ui_panels from renderer before handling tap
+            if let Some(renderer) = self.focused_renderer() {
+                let panels = renderer.compute_ui_panels(&self.state);
+                self.edit_mode.ui_panels = panels
+                    .into_iter()
+                    .map(|(id, px, py, w, h)| UIPanel {
+                        id,
+                        bounds: UIPanelBounds { x: px, y: py, width: w, height: h },
+                    })
+                    .collect();
+            }
+            self.handle_edit_mode_tap(x, y);
+            return;
+        }
+
         // Extract window info before mutable state borrow
         let window_info = self.focused_window
             .and_then(|id| self.windows.get(&id))
@@ -779,6 +824,196 @@ impl TouchInput for super::App {
                     }
                 }
             }
+        }
+    }
+}
+
+/// ICS-style edge detection: detects which edge/handle the point is on
+/// Returns Some(handle) if on an edge, None if inside or outside the panel
+fn detect_edge_handle(x: f32, y: f32, bounds: &UIPanelBounds) -> Option<ResizeHandle> {
+    let left = bounds.x;
+    let right = bounds.right();
+    let top = bounds.y;
+    let bottom = bounds.bottom();
+
+    // Check if within extended bounds (panel bounds + threshold)
+    let in_x_range = x >= left - EDGE_THRESHOLD && x <= right + EDGE_THRESHOLD;
+    let in_y_range = y >= top - EDGE_THRESHOLD && y <= bottom + EDGE_THRESHOLD;
+    if !in_x_range || !in_y_range {
+        return None;
+    }
+
+    // Detect edges (ICS style - entire edge is grabbable)
+    let on_left = x >= left - EDGE_THRESHOLD && x <= left + EDGE_THRESHOLD;
+    let on_right = x >= right - EDGE_THRESHOLD && x <= right + EDGE_THRESHOLD;
+    let on_top = y >= top - EDGE_THRESHOLD && y <= top + EDGE_THRESHOLD;
+    let on_bottom = y >= bottom - EDGE_THRESHOLD && y <= bottom + EDGE_THRESHOLD;
+
+    // Must be within the panel's extent (plus threshold) to count as on that edge
+    let within_horizontal = x >= left - EDGE_THRESHOLD && x <= right + EDGE_THRESHOLD;
+    let within_vertical = y >= top - EDGE_THRESHOLD && y <= bottom + EDGE_THRESHOLD;
+
+    // Corners first (where edges overlap)
+    if on_top && on_left && within_horizontal && within_vertical {
+        return Some(ResizeHandle::TopLeft);
+    }
+    if on_top && on_right && within_horizontal && within_vertical {
+        return Some(ResizeHandle::TopRight);
+    }
+    if on_bottom && on_left && within_horizontal && within_vertical {
+        return Some(ResizeHandle::BottomLeft);
+    }
+    if on_bottom && on_right && within_horizontal && within_vertical {
+        return Some(ResizeHandle::BottomRight);
+    }
+
+    // Edges (only if within the panel's extent on the perpendicular axis)
+    if on_left && within_vertical {
+        return Some(ResizeHandle::Left);
+    }
+    if on_right && within_vertical {
+        return Some(ResizeHandle::Right);
+    }
+    if on_top && within_horizontal {
+        return Some(ResizeHandle::Top);
+    }
+    if on_bottom && within_horizontal {
+        return Some(ResizeHandle::Bottom);
+    }
+
+    None
+}
+
+/// Edit mode touch handling methods
+impl super::App {
+    /// Handle taps in edit mode (panel selection and resize handle detection)
+    pub(crate) fn handle_edit_mode_tap(&mut self, x: f32, y: f32) {
+        // Clone ui_panels to avoid borrow issues
+        let panels: Vec<UIPanel> = self.edit_mode.ui_panels.clone();
+
+        tracing::debug!(
+            "Edit mode tap at ({:.0}, {:.0}), {} panels available",
+            x, y, panels.len()
+        );
+
+        // First, check if tap is on any panel's edge (for resize)
+        for panel in &panels {
+            // Debug: show panel bounds
+            let b = &panel.bounds;
+            tracing::debug!(
+                "  Checking '{}': x={:.0}-{:.0}, y={:.0}-{:.0}",
+                panel.id, b.x, b.x + b.width, b.y, b.y + b.height
+            );
+
+            if let Some(handle) = detect_edge_handle(x, y, &panel.bounds) {
+                tracing::info!(
+                    "Edit mode: Starting resize of '{}' from {:?} handle at ({:.0}, {:.0})",
+                    panel.id, handle, x, y
+                );
+
+                // Start resize operation
+                self.edit_mode.ui_resize = Some(UIPanelResizeState::new(
+                    panel.id,
+                    handle,
+                    panel.bounds,
+                    x,
+                    y,
+                ));
+                self.edit_mode.selected_panel = Some(panel.id);
+                self.request_redraw();
+                return;
+            }
+        }
+
+        // Not on an edge - check if tap is inside any panel (for selection)
+        for panel in &panels {
+            if panel.bounds.contains(x, y) {
+                tracing::info!(
+                    "Edit mode: Selected panel '{}' at ({:.0}, {:.0})",
+                    panel.id, x, y
+                );
+                self.edit_mode.selected_panel = Some(panel.id);
+                self.request_redraw();
+                return;
+            }
+        }
+
+        // Tap outside all panels - deselect
+        if self.edit_mode.selected_panel.is_some() {
+            tracing::info!("Edit mode: Deselected panel (tap outside)");
+            self.edit_mode.selected_panel = None;
+            self.request_redraw();
+        }
+    }
+
+    /// Handle touch/mouse move during edit mode (for resize dragging)
+    pub(crate) fn handle_edit_mode_move(&mut self, x: f32, y: f32) {
+        if let Some(ref mut resize) = self.edit_mode.ui_resize {
+            let delta_x = x - resize.start_pos.0;
+            let delta_y = y - resize.start_pos.1;
+            tracing::debug!(
+                "Edit mode move: panel='{}' delta=({:.0}, {:.0})",
+                resize.panel_id, delta_x, delta_y
+            );
+            resize.current_pos = (x, y);
+
+            // Compute reflow for displaced panels
+            if let Some(window_id) = self.focused_window {
+                if let Some(palace_window) = self.windows.get(&window_id) {
+                    let size = palace_window.window.inner_size();
+                    let screen_width = size.width as f32;
+                    let screen_height = size.height as f32;
+                    self.edit_mode.compute_reflow(
+                        &mut self.panel_layout,
+                        screen_width,
+                        screen_height,
+                    );
+                }
+            }
+
+            self.request_redraw();
+        }
+    }
+
+    /// Handle touch/mouse release during edit mode (finish resize)
+    pub(crate) fn handle_edit_mode_release(&mut self, _x: f32, _y: f32) {
+        // Check if reflow solution was valid (must check before taking ui_resize)
+        let reflow_valid = self.edit_mode.reflow_solution
+            .as_ref()
+            .map(|s| s.valid)
+            .unwrap_or(true);
+
+        if reflow_valid {
+            // Apply resize to panel_overrides BEFORE taking ui_resize
+            // This persists the new position for the resized panel and any displaced panels
+            self.edit_mode.apply_resize_to_overrides();
+        }
+
+        if let Some(resize) = self.edit_mode.ui_resize.take() {
+            let delta_x = resize.current_pos.0 - resize.start_pos.0;
+            let delta_y = resize.current_pos.1 - resize.start_pos.1;
+
+            if reflow_valid {
+                tracing::info!(
+                    "Edit mode: Finished resize of '{}' - delta: ({:.0}, {:.0}), applied to overrides",
+                    resize.panel_id, delta_x, delta_y
+                );
+
+                // Log override count
+                tracing::info!(
+                    "  Panel overrides now contains {} panels",
+                    self.edit_mode.panel_overrides.len()
+                );
+            } else {
+                tracing::warn!(
+                    "Edit mode: Resize of '{}' blocked - no valid reflow solution",
+                    resize.panel_id
+                );
+            }
+
+            // Clear reflow state (previews already applied to overrides)
+            self.edit_mode.clear_reflow();
+            self.request_redraw();
         }
     }
 }

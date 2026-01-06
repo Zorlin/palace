@@ -3,6 +3,7 @@ mod app;
 mod debug;
 mod display;
 mod palace_window;
+mod panels;
 mod persistence;
 mod projects;
 mod renderer;
