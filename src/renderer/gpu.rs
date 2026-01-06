@@ -1474,7 +1474,9 @@ impl Renderer {
                 self.build_project_cards(projects, *selected_index)
             }
             AppState::ProjectView { selected_action, .. } => {
-                self.build_action_cards(*selected_action)
+                // Look up action_menu bounds from reflow_positions for real-time resize
+                let menu_bounds = reflow_positions.get("action_menu").copied();
+                self.build_action_cards(*selected_action, menu_bounds)
             }
             AppState::PalaceLoop { cards, focused_index, hovered_index, card_scroll_offset, generating, .. } => {
                 // Show "+" card once we have cards (even while generating more) or when generation is done
@@ -1525,7 +1527,9 @@ impl Renderer {
                     self.queue_project_chooser_text(projects, *selected_index);
                 }
                 AppState::ProjectView { project_path, selected_action } => {
-                    self.queue_project_view_text(project_path, *selected_action);
+                    let context_bounds = reflow_positions.get("context_widget").copied();
+                    let menu_bounds = reflow_positions.get("action_menu").copied();
+                    self.queue_project_view_text(project_path, *selected_action, context_bounds, menu_bounds);
                 }
                 AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, hovered_index, detail_scroll_offset, card_scroll_offset, generating, .. } => {
                     let show_add_card = !cards.is_empty() || !generating;
@@ -1787,7 +1791,9 @@ impl Renderer {
                     self.queue_project_chooser_text(projects, *selected_index);
                 }
                 AppState::ProjectView { project_path, selected_action } => {
-                    self.queue_project_view_text(project_path, *selected_action);
+                    let context_bounds = reflow_positions.get("context_widget").copied();
+                    let menu_bounds = reflow_positions.get("action_menu").copied();
+                    self.queue_project_view_text(project_path, *selected_action, context_bounds, menu_bounds);
                 }
                 AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, hovered_index, detail_scroll_offset, card_scroll_offset, generating, .. } => {
                     let show_add_card = !cards.is_empty() || !generating;
@@ -1924,7 +1930,9 @@ impl Renderer {
                     self.queue_project_chooser_text(projects, *selected_index);
                 }
                 AppState::ProjectView { project_path, selected_action } => {
-                    self.queue_project_view_text(project_path, *selected_action);
+                    let context_bounds = reflow_positions.get("context_widget").copied();
+                    let menu_bounds = reflow_positions.get("action_menu").copied();
+                    self.queue_project_view_text(project_path, *selected_action, context_bounds, menu_bounds);
                 }
                 AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, hovered_index, detail_scroll_offset, card_scroll_offset, generating, .. } => {
                     let show_add_card = !cards.is_empty() || !generating;
@@ -2074,34 +2082,55 @@ impl Renderer {
             .collect()
     }
 
-    fn build_action_cards(&self, selected: usize) -> Vec<CardInstance> {
+    fn build_action_cards(&self, selected: usize, panel_bounds: Option<(f32, f32, f32, f32)>) -> Vec<CardInstance> {
         use crate::state::ProjectAction;
 
         let (content_w, _content_h) = self.content_size();
         let (offset_x, offset_y) = self.content_offset();
 
         let actions = ProjectAction::all();
-        let left_margin = self.ui_scale.px(60.0);
-        let title_scale = self.ui_scale.px(40.0);
-        let top_margin = self.ui_scale.px(40.0);
-        let menu_start_y = top_margin + title_scale + self.ui_scale.px(60.0);
-        let card_width = content_w - left_margin * 2.0;
-        let card_height = self.ui_scale.px(70.0);
-        let card_gap = self.ui_scale.px(16.0);
+        let action_count = actions.len() as f32;
+
+        // Use panel bounds if provided, otherwise calculate defaults
+        let (menu_x, menu_y, menu_w, menu_h) = if let Some((px, py, pw, ph)) = panel_bounds {
+            (px, py, pw, ph)
+        } else {
+            let left_margin = self.ui_scale.px(60.0);
+            let title_scale = self.ui_scale.px(40.0);
+            let top_margin = self.ui_scale.px(40.0);
+            let menu_start_y = top_margin + title_scale + self.ui_scale.px(60.0);
+            let card_width = content_w - left_margin * 2.0;
+            let card_height = self.ui_scale.px(70.0);
+            let card_gap = self.ui_scale.px(16.0);
+            let menu_height = action_count * (card_height + card_gap) - card_gap;
+            (offset_x + left_margin, offset_y + menu_start_y, card_width, menu_height)
+        };
+
+        // Calculate card dimensions dynamically based on panel bounds
+        // Gap is proportional to panel height (roughly 15% of card+gap goes to gap)
+        let padding = (menu_w * 0.01).max(2.0).min(self.ui_scale.px(5.0));
+        let total_gap_space = menu_h * 0.12; // 12% of height for gaps
+        let card_gap = total_gap_space / (action_count - 1.0).max(1.0);
+        let card_width = menu_w - padding * 2.0;
+        let card_height = (menu_h - padding * 2.0 - card_gap * (action_count - 1.0)) / action_count;
 
         // Action color - purple accent
         let action_color = [0.5, 0.3, 0.8, 1.0];
+
+        // Scale border and corner radius based on card size
+        let size_factor = (card_height / self.ui_scale.px(70.0)).clamp(0.3, 2.0);
 
         actions
             .iter()
             .enumerate()
             .map(|(i, _action)| {
-                let y = menu_start_y + i as f32 * (card_height + card_gap);
+                let x = menu_x + padding;
+                let y = menu_y + padding + i as f32 * (card_height + card_gap);
                 let is_selected = i == selected;
 
-                let mut card = CardInstance::new(left_margin + offset_x, y + offset_y, card_width, card_height, action_color)
-                    .with_border_width(self.ui_scale.px(if is_selected { 3.0 } else { 1.5 }))
-                    .with_corner_radius(self.ui_scale.px(12.0));
+                let mut card = CardInstance::new(x, y, card_width, card_height, action_color)
+                    .with_border_width(self.ui_scale.px(if is_selected { 3.0 } else { 1.5 }) * size_factor)
+                    .with_corner_radius(self.ui_scale.px(12.0) * size_factor);
 
                 if is_selected {
                     card = card.selected();
@@ -4287,15 +4316,17 @@ impl Renderer {
         }
     }
 
-    fn queue_project_view_text(&mut self, project_path: &std::path::Path, selected_action: usize) {
+    fn queue_project_view_text(
+        &mut self,
+        project_path: &std::path::Path,
+        selected_action: usize,
+        context_bounds: Option<(f32, f32, f32, f32)>,
+        menu_bounds: Option<(f32, f32, f32, f32)>,
+    ) {
         use crate::state::ProjectAction;
 
         let (_content_w, _content_h) = self.content_size();
         let (offset_x, offset_y) = self.content_offset();
-
-        let title_scale = self.ui_scale.px(36.0);
-        let left_margin = self.ui_scale.px(60.0);
-        let top_margin = self.ui_scale.px(40.0);
 
         let project_name = project_path
             .file_name()
@@ -4303,27 +4334,69 @@ impl Renderer {
             .unwrap_or("Unknown");
         let path_str = project_path.to_string_lossy();
 
-        let actions = ProjectAction::all();
-        let card_height = self.ui_scale.px(70.0);
-        let card_gap = self.ui_scale.px(16.0);
-        let menu_start_y = offset_y + top_margin + title_scale + self.ui_scale.px(60.0);
-        let text_margin = self.ui_scale.px(20.0);
+        // Context widget bounds (title + path)
+        let (ctx_x, ctx_y, ctx_w, ctx_h) = if let Some((px, py, pw, ph)) = context_bounds {
+            (px, py, pw, ph)
+        } else {
+            let title_scale = self.ui_scale.px(36.0);
+            let left_margin = self.ui_scale.px(60.0);
+            let top_margin = self.ui_scale.px(40.0);
+            (offset_x + left_margin, offset_y + top_margin, self.ui_scale.px(300.0), title_scale + self.ui_scale.px(30.0))
+        };
+
+        // Calculate title text size based on context panel height
+        let base_title_scale = self.ui_scale.px(36.0);
+        let title_scale = if context_bounds.is_some() {
+            // Scale title to fit context panel - roughly 40% of height for title
+            (ctx_h * 0.4).clamp(self.ui_scale.px(14.0), self.ui_scale.px(48.0))
+        } else {
+            base_title_scale
+        };
+        let subtitle_scale = (title_scale * 0.4).clamp(self.ui_scale.px(10.0), self.ui_scale.px(18.0));
+        let padding = (ctx_w * 0.02).max(2.0).min(self.ui_scale.px(8.0));
 
         // Title
-        self.text_queue.push(project_name, offset_x + left_margin, offset_y + top_margin, title_scale, [1.0, 1.0, 1.0, 1.0]);
+        self.text_queue.push(project_name, ctx_x + padding, ctx_y + padding, title_scale, [1.0, 1.0, 1.0, 1.0]);
 
         // Path subtitle
         self.text_queue.push(
             path_str.as_ref(),
-            offset_x + left_margin,
-            offset_y + top_margin + title_scale + self.ui_scale.px(8.0),
-            self.ui_scale.px(14.0),
+            ctx_x + padding,
+            ctx_y + padding + title_scale + padding,
+            subtitle_scale,
             [0.4, 0.4, 0.5, 1.0],
         );
 
+        // Menu bounds for action labels
+        let actions = ProjectAction::all();
+        let action_count = actions.len() as f32;
+        let (menu_x, menu_y, menu_w, menu_h) = if let Some((px, py, pw, ph)) = menu_bounds {
+            (px, py, pw, ph)
+        } else {
+            let left_margin = self.ui_scale.px(60.0);
+            let top_margin = self.ui_scale.px(40.0);
+            let menu_start_y = offset_y + top_margin + base_title_scale + self.ui_scale.px(60.0);
+            let card_height = self.ui_scale.px(70.0);
+            let card_gap = self.ui_scale.px(16.0);
+            let menu_height = action_count * (card_height + card_gap) - card_gap;
+            (offset_x + left_margin, menu_start_y, _content_w - left_margin * 2.0, menu_height)
+        };
+
+        // Calculate card dimensions dynamically (must match build_action_cards)
+        let menu_padding = (menu_w * 0.01).max(2.0).min(self.ui_scale.px(5.0));
+        let total_gap_space = menu_h * 0.12;
+        let card_gap = total_gap_space / (action_count - 1.0).max(1.0);
+        let card_height = (menu_h - menu_padding * 2.0 - card_gap * (action_count - 1.0)) / action_count;
+
+        // Scale text sizes based on card height
+        let size_factor = (card_height / self.ui_scale.px(70.0)).clamp(0.3, 2.0);
+        let label_scale = self.ui_scale.px(22.0) * size_factor;
+        let desc_scale = self.ui_scale.px(12.0) * size_factor;
+        let text_margin = self.ui_scale.px(20.0) * size_factor;
+
         // Action labels and descriptions
         for (i, action) in actions.iter().enumerate() {
-            let y = menu_start_y + i as f32 * (card_height + card_gap);
+            let y = menu_y + menu_padding + i as f32 * (card_height + card_gap);
             let is_selected = i == selected_action;
             let label_color = if is_selected {
                 [1.0, 1.0, 1.0, 1.0]
@@ -4333,17 +4406,17 @@ impl Renderer {
 
             self.text_queue.push(
                 action.label(),
-                offset_x + left_margin + text_margin,
+                menu_x + menu_padding + text_margin,
                 y + text_margin,
-                self.ui_scale.px(22.0),
+                label_scale,
                 label_color,
             );
 
             self.text_queue.push(
                 action.description(),
-                offset_x + left_margin + text_margin,
-                y + text_margin + self.ui_scale.px(28.0),
-                self.ui_scale.px(12.0),
+                menu_x + menu_padding + text_margin,
+                y + text_margin + label_scale * 1.2,
+                desc_scale,
                 [0.45, 0.45, 0.5, 1.0],
             );
         }

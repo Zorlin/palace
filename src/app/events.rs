@@ -287,10 +287,14 @@ impl ApplicationHandler<AppEvent> for App {
                             }
                         }
                         ElementState::Released => {
-                            // Handle mouse button release for edit mode resize
-                            if self.edit_mode.active && self.edit_mode.ui_resize.is_some() {
+                            // Handle mouse button release for edit mode resize or drag
+                            if self.edit_mode.active {
                                 if let Some(ref resize) = self.edit_mode.ui_resize {
                                     let (x, y) = resize.current_pos;
+                                    self.handle_edit_mode_release(x, y);
+                                    self.request_redraw();
+                                } else if let Some(ref drag) = self.edit_mode.ui_drag {
+                                    let (x, y) = drag.current_pos;
                                     self.handle_edit_mode_release(x, y);
                                     self.request_redraw();
                                 }
@@ -354,6 +358,14 @@ impl ApplicationHandler<AppEvent> for App {
                     } else {
                         None
                     };
+
+                    // Compute drag preview bounds for the actively dragging panel
+                    if let Some(ref drag) = self.edit_mode.ui_drag {
+                        let (new_x, new_y) = drag.current_pos;
+                        let orig = drag.original_bounds;
+                        // Add drag preview to panel_positions so renderer draws it at new position
+                        panel_positions.insert(drag.panel_id, (new_x, new_y, orig.width, orig.height));
+                    }
 
                     match palace_window.renderer.render_with_screenshot(
                         &self.state,

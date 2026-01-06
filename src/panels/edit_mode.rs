@@ -109,6 +109,9 @@ pub struct EditModeState {
     /// UI panel being resized (for static UI panels)
     pub ui_resize: Option<UIPanelResizeState>,
 
+    /// UI panel being dragged (for static UI panels)
+    pub ui_drag: Option<UIPanelDragState>,
+
     /// Long press tracking for edit mode entry
     pub long_press: Option<LongPressState>,
 
@@ -197,6 +200,19 @@ pub struct UIPanelResizeState {
     pub current_pos: (f32, f32),
 }
 
+/// State for UI panel drag operation (moving entire panel)
+#[derive(Debug, Clone)]
+pub struct UIPanelDragState {
+    /// Panel being dragged (id string)
+    pub panel_id: &'static str,
+    /// Original pixel bounds before drag
+    pub original_bounds: UIPanelBounds,
+    /// Offset from panel corner to mouse position at drag start
+    pub grab_offset: (f32, f32),
+    /// Current panel position (top-left corner)
+    pub current_pos: (f32, f32),
+}
+
 impl UIPanelResizeState {
     pub fn new(panel_id: &'static str, handle: ResizeHandle, bounds: UIPanelBounds, x: f32, y: f32) -> Self {
         Self {
@@ -222,6 +238,7 @@ impl EditModeState {
             dragging: None,
             resizing: None,
             ui_resize: None,
+            ui_drag: None,
             long_press: None,
             panel_chooser_open: false,
             spawn_target: None,
@@ -242,6 +259,7 @@ impl EditModeState {
         self.dragging = None;
         self.resizing = None;
         self.ui_resize = None;
+        self.ui_drag = None;
         self.panel_chooser_open = false;
         self.spawn_target = None;
         self.ghost_position = None;
@@ -255,6 +273,7 @@ impl EditModeState {
         self.dragging = None;
         self.resizing = None;
         self.ui_resize = None;
+        self.ui_drag = None;
         self.panel_chooser_open = false;
         self.spawn_target = None;
         self.ghost_position = None;
@@ -673,6 +692,107 @@ impl EditModeState {
         self.reflow_solution = None;
     }
 
+    /// Compute reflow during UI panel drag (ICS-style collision detection)
+    ///
+    /// Similar to compute_reflow but for drag operations instead of resize.
+    pub fn compute_drag_reflow(
+        &mut self,
+        layout: &mut PanelLayout,
+        screen_width: f32,
+        screen_height: f32,
+    ) {
+        // Clear previous previews
+        self.reflow_previews.clear();
+        self.reflow_solution = None;
+
+        // Get current drag state
+        let drag = match &self.ui_drag {
+            Some(d) => d,
+            None => return,
+        };
+
+        // Map string IDs to numeric IDs for the layout system
+        let panel_ids: HashMap<&str, PanelId> = self.ui_panels
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.id, i as PanelId + 1))
+            .collect();
+
+        let reverse_ids: HashMap<PanelId, &'static str> = panel_ids
+            .iter()
+            .map(|(&name, &id)| (id, name))
+            .collect();
+
+        // Get the ID of the panel being dragged
+        let dragging_id = match panel_ids.get(drag.panel_id) {
+            Some(&id) => id,
+            None => return,
+        };
+
+        // Reconfigure layout for current screen size (~40px cells)
+        *layout = PanelLayout::for_screen_size(screen_width, screen_height);
+
+        // Populate layout with current UI panel positions
+        for panel in &self.ui_panels {
+            if let Some(&id) = panel_ids.get(panel.id) {
+                let grid_pos = layout.grid_position_from_pixels(
+                    panel.bounds.x,
+                    panel.bounds.y,
+                    panel.bounds.width,
+                    panel.bounds.height,
+                    screen_width,
+                    screen_height,
+                );
+                layout.force_set_position(id, grid_pos);
+            }
+        }
+
+        // Calculate the new position for the dragging panel
+        let (new_x, new_y) = drag.current_pos;
+        let orig = drag.original_bounds;
+
+        // Convert new pixel bounds to grid position (same size, new location)
+        let new_grid_pos = layout.grid_position_from_pixels(
+            new_x, new_y, orig.width, orig.height,
+            screen_width, screen_height,
+        );
+
+        tracing::trace!(
+            "Dragging '{}' to pixel ({:.0},{:.0}) -> grid ({},{}) {}x{}",
+            drag.panel_id, new_x, new_y,
+            new_grid_pos.start.col, new_grid_pos.start.row, new_grid_pos.width, new_grid_pos.height
+        );
+
+        // Use Outward direction for drag (push panels away from drag point)
+        let direction = PushDirection::Outward;
+
+        // Run the reflow algorithm
+        let solution = layout.find_reorder_solution(dragging_id, new_grid_pos.clone(), direction);
+
+        tracing::trace!(
+            "Drag reflow solution: valid={}, moves={}",
+            solution.valid, solution.moves.len()
+        );
+
+        if solution.valid && solution.has_moves() {
+            // Convert grid moves back to pixel previews
+            for (&id, (orig_pos, new_pos)) in &solution.moves {
+                if let Some(&name) = reverse_ids.get(&id) {
+                    let bounds = layout.bounds_for(new_pos, screen_width, screen_height);
+                    self.reflow_previews.insert(name, (bounds.x, bounds.y, bounds.width, bounds.height));
+                    tracing::debug!(
+                        "Drag reflow: '{}' displaced from ({},{}) to ({},{}) -> pixel ({:.0},{:.0})",
+                        name, orig_pos.start.col, orig_pos.start.row,
+                        new_pos.start.col, new_pos.start.row,
+                        bounds.x, bounds.y
+                    );
+                }
+            }
+        }
+
+        self.reflow_solution = Some(solution);
+    }
+
     /// Apply the current resize operation to panel_overrides
     ///
     /// Call this on release to persist the new panel position.
@@ -704,6 +824,34 @@ impl EditModeState {
             self.panel_overrides.insert(panel_id, (x, y, w, h));
             tracing::debug!(
                 "Applied reflow override for '{}': ({:.0}, {:.0}, {:.0}, {:.0})",
+                panel_id, x, y, w, h
+            );
+        }
+    }
+
+    /// Apply the current drag operation to panel_overrides
+    ///
+    /// Call this on release to persist the new panel position.
+    /// Also applies any reflow moves from displaced panels.
+    pub fn apply_drag_to_overrides(&mut self) {
+        // Get drag state (must still be present)
+        if let Some(ref drag) = self.ui_drag {
+            let (new_x, new_y) = drag.current_pos;
+            let orig = drag.original_bounds;
+
+            // Store override for the dragged panel (same size, new position)
+            self.panel_overrides.insert(drag.panel_id, (new_x, new_y, orig.width, orig.height));
+            tracing::debug!(
+                "Applied drag override for '{}': ({:.0}, {:.0}, {:.0}, {:.0})",
+                drag.panel_id, new_x, new_y, orig.width, orig.height
+            );
+        }
+
+        // Apply reflow positions for displaced panels
+        for (&panel_id, &(x, y, w, h)) in &self.reflow_previews {
+            self.panel_overrides.insert(panel_id, (x, y, w, h));
+            tracing::debug!(
+                "Applied drag reflow override for '{}': ({:.0}, {:.0}, {:.0}, {:.0})",
                 panel_id, x, y, w, h
             );
         }

@@ -9,7 +9,7 @@ mod layout;
 mod registry;
 
 pub use bounds::{GridCell, GridPosition, PanelBounds};
-pub use edit_mode::{available_panel_types, EditModeState, PanelTypeInfo, ResizeHandle, UIPanel, UIPanelBounds, UIPanelResizeState, LONG_PRESS_THRESHOLD};
+pub use edit_mode::{available_panel_types, EditModeState, PanelTypeInfo, ResizeHandle, UIPanel, UIPanelBounds, UIPanelDragState, UIPanelResizeState, LONG_PRESS_THRESHOLD};
 pub use layout::{LayoutPreset, PanelLayout, PushDirection, ReorderSolution};
 pub use registry::{PanelId, PanelRegistry};
 

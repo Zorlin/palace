@@ -60,8 +60,8 @@ impl TouchInput for super::App {
             TouchPhase::Ended => {
                 tracing::info!("Touch ended at ({:.0}, {:.0}), id: {:?}", x, y, touch.id);
 
-                // Handle edit mode resize release
-                if self.edit_mode.active && self.edit_mode.ui_resize.is_some() {
+                // Handle edit mode resize or drag release
+                if self.edit_mode.active && (self.edit_mode.ui_resize.is_some() || self.edit_mode.ui_drag.is_some()) {
                     self.handle_edit_mode_release(x, y);
                     self.touch_hold = None;
                     self.touch_hold_triggered = false;
@@ -160,8 +160,8 @@ impl TouchInput for super::App {
             TouchPhase::Moved => {
                 tracing::debug!("Touch moved to ({:.0}, {:.0})", x, y);
 
-                // Handle edit mode resize dragging
-                if self.edit_mode.active && self.edit_mode.ui_resize.is_some() {
+                // Handle edit mode resize or drag
+                if self.edit_mode.active && (self.edit_mode.ui_resize.is_some() || self.edit_mode.ui_drag.is_some()) {
                     self.handle_edit_mode_move(x, y);
                     return;
                 }
@@ -263,8 +263,8 @@ impl TouchInput for super::App {
         // Store cursor position for click handling
         self.last_cursor_position = Some((x, y));
 
-        // Handle edit mode resize dragging
-        if self.edit_mode.active && self.edit_mode.ui_resize.is_some() {
+        // Handle edit mode resize or drag
+        if self.edit_mode.active && (self.edit_mode.ui_resize.is_some() || self.edit_mode.ui_drag.is_some()) {
             self.handle_edit_mode_move(x, y);
             return;
         }
@@ -925,13 +925,24 @@ impl super::App {
             }
         }
 
-        // Not on an edge - check if tap is inside any panel (for selection)
+        // Not on an edge - check if tap is inside any panel (for drag/selection)
         for panel in &panels {
             if panel.bounds.contains(x, y) {
                 tracing::info!(
-                    "Edit mode: Selected panel '{}' at ({:.0}, {:.0})",
+                    "Edit mode: Starting drag of '{}' at ({:.0}, {:.0})",
                     panel.id, x, y
                 );
+
+                // Calculate offset from panel corner to mouse position
+                let grab_offset = (x - panel.bounds.x, y - panel.bounds.y);
+
+                // Start drag operation
+                self.edit_mode.ui_drag = Some(crate::panels::UIPanelDragState {
+                    panel_id: panel.id,
+                    original_bounds: panel.bounds,
+                    grab_offset,
+                    current_pos: (panel.bounds.x, panel.bounds.y),
+                });
                 self.edit_mode.selected_panel = Some(panel.id);
                 self.request_redraw();
                 return;
@@ -946,13 +957,14 @@ impl super::App {
         }
     }
 
-    /// Handle touch/mouse move during edit mode (for resize dragging)
+    /// Handle touch/mouse move during edit mode (for resize or drag)
     pub(crate) fn handle_edit_mode_move(&mut self, x: f32, y: f32) {
+        // Handle resize
         if let Some(ref mut resize) = self.edit_mode.ui_resize {
             let delta_x = x - resize.start_pos.0;
             let delta_y = y - resize.start_pos.1;
             tracing::debug!(
-                "Edit mode move: panel='{}' delta=({:.0}, {:.0})",
+                "Edit mode resize move: panel='{}' delta=({:.0}, {:.0})",
                 resize.panel_id, delta_x, delta_y
             );
             resize.current_pos = (x, y);
@@ -972,48 +984,121 @@ impl super::App {
             }
 
             self.request_redraw();
+            return;
+        }
+
+        // Handle drag
+        if let Some(ref mut drag) = self.edit_mode.ui_drag {
+            // Calculate new position (mouse position minus grab offset)
+            let new_x = x - drag.grab_offset.0;
+            let new_y = y - drag.grab_offset.1;
+            tracing::debug!(
+                "Edit mode drag move: panel='{}' pos=({:.0}, {:.0})",
+                drag.panel_id, new_x, new_y
+            );
+            drag.current_pos = (new_x, new_y);
+
+            // Compute reflow for displaced panels during drag (ICS-style collision)
+            if let Some(window_id) = self.focused_window {
+                if let Some(palace_window) = self.windows.get(&window_id) {
+                    let size = palace_window.window.inner_size();
+                    let screen_width = size.width as f32;
+                    let screen_height = size.height as f32;
+                    self.edit_mode.compute_drag_reflow(
+                        &mut self.panel_layout,
+                        screen_width,
+                        screen_height,
+                    );
+                }
+            }
+
+            self.request_redraw();
         }
     }
 
-    /// Handle touch/mouse release during edit mode (finish resize)
+    /// Handle touch/mouse release during edit mode (finish resize or drag)
     pub(crate) fn handle_edit_mode_release(&mut self, _x: f32, _y: f32) {
-        // Check if reflow solution was valid (must check before taking ui_resize)
-        let reflow_valid = self.edit_mode.reflow_solution
-            .as_ref()
-            .map(|s| s.valid)
-            .unwrap_or(true);
-
-        if reflow_valid {
-            // Apply resize to panel_overrides BEFORE taking ui_resize
-            // This persists the new position for the resized panel and any displaced panels
-            self.edit_mode.apply_resize_to_overrides();
-        }
-
-        if let Some(resize) = self.edit_mode.ui_resize.take() {
-            let delta_x = resize.current_pos.0 - resize.start_pos.0;
-            let delta_y = resize.current_pos.1 - resize.start_pos.1;
+        // Handle resize release
+        if self.edit_mode.ui_resize.is_some() {
+            // Check if reflow solution was valid (must check before taking ui_resize)
+            let reflow_valid = self.edit_mode.reflow_solution
+                .as_ref()
+                .map(|s| s.valid)
+                .unwrap_or(true);
 
             if reflow_valid {
-                tracing::info!(
-                    "Edit mode: Finished resize of '{}' - delta: ({:.0}, {:.0}), applied to overrides",
-                    resize.panel_id, delta_x, delta_y
-                );
-
-                // Log override count
-                tracing::info!(
-                    "  Panel overrides now contains {} panels",
-                    self.edit_mode.panel_overrides.len()
-                );
-            } else {
-                tracing::warn!(
-                    "Edit mode: Resize of '{}' blocked - no valid reflow solution",
-                    resize.panel_id
-                );
+                // Apply resize to panel_overrides BEFORE taking ui_resize
+                // This persists the new position for the resized panel and any displaced panels
+                self.edit_mode.apply_resize_to_overrides();
             }
 
-            // Clear reflow state (previews already applied to overrides)
-            self.edit_mode.clear_reflow();
-            self.request_redraw();
+            if let Some(resize) = self.edit_mode.ui_resize.take() {
+                let delta_x = resize.current_pos.0 - resize.start_pos.0;
+                let delta_y = resize.current_pos.1 - resize.start_pos.1;
+
+                if reflow_valid {
+                    tracing::info!(
+                        "Edit mode: Finished resize of '{}' - delta: ({:.0}, {:.0}), applied to overrides",
+                        resize.panel_id, delta_x, delta_y
+                    );
+
+                    // Log override count
+                    tracing::info!(
+                        "  Panel overrides now contains {} panels",
+                        self.edit_mode.panel_overrides.len()
+                    );
+                } else {
+                    tracing::warn!(
+                        "Edit mode: Resize of '{}' blocked - no valid reflow solution",
+                        resize.panel_id
+                    );
+                }
+
+                // Clear reflow state (previews already applied to overrides)
+                self.edit_mode.clear_reflow();
+                self.request_redraw();
+            }
+            return;
+        }
+
+        // Handle drag release
+        if self.edit_mode.ui_drag.is_some() {
+            // Check if reflow solution was valid
+            let reflow_valid = self.edit_mode.reflow_solution
+                .as_ref()
+                .map(|s| s.valid)
+                .unwrap_or(true);
+
+            if reflow_valid {
+                // Apply drag to panel_overrides and any displaced panels
+                self.edit_mode.apply_drag_to_overrides();
+            }
+
+            if let Some(drag) = self.edit_mode.ui_drag.take() {
+                let (new_x, new_y) = drag.current_pos;
+                let orig = drag.original_bounds;
+
+                if reflow_valid {
+                    tracing::info!(
+                        "Edit mode: Finished drag of '{}' - from ({:.0}, {:.0}) to ({:.0}, {:.0}), applied to overrides",
+                        drag.panel_id, orig.x, orig.y, new_x, new_y
+                    );
+
+                    tracing::info!(
+                        "  Panel overrides now contains {} panels",
+                        self.edit_mode.panel_overrides.len()
+                    );
+                } else {
+                    tracing::warn!(
+                        "Edit mode: Drag of '{}' blocked - no valid reflow solution",
+                        drag.panel_id
+                    );
+                }
+
+                // Clear reflow state
+                self.edit_mode.clear_reflow();
+                self.request_redraw();
+            }
         }
     }
 }
