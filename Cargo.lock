@@ -143,9 +143,12 @@ name = "anthropic-ffi"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "dirs",
+ "libloading",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
+ "tracing",
 ]
 
 [[package]]

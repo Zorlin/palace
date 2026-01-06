@@ -1,7 +1,11 @@
+mod builder;
+
+pub use builder::{ensure_library, get_lib_cache_path, go_available};
+
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once};
 
 /// Event type constants (must match Go side)
 pub const EVENT_TEXT: c_int = 0;
@@ -22,32 +26,69 @@ pub type StreamCallback = extern "C" fn(event_type: c_int, data: *const c_char);
 /// Returns a C string with the tool result (caller must free)
 pub type ToolExecutor = extern "C" fn(tool_name: *const c_char, tool_input: *const c_char) -> *mut c_char;
 
-#[link(name = "anthropic")]
-extern "C" {
-    fn anthropic_init_with_base(api_key: *const c_char, base_url: *const c_char) -> i32;
-    fn anthropic_message(
-        model: *const c_char,
-        system_prompt: *const c_char,
-        user_message: *const c_char,
-        max_tokens: i32,
-    ) -> *mut c_char;
-    fn anthropic_message_stream(
-        model: *const c_char,
-        system_prompt: *const c_char,
-        user_message: *const c_char,
-        max_tokens: i32,
-        callback: StreamCallback,
-    );
-    fn anthropic_agentic_loop(
-        model: *const c_char,
-        system_prompt: *const c_char,
-        user_message: *const c_char,
-        max_tokens: i32,
-        tools_json: *const c_char,
-        callback: StreamCallback,
-        tool_executor: ToolExecutor,
-    );
-    fn anthropic_free_string(s: *mut c_char);
+/// Dynamically loaded FFI function types
+type AnthropicInitWithBase = unsafe extern "C" fn(api_key: *const c_char, base_url: *const c_char) -> i32;
+type AnthropicMessage = unsafe extern "C" fn(
+    model: *const c_char,
+    system_prompt: *const c_char,
+    user_message: *const c_char,
+    max_tokens: i32,
+) -> *mut c_char;
+type AnthropicMessageStream = unsafe extern "C" fn(
+    model: *const c_char,
+    system_prompt: *const c_char,
+    user_message: *const c_char,
+    max_tokens: i32,
+    callback: StreamCallback,
+);
+type AnthropicAgenticLoop = unsafe extern "C" fn(
+    model: *const c_char,
+    system_prompt: *const c_char,
+    user_message: *const c_char,
+    max_tokens: i32,
+    tools_json: *const c_char,
+    callback: StreamCallback,
+    tool_executor: ToolExecutor,
+);
+type AnthropicFreeString = unsafe extern "C" fn(s: *mut c_char);
+
+/// Global library handle (loaded once)
+static LIB_INIT: Once = Once::new();
+static mut LIB_HANDLE: Option<Arc<libloading::Library>> = None;
+
+/// Load the library once
+fn get_library() -> Result<Arc<libloading::Library>, AnthropicError> {
+    unsafe {
+        let mut init_error = None;
+
+        LIB_INIT.call_once(|| {
+            match load_library_inner() {
+                Ok(lib) => LIB_HANDLE = Some(Arc::new(lib)),
+                Err(e) => init_error = Some(e),
+            }
+        });
+
+        if let Some(err) = init_error {
+            return Err(err);
+        }
+
+        LIB_HANDLE.clone().ok_or_else(|| {
+            AnthropicError::InitError("Library not initialized".to_string())
+        })
+    }
+}
+
+/// Inner function to load the library
+fn load_library_inner() -> Result<libloading::Library, AnthropicError> {
+    let lib_path = ensure_library()
+        .map_err(|e| AnthropicError::InitError(format!("Failed to get library: {}", e)))?;
+
+    tracing::debug!("Loading libanthropic.so from {:?}", lib_path);
+
+    unsafe {
+        libloading::Library::new(&lib_path)
+            .map_err(|e| AnthropicError::InitError(format!("Failed to load library: {}", e)))
+    }
 }
 
 static INIT: Once = Once::new();
@@ -92,6 +133,9 @@ impl Client {
     /// If api_key is None, checks environment variables in order:
     /// ANTHROPIC_API_KEY, ZAI_API_KEY, OPENAI_API_KEY
     pub fn new(api_key: Option<&str>) -> Result<Self, AnthropicError> {
+        // Ensure library is loaded
+        let lib = get_library()?;
+
         let mut result = Ok(());
 
         INIT.call_once(|| {
@@ -124,7 +168,12 @@ impl Client {
                 .map(|s| s.as_ptr())
                 .unwrap_or(std::ptr::null());
 
-            let ret = unsafe { anthropic_init_with_base(key_cstr.as_ptr(), base_ptr) };
+            let ret = unsafe {
+                let init_fn: libloading::Symbol<AnthropicInitWithBase> = lib
+                    .get(b"anthropic_init_with_base")
+                    .expect("Failed to load anthropic_init_with_base symbol");
+                init_fn(key_cstr.as_ptr(), base_ptr)
+            };
             if ret != 0 {
                 result = Err(AnthropicError::InitError(
                     "Failed to initialize Anthropic client. Check API key.".to_string(),
@@ -144,12 +193,18 @@ impl Client {
         user_message: &str,
         max_tokens: i32,
     ) -> Result<MessageResponse, AnthropicError> {
+        let lib = get_library()?;
+
         let model_c = CString::new(model)?;
         let system_c = CString::new(system_prompt.unwrap_or(""))?;
         let user_c = CString::new(user_message)?;
 
         let response_ptr = unsafe {
-            anthropic_message(
+            let message_fn: libloading::Symbol<AnthropicMessage> = lib
+                .get(b"anthropic_message")
+                .map_err(|e| AnthropicError::InitError(format!("Failed to load anthropic_message: {}", e)))?;
+
+            message_fn(
                 model_c.as_ptr(),
                 system_c.as_ptr(),
                 user_c.as_ptr(),
@@ -163,7 +218,12 @@ impl Client {
 
         let response_str = unsafe {
             let s = CStr::from_ptr(response_ptr).to_string_lossy().into_owned();
-            anthropic_free_string(response_ptr);
+
+            let free_fn: libloading::Symbol<AnthropicFreeString> = lib
+                .get(b"anthropic_free_string")
+                .map_err(|e| AnthropicError::InitError(format!("Failed to load anthropic_free_string: {}", e)))?;
+            free_fn(response_ptr);
+
             s
         };
 
@@ -186,12 +246,14 @@ impl Client {
         system_prompt: Option<&str>,
         user_message: &str,
         max_tokens: i32,
-        mut on_chunk: F,
+        on_chunk: F,
     ) -> Result<(), AnthropicError>
     where
         F: FnMut(StreamEvent) + 'static,
     {
         use std::sync::{Arc, Mutex};
+
+        let lib = get_library()?;
 
         let model_c = CString::new(model)?;
         let system_c = CString::new(system_prompt.unwrap_or(""))?;
@@ -207,7 +269,11 @@ impl Client {
         });
 
         unsafe {
-            anthropic_message_stream(
+            let stream_fn: libloading::Symbol<AnthropicMessageStream> = lib
+                .get(b"anthropic_message_stream")
+                .map_err(|e| AnthropicError::InitError(format!("Failed to load anthropic_message_stream: {}", e)))?;
+
+            stream_fn(
                 model_c.as_ptr(),
                 system_c.as_ptr(),
                 user_c.as_ptr(),
@@ -240,6 +306,8 @@ impl Client {
         F: FnMut(StreamEvent) + 'static,
         T: Fn(&str, &str) -> String + 'static,
     {
+        let lib = get_library()?;
+
         let model_c = CString::new(model)?;
         let system_c = CString::new(system_prompt.unwrap_or(""))?;
         let user_c = CString::new(user_message)?;
@@ -259,7 +327,11 @@ impl Client {
         });
 
         unsafe {
-            anthropic_agentic_loop(
+            let agentic_fn: libloading::Symbol<AnthropicAgenticLoop> = lib
+                .get(b"anthropic_agentic_loop")
+                .map_err(|e| AnthropicError::InitError(format!("Failed to load anthropic_agentic_loop: {}", e)))?;
+
+            agentic_fn(
                 model_c.as_ptr(),
                 system_c.as_ptr(),
                 user_c.as_ptr(),
@@ -304,7 +376,6 @@ pub enum StreamEvent {
 }
 
 use std::cell::RefCell;
-use std::sync::{Arc, Mutex};
 
 thread_local! {
     static STREAM_CALLBACK: RefCell<Option<Arc<Mutex<Option<Box<dyn FnMut(StreamEvent)>>>>>> = RefCell::new(None);

@@ -9,6 +9,10 @@ description = "GPU-native recursive hierarchical self-improvement environment"
 license = "MIT"
 authors = ["Palace Contributors"]
 
+[lib]
+name = "palace"
+path = "src/lib.rs"
+
 [dependencies]
 # GPU / Rendering
 wgpu = "28"
