@@ -373,6 +373,10 @@ We welcome contributions! Please:
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
 
+## Credits
+
+**Xbox Controller Button Icons** by [Arks](https://arks.itch.io/xbox-buttons) - Licensed under CC-BY. These icons are used in the Palace GPU interface for gamepad input hints.
+
 ## License
 
 Palace is licensed under the GNU Affero General Public License v3.0. See [LICENSE](LICENSE) for details.

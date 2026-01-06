@@ -2,8 +2,8 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 use std::path::Path;
 
-// Xbox button assets by Arks: https://arks.itch.io/xbox-buttons
-const ASSETS_DIR: &str = "/home/wings/assets/XBOX BUTTONS - Premium Assets/XBOX BUTTONS - Premium Assets/Svg";
+// Xbox button assets by Arks: https://arks.itch.io/xbox-buttons (CC-BY license)
+const ASSETS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/xbox-buttons");
 
 /// Xbox controller button types
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
