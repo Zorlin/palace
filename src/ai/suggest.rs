@@ -132,9 +132,10 @@ fn execute_tool(
             let full_path = project_root.join(path);
             match std::fs::read_to_string(&full_path) {
                 Ok(content) => {
-                    // Truncate if too long
+                    // Truncate if too long (use chars to avoid UTF-8 boundary issues)
                     if content.len() > 8000 {
-                        format!("{}\n... (truncated, {} bytes total)", &content[..8000], content.len())
+                        let truncated: String = content.chars().take(8000).collect();
+                        format!("{}\n... (truncated, {} bytes total)", truncated, content.len())
                     } else {
                         content
                     }
@@ -260,7 +261,8 @@ fn execute_tool(
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     if output.status.success() {
                         if stdout.len() > 4000 {
-                            format!("{}\n... (truncated)", &stdout[..4000])
+                            let truncated: String = stdout.chars().take(4000).collect();
+                            format!("{}\n... (truncated)", truncated)
                         } else {
                             stdout.to_string()
                         }
@@ -375,9 +377,10 @@ fn result_preview(result: &str) -> String {
     let lines: Vec<&str> = result.lines().take(2).collect();
     let preview = lines.join(" ");
 
-    // Truncate if too long
+    // Truncate if too long (use chars to avoid UTF-8 boundary issues)
     if preview.len() > 80 {
-        format!("{}...", &preview[..80])
+        let truncated: String = preview.chars().take(80).collect();
+        format!("{}...", truncated)
     } else {
         preview
     }
@@ -1503,8 +1506,8 @@ Let me know if you need more!"#;
         // Test truncation of long commands
         let long_cmd = "cargo build --release --features all --target x86_64-unknown-linux-gnu && echo done";
         let desc_long = tool_description("Bash", &serde_json::json!({"command": long_cmd}).to_string());
-        // Total length should be ≤ 55 (including "💻 " prefix and "...")
-        assert!(desc_long.len() <= 55, "Expected ≤55 chars, got {}", desc_long.len());
+        // Total: emoji (4 bytes) + space (1) + 50 chars + "..." (3) = 58 bytes
+        assert!(desc_long.len() <= 58, "Expected ≤58 bytes, got {}", desc_long.len());
         assert!(desc_long.ends_with("..."));
     }
 
