@@ -258,9 +258,15 @@ impl PreparedText {
                     (req.color[3] * 255.0) as u8,
                 );
 
-                let bounds_width = req.bounds_width.unwrap_or(screen_width - req.x);
-                let bounds_height = req.bounds_height.unwrap_or(screen_height - req.y);
+                // Compute bounds, ensuring they're always valid (right >= left, bottom >= top)
+                let bounds_width = req.bounds_width.unwrap_or(screen_width - req.x).max(0.0);
+                let bounds_height = req.bounds_height.unwrap_or(screen_height - req.y).max(0.0);
                 let scrolled_top = req.y - req.scroll_offset;
+
+                let left = req.x as i32;
+                let top = req.y as i32;
+                let right = (req.x + bounds_width) as i32;
+                let bottom = (req.y + bounds_height) as i32;
 
                 TextArea {
                     buffer,
@@ -268,10 +274,10 @@ impl PreparedText {
                     top: scrolled_top,
                     scale: 1.0,
                     bounds: TextBounds {
-                        left: req.x as i32,
-                        top: req.y as i32,
-                        right: (req.x + bounds_width) as i32,
-                        bottom: (req.y + bounds_height) as i32,
+                        left,
+                        top,
+                        right: right.max(left), // Ensure right >= left
+                        bottom: bottom.max(top), // Ensure bottom >= top
                     },
                     default_color: color,
                     custom_glyphs: &[],
@@ -290,9 +296,15 @@ impl PreparedText {
                     (req.color[3] * 255.0) as u8,
                 );
 
-                let bounds_width = req.bounds_width.unwrap_or(screen_width - req.x);
-                let bounds_height = req.bounds_height.unwrap_or(screen_height - req.y);
+                // Compute bounds, ensuring they're always valid (right >= left, bottom >= top)
+                let bounds_width = req.bounds_width.unwrap_or(screen_width - req.x).max(0.0);
+                let bounds_height = req.bounds_height.unwrap_or(screen_height - req.y).max(0.0);
                 let scrolled_top = req.y - req.scroll_offset;
+
+                let left = req.x as i32;
+                let top = req.y as i32;
+                let right = (req.x + bounds_width) as i32;
+                let bottom = (req.y + bounds_height) as i32;
 
                 TextArea {
                     buffer,
@@ -300,10 +312,10 @@ impl PreparedText {
                     top: scrolled_top,
                     scale: 1.0,
                     bounds: TextBounds {
-                        left: req.x as i32,
-                        top: req.y as i32,
-                        right: (req.x + bounds_width) as i32,
-                        bottom: (req.y + bounds_height) as i32,
+                        left,
+                        top,
+                        right: right.max(left), // Ensure right >= left
+                        bottom: bottom.max(top), // Ensure bottom >= top
                     },
                     default_color: color,
                     custom_glyphs: &[],

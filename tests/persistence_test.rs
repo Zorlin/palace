@@ -22,9 +22,9 @@ fn create_test_db() -> (PalaceDB, TempDir) {
     let write_txn = palace_db.db.begin_write().unwrap();
 
     // Define tables (must match persistence.rs)
-    let tasks_def = redb::TableDefinition::new("tasks");
-    let permissions_def = redb::TableDefinition::new("project_permissions");
-    let prefs_def = redb::TableDefinition::new("user_prefs");
+    let tasks_def: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("tasks");
+    let permissions_def: redb::TableDefinition<&str, bool> = redb::TableDefinition::new("project_permissions");
+    let prefs_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("user_prefs");
 
     {
         let _ = write_txn.open_table(tasks_def);
@@ -744,4 +744,96 @@ fn test_multi_project_permissions_workflow() {
     let tasks_b = db.load_current_tasks(project_b).unwrap();
     assert_eq!(tasks_b.len(), 1);
     assert_eq!(tasks_b[0].title, "Install Node dependencies");
+}
+
+// ============== DisplaySettings Persistence Tests ==============
+
+#[test]
+fn test_display_settings_persistence() {
+    use palace::state::DisplaySettings;
+
+    let (db, _dir) = create_test_db();
+
+    // Initially no settings
+    let loaded: Option<DisplaySettings> = db.get_pref("display_settings").unwrap();
+    assert!(loaded.is_none());
+
+    // Save display settings
+    let settings = DisplaySettings {
+        primary: Some("Monitor1".to_string()),
+        enabled: vec!["Monitor1".to_string(), "Monitor2".to_string()],
+    };
+    db.set_pref("display_settings", &settings).unwrap();
+
+    // Load and verify
+    let loaded: DisplaySettings = db.get_pref("display_settings").unwrap().unwrap();
+    assert_eq!(loaded.primary, Some("Monitor1".to_string()));
+    assert_eq!(loaded.enabled.len(), 2);
+    assert!(loaded.enabled.contains(&"Monitor1".to_string()));
+    assert!(loaded.enabled.contains(&"Monitor2".to_string()));
+}
+
+#[test]
+fn test_display_settings_primary_persists_across_changes() {
+    use palace::state::DisplaySettings;
+
+    let (db, _dir) = create_test_db();
+
+    // Set initial primary to Monitor1
+    let settings1 = DisplaySettings {
+        primary: Some("Monitor1".to_string()),
+        enabled: vec!["Monitor1".to_string()],
+    };
+    db.set_pref("display_settings", &settings1).unwrap();
+
+    // Change primary to Monitor2
+    let settings2 = DisplaySettings {
+        primary: Some("Monitor2".to_string()),
+        enabled: vec!["Monitor1".to_string(), "Monitor2".to_string()],
+    };
+    db.set_pref("display_settings", &settings2).unwrap();
+
+    // Verify primary is Monitor2, not Monitor1
+    let loaded: DisplaySettings = db.get_pref("display_settings").unwrap().unwrap();
+    assert_eq!(loaded.primary, Some("Monitor2".to_string()), "Primary should persist as Monitor2");
+    assert_eq!(loaded.enabled.len(), 2);
+}
+
+#[test]
+fn test_display_settings_enabled_list_persists() {
+    use palace::state::DisplaySettings;
+
+    let (db, _dir) = create_test_db();
+
+    // Enable only Monitor1
+    let settings1 = DisplaySettings {
+        primary: Some("Monitor1".to_string()),
+        enabled: vec!["Monitor1".to_string()],
+    };
+    db.set_pref("display_settings", &settings1).unwrap();
+
+    let loaded1: DisplaySettings = db.get_pref("display_settings").unwrap().unwrap();
+    assert_eq!(loaded1.enabled.len(), 1);
+
+    // Now enable Monitor2 as well
+    let settings2 = DisplaySettings {
+        primary: Some("Monitor1".to_string()),
+        enabled: vec!["Monitor1".to_string(), "Monitor2".to_string()],
+    };
+    db.set_pref("display_settings", &settings2).unwrap();
+
+    let loaded2: DisplaySettings = db.get_pref("display_settings").unwrap().unwrap();
+    assert_eq!(loaded2.enabled.len(), 2, "Should have 2 enabled displays");
+    assert!(loaded2.enabled.contains(&"Monitor2".to_string()));
+
+    // Now disable Monitor2
+    let settings3 = DisplaySettings {
+        primary: Some("Monitor1".to_string()),
+        enabled: vec!["Monitor1".to_string()],
+    };
+    db.set_pref("display_settings", &settings3).unwrap();
+
+    let loaded3: DisplaySettings = db.get_pref("display_settings").unwrap().unwrap();
+    assert_eq!(loaded3.enabled.len(), 1, "Should have only 1 enabled display after disabling Monitor2");
+    assert!(!loaded3.enabled.contains(&"Monitor2".to_string()));
 }

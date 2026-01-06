@@ -12,7 +12,7 @@ struct InstanceInput {
     @location(4) border_width: f32,
     @location(5) corner_radius: f32,
     @location(6) selected: f32,        // 0.0 or 1.0
-    @location(7) _padding: f32,
+    @location(7) filled: f32,          // 0.0 = OLED (border only), 1.0 = filled background
 };
 
 struct VertexOutput {
@@ -23,6 +23,7 @@ struct VertexOutput {
     @location(3) border_width: f32,
     @location(4) corner_radius: f32,
     @location(5) selected: f32,
+    @location(6) filled: f32,
 };
 
 struct Uniforms {
@@ -51,6 +52,7 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     out.border_width = instance.border_width;
     out.corner_radius = instance.corner_radius;
     out.selected = instance.selected;
+    out.filled = instance.filled;
 
     return out;
 }
@@ -70,8 +72,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Calculate distance from rounded rectangle edge
     let d = sd_rounded_rect(p, half_size, in.corner_radius);
 
-    // Anti-aliased border - draw border on the INSIDE of the edge
-    let aa = 1.0; // Anti-aliasing width in pixels
+    // Anti-aliasing width in pixels
+    let aa = 1.0;
 
     // Fill: inside the card (d < 0)
     let fill_alpha = 1.0 - smoothstep(-aa, aa, d);
@@ -95,26 +97,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
         // Subtle inner fill for contrast (inside the card)
         if (d < -in.border_width) {
-            // Fade from edge inward for smooth look
             let inner_dist = abs(d + in.border_width);
             selection_fill_alpha = smoothstep(0.0, in.border_width * 2.0, inner_dist) * 0.12;
         }
     }
 
     // Semi-transparent overlay mode: no border, just a filled rectangle with alpha
-    // Used for modal background overlays
+    // Used for modal background overlays (border_width == 0)
     if (in.border_width < 0.5) {
-        // Simple filled rectangle with the specified alpha
         if (fill_alpha < 0.01) {
             discard;
         }
         return vec4<f32>(in.border_color.rgb, fill_alpha * in.border_color.a);
     }
 
-    // If border_color alpha is 1.0, render as filled card (not OLED border-only)
-    // This allows modal backgrounds to be fully opaque
-    if (in.border_color.a > 0.99) {
-        // Filled card mode: fill + border
+    // Filled mode: render with dark fill background
+    if (in.filled > 0.5) {
         let fill_color = vec3<f32>(in.border_color.rgb * 0.15); // Darker fill
         let combined_alpha = max(fill_alpha, max(border_alpha, glow_alpha));
 
@@ -122,15 +120,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             discard;
         }
 
-        // Blend fill and border
+        // Border draws on top of fill
         if (border_alpha > 0.01) {
-            return vec4<f32>(in.border_color.rgb, combined_alpha);
+            return vec4<f32>(in.border_color.rgb, combined_alpha * in.border_color.a);
         } else {
-            return vec4<f32>(fill_color, fill_alpha);
+            return vec4<f32>(fill_color, fill_alpha * in.border_color.a);
         }
     }
 
-    // OLED mode: border-only (transparent fill) with selection highlight
+    // OLED mode (default): border-only with transparent fill
     let final_alpha = max(max(border_alpha, glow_alpha), selection_fill_alpha);
 
     // Discard fully transparent pixels for OLED optimization
@@ -140,10 +138,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Selection fill uses a slightly brighter version of border color
     if (selection_fill_alpha > border_alpha && selection_fill_alpha > glow_alpha) {
-        // Brighten the color for selected fill
         let bright_color = in.border_color.rgb * 1.3;
-        return vec4<f32>(bright_color, selection_fill_alpha);
+        return vec4<f32>(bright_color, selection_fill_alpha * in.border_color.a);
     }
 
-    return vec4<f32>(in.border_color.rgb, final_alpha);
+    return vec4<f32>(in.border_color.rgb, final_alpha * in.border_color.a);
 }

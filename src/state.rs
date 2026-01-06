@@ -1,6 +1,15 @@
 #![allow(dead_code)]
 use std::path::PathBuf;
 
+/// Display configuration (persisted)
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DisplaySettings {
+    /// Primary display ID (raw monitor name)
+    pub primary: Option<String>,
+    /// Enabled display IDs (raw monitor names)
+    pub enabled: Vec<String>,
+}
+
 /// Application settings (persisted)
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -8,6 +17,8 @@ pub struct Settings {
     pub dark_mode: bool,
     /// UI scale setting (None = auto-detect, Some = user override)
     pub ui_scale: Option<f32>,
+    /// Display configuration
+    pub display: DisplaySettings,
 }
 
 impl Default for Settings {
@@ -15,7 +26,35 @@ impl Default for Settings {
         Self {
             dark_mode: true, // Default to dark mode (OLED-friendly)
             ui_scale: None,  // Auto-detect by default
+            display: DisplaySettings::default(),
         }
+    }
+}
+
+/// Layout mode based on display aspect ratio
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LayoutMode {
+    /// Standard layouts: 16:9, 21:9
+    #[default]
+    Standard,
+    /// Ultrawide layout: 32:9 (aspect ratio > 2.5)
+    Ultrawide,
+}
+
+impl LayoutMode {
+    /// Detect layout mode from screen dimensions
+    pub fn from_dimensions(width: u32, height: u32) -> Self {
+        let aspect = width as f32 / height as f32;
+        if aspect > 2.5 {
+            LayoutMode::Ultrawide
+        } else {
+            LayoutMode::Standard
+        }
+    }
+
+    /// Is this an ultrawide display?
+    pub fn is_ultrawide(&self) -> bool {
+        matches!(self, LayoutMode::Ultrawide)
     }
 }
 
@@ -44,19 +83,29 @@ impl MainMenuItem {
 /// Settings menu items
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsItem {
+    Display,
     DarkMode,
     UiScale,
 }
 
 impl SettingsItem {
     pub fn all() -> &'static [SettingsItem] {
-        &[SettingsItem::DarkMode, SettingsItem::UiScale]
+        &[SettingsItem::Display, SettingsItem::DarkMode, SettingsItem::UiScale]
     }
 
     pub fn label(&self) -> &'static str {
         match self {
+            SettingsItem::Display => "Display",
             SettingsItem::DarkMode => "Dark Mode",
             SettingsItem::UiScale => "UI Scale",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            SettingsItem::Display => "Configure monitors and extend across displays",
+            SettingsItem::DarkMode => "Toggle dark/light theme",
+            SettingsItem::UiScale => "Adjust interface size",
         }
     }
 }
@@ -237,12 +286,49 @@ pub enum SurveyResponse {
     Cancelled,
 }
 
+/// Options for the project context menu
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectContextOption {
+    /// Remove project from list (doesn't delete files)
+    Remove,
+    /// Change the assigned language
+    ChangeLanguage,
+    /// Archive/unarchive the project
+    ToggleArchive,
+    /// Cancel
+    Cancel,
+}
+
+impl ProjectContextOption {
+    pub fn all() -> &'static [ProjectContextOption] {
+        &[
+            ProjectContextOption::Remove,
+            ProjectContextOption::ChangeLanguage,
+            ProjectContextOption::ToggleArchive,
+            ProjectContextOption::Cancel,
+        ]
+    }
+
+    pub fn label(&self, is_archived: bool) -> &'static str {
+        match self {
+            ProjectContextOption::Remove => "Remove from list",
+            ProjectContextOption::ChangeLanguage => "Change language",
+            ProjectContextOption::ToggleArchive => {
+                if is_archived { "Unarchive" } else { "Archive" }
+            }
+            ProjectContextOption::Cancel => "Cancel",
+        }
+    }
+}
+
 /// Current application state
 #[derive(Debug, Clone)]
 pub enum AppState {
     /// Project chooser screen - shown when launched from $HOME
     ProjectChooser {
         selected_index: usize,
+        /// Show archived projects (All Projects view)
+        show_archived: bool,
     },
     /// Active project view - shown when a project is selected
     ProjectView {
@@ -313,6 +399,46 @@ pub enum AppState {
         /// Previous state to return to
         previous_state: Box<AppState>,
     },
+    /// Add card menu - shown when "+" card is selected
+    AddCardMenu {
+        /// Selected option (0=Generate More, 1=Custom Task, 2=Cancel)
+        selected_option: usize,
+        /// Previous state to return to
+        previous_state: Box<AppState>,
+    },
+    /// Custom task input - text entry for custom task (name and/or description)
+    CustomTaskInput {
+        /// Task name (title)
+        name: String,
+        /// Task description
+        description: String,
+        /// Which field is currently being edited (0=name, 1=description)
+        active_field: usize,
+        /// Cursor position in active field
+        cursor: usize,
+        /// Previous state to return to
+        previous_state: Box<AppState>,
+    },
+    /// Project context menu - shown when X pressed on a project
+    ProjectContextMenu {
+        /// Index of the project being edited
+        project_index: usize,
+        /// Selected menu option
+        selected_option: usize,
+        /// Previous state to return to
+        previous_state: Box<AppState>,
+    },
+    /// Language selector for a project
+    LanguageSelector {
+        /// Index of the project being edited
+        project_index: usize,
+        /// Selected language index
+        selected_index: usize,
+        /// Available languages
+        languages: Vec<String>,
+        /// Previous state to return to
+        previous_state: Box<AppState>,
+    },
     /// Executing - Claude/Z.ai is running the selected tasks
     Executing {
         /// Project path
@@ -339,6 +465,10 @@ pub enum AppState {
         quest_log_visible: bool,
         /// Focused card index in quest log view
         quest_log_focus: usize,
+        /// Total tokens used in this execution
+        tokens_used: u64,
+        /// Whether a request is currently in flight
+        request_active: bool,
     },
     /// Survey/Question UI - for Claude's AskUserQuestion tool
     Survey {
@@ -367,6 +497,127 @@ pub enum AppState {
         /// Channel to send response back
         response_tx: Option<std::sync::mpsc::Sender<SurveyResponse>>,
     },
+    /// Multi-display dialog - shown when a new monitor is detected or from Settings
+    /// Each monitor has an enable/disable toggle. Primary can be set on any enabled monitor.
+    /// Gamepad: A = toggle enabled, X = set as primary
+    /// Keyboard: Space = toggle enabled, P = set as primary
+    /// Mouse: Click toggle or "Set Primary" button
+    MultiDisplayDialog {
+        /// Which monitor in the list is focused (for keyboard nav)
+        focus_index: usize,
+        /// Available monitors with enabled/primary state
+        options: Vec<DisplayOption>,
+        /// Remember this choice for future sessions
+        remember_choice: bool,
+        /// Which row is focused: 0=monitors, 1=remember toggle, 2=apply button
+        focused_row: usize,
+        /// Primary pill drag state: (source_monitor_index, cursor_x, cursor_y)
+        primary_pill_drag: Option<(usize, f32, f32)>,
+        /// Previous state to return to
+        previous_state: Box<AppState>,
+    },
+    /// Simple dialog for newly connected monitor (hot-plug)
+    /// Much simpler than MultiDisplayDialog - just "Extend to this monitor? Yes/No/Never"
+    NewMonitorDialog {
+        /// Name of the newly connected monitor
+        monitor_name: String,
+        /// Resolution of the monitor
+        resolution: String,
+        /// Focused option: 0=Yes, 1=No, 2=Never ask again
+        focus_index: usize,
+        /// Previous state to return to
+        previous_state: Box<AppState>,
+    },
+}
+
+/// Display option for multi-display dialog
+#[derive(Debug, Clone)]
+pub struct DisplayOption {
+    /// Display name (e.g., "Monitor 1", "LG Ultrawide")
+    pub name: String,
+    /// Display identifier (for winit)
+    pub id: String,
+    /// Resolution string (e.g., "3440x1440")
+    pub resolution: String,
+    /// Is this monitor enabled (Palace will display on it)?
+    pub enabled: bool,
+    /// Is this the primary display?
+    pub is_primary: bool,
+}
+
+impl DisplayOption {
+    /// Create a new display option. enabled and is_primary are set separately.
+    pub fn new(name: impl Into<String>, id: impl Into<String>, width: u32, height: u32) -> Self {
+        Self {
+            name: name.into(),
+            id: id.into(),
+            resolution: format!("{}x{}", width, height),
+            enabled: false,
+            is_primary: false,
+        }
+    }
+
+    /// Builder: set enabled state
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Builder: set as primary (also enables)
+    pub fn with_primary(mut self) -> Self {
+        self.is_primary = true;
+        self.enabled = true; // Primary must be enabled
+        self
+    }
+
+    /// Label for display in the dialog
+    pub fn label(&self) -> String {
+        let status = if self.is_primary {
+            "[Primary]"
+        } else if self.enabled {
+            "[Enabled]"
+        } else {
+            ""
+        };
+        if status.is_empty() {
+            format!("{} ({})", self.name, self.resolution)
+        } else {
+            format!("{} ({}) {}", self.name, self.resolution, status)
+        }
+    }
+}
+
+/// Options for the "+" card menu (add new cards)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddCardOption {
+    /// Generate more AI suggestions
+    GenerateMore,
+    /// Interview user then generate targeted suggestions
+    InterviewMe,
+    /// Enter custom task manually
+    CustomTask,
+    /// Cancel and go back
+    Cancel,
+}
+
+impl AddCardOption {
+    pub fn all() -> &'static [AddCardOption] {
+        &[
+            AddCardOption::GenerateMore,
+            AddCardOption::InterviewMe,
+            AddCardOption::CustomTask,
+            AddCardOption::Cancel,
+        ]
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            AddCardOption::GenerateMore => "Generate more suggestions",
+            AddCardOption::InterviewMe => "Interview me, then generate",
+            AddCardOption::CustomTask => "Add custom task",
+            AddCardOption::Cancel => "Cancel",
+        }
+    }
 }
 
 /// Execution options
@@ -536,7 +787,7 @@ impl PermissionResponse {
 
 impl AppState {
     pub fn project_chooser() -> Self {
-        Self::ProjectChooser { selected_index: 0 }
+        Self::ProjectChooser { selected_index: 0, show_archived: false }
     }
 
     pub fn project_view(path: PathBuf) -> Self {
@@ -574,8 +825,9 @@ mod tests {
     #[test]
     fn test_settings_items() {
         let items = SettingsItem::all();
-        assert_eq!(items.len(), 2, "Should have 2 settings items");
+        assert_eq!(items.len(), 3, "Should have 3 settings items");
 
+        assert_eq!(SettingsItem::Display.label(), "Display");
         assert_eq!(SettingsItem::DarkMode.label(), "Dark Mode");
         assert_eq!(SettingsItem::UiScale.label(), "UI Scale");
     }
@@ -825,7 +1077,7 @@ mod tests {
     fn test_app_state_project_chooser() {
         let state = AppState::project_chooser();
         match state {
-            AppState::ProjectChooser { selected_index } => {
+            AppState::ProjectChooser { selected_index, .. } => {
                 assert_eq!(selected_index, 0);
             }
             _ => panic!("Expected ProjectChooser state"),

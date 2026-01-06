@@ -11,7 +11,7 @@ pub struct CardInstance {
     pub border_width: f32,
     pub corner_radius: f32,
     pub selected: f32,
-    pub _padding: f32,
+    pub filled: f32,            // 0.0 = OLED (border only), 1.0 = filled background
 }
 
 impl CardInstance {
@@ -22,13 +22,19 @@ impl CardInstance {
             border_width: 3.0,
             corner_radius: 12.0,
             selected: 0.0,
-            _padding: 0.0,
+            filled: 0.0, // Default to OLED style
         }
     }
 
     pub fn selected(mut self) -> Self {
         self.selected = 1.0;
         self.border_width = 4.0;
+        self
+    }
+
+    /// Make this card have a filled background instead of OLED border-only
+    pub fn filled(mut self) -> Self {
+        self.filled = 1.0;
         self
     }
 
@@ -60,13 +66,14 @@ pub enum ProjectStatus {
 }
 
 impl ProjectStatus {
+    /// Returns border color for project cards
     pub fn color(&self) -> [f32; 4] {
         match self {
-            ProjectStatus::Unknown => [0.4, 0.4, 0.5, 1.0],
-            ProjectStatus::Building => [1.0, 0.7, 0.2, 1.0],
-            ProjectStatus::Error => [1.0, 0.3, 0.3, 1.0],
-            ProjectStatus::Passing => [0.3, 0.9, 0.4, 1.0],
-            ProjectStatus::Active => [0.4, 0.6, 1.0, 1.0],
+            ProjectStatus::Unknown => [0.6, 0.6, 0.7, 1.0],  // Light grey border
+            ProjectStatus::Building => [1.0, 0.7, 0.2, 1.0], // Orange border
+            ProjectStatus::Error => [1.0, 0.3, 0.3, 1.0],    // Red border
+            ProjectStatus::Passing => [0.3, 0.9, 0.4, 1.0],  // Green border
+            ProjectStatus::Active => [0.4, 0.6, 1.0, 1.0],   // Blue border
         }
     }
 }

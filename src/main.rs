@@ -2,10 +2,12 @@ mod ai;
 mod app;
 mod debug;
 mod display;
+mod palace_window;
 mod persistence;
 mod projects;
 mod renderer;
 mod state;
+mod ui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -18,6 +20,93 @@ use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use winit::event_loop::EventLoop;
 
+/// Virtual viewport settings for testing different aspect ratios/resolutions
+#[derive(Debug, Clone, Default)]
+pub struct VirtualViewport {
+    /// Target aspect ratio (width / height), e.g., 32/9 = 3.555
+    pub target_aspect: Option<f32>,
+    /// Internal resolution (width, height) - if set, render at this resolution
+    pub internal_resolution: Option<(u32, u32)>,
+}
+
+impl VirtualViewport {
+    /// Parse aspect ratio string like "32:9", "21:9", "16:9"
+    pub fn parse_aspect(s: &str) -> Option<f32> {
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() == 2 {
+            let width: f32 = parts[0].trim().parse().ok()?;
+            let height: f32 = parts[1].trim().parse().ok()?;
+            if height > 0.0 {
+                return Some(width / height);
+            }
+        }
+        None
+    }
+
+    /// Parse resolution string like "1920x1080", "1280x720"
+    pub fn parse_resolution(s: &str) -> Option<(u32, u32)> {
+        let lowered = s.to_lowercase();
+        let parts: Vec<&str> = lowered.split('x').collect();
+        if parts.len() == 2 {
+            let width: u32 = parts[0].trim().parse().ok()?;
+            let height: u32 = parts[1].trim().parse().ok()?;
+            if width > 0 && height > 0 {
+                return Some((width, height));
+            }
+        }
+        None
+    }
+
+    /// Calculate the virtual viewport size given a native window size
+    /// Returns (virtual_width, virtual_height, x_offset, y_offset)
+    pub fn calculate(&self, native_width: u32, native_height: u32) -> (u32, u32, u32, u32) {
+        // If internal resolution is set, use it directly (letterbox/pillarbox as needed)
+        if let Some((iw, ih)) = self.internal_resolution {
+            let native_aspect = native_width as f32 / native_height as f32;
+            let internal_aspect = iw as f32 / ih as f32;
+
+            if internal_aspect > native_aspect {
+                // Internal is wider - pillarbox (black bars top/bottom)
+                let scale = native_width as f32 / iw as f32;
+                let scaled_height = (ih as f32 * scale) as u32;
+                let y_offset = (native_height.saturating_sub(scaled_height)) / 2;
+                return (iw, ih, 0, y_offset);
+            } else {
+                // Internal is taller - letterbox (black bars left/right)
+                let scale = native_height as f32 / ih as f32;
+                let scaled_width = (iw as f32 * scale) as u32;
+                let x_offset = (native_width.saturating_sub(scaled_width)) / 2;
+                return (iw, ih, x_offset, 0);
+            }
+        }
+
+        // If target aspect is set, calculate virtual resolution to fit that aspect
+        if let Some(target_aspect) = self.target_aspect {
+            let native_aspect = native_width as f32 / native_height as f32;
+
+            if target_aspect > native_aspect {
+                // Target is wider - use full width, reduce height (letterbox)
+                let virtual_height = (native_width as f32 / target_aspect) as u32;
+                let y_offset = (native_height.saturating_sub(virtual_height)) / 2;
+                return (native_width, virtual_height, 0, y_offset);
+            } else {
+                // Target is narrower - use full height, reduce width (pillarbox)
+                let virtual_width = (native_height as f32 * target_aspect) as u32;
+                let x_offset = (native_width.saturating_sub(virtual_width)) / 2;
+                return (virtual_width, native_height, x_offset, 0);
+            }
+        }
+
+        // No virtual viewport - use native size
+        (native_width, native_height, 0, 0)
+    }
+
+    /// Returns true if virtual viewport is active
+    pub fn is_active(&self) -> bool {
+        self.target_aspect.is_some() || self.internal_resolution.is_some()
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "palace")]
 #[command(about = "GPU-native project launcher")]
@@ -28,6 +117,15 @@ struct Cli {
     /// Restore state from file (used by restart command)
     #[arg(long, value_name = "FILE")]
     restore: Option<String>,
+
+    /// Virtual aspect ratio for testing ultrawide layouts (e.g., "32:9", "21:9", "16:9")
+    #[arg(long, value_name = "RATIO")]
+    aspect: Option<String>,
+
+    /// Internal resolution to use (e.g., "1280x720", "1920x1080")
+    /// Content will be rendered at this resolution and scaled to fit the window
+    #[arg(long, value_name = "WxH")]
+    internal: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -171,8 +269,27 @@ fn main() -> Result<()> {
         };
     }
 
+    // Parse virtual viewport settings from CLI flags
+    let mut virtual_viewport = VirtualViewport::default();
+
+    if let Some(ref aspect) = cli.aspect {
+        if let Some(ratio) = VirtualViewport::parse_aspect(aspect) {
+            virtual_viewport.target_aspect = Some(ratio);
+        } else {
+            eprintln!("Warning: Invalid aspect ratio '{}'. Use format like '32:9', '21:9', '16:9'", aspect);
+        }
+    }
+
+    if let Some(ref internal) = cli.internal {
+        if let Some(res) = VirtualViewport::parse_resolution(internal) {
+            virtual_viewport.internal_resolution = Some(res);
+        } else {
+            eprintln!("Warning: Invalid internal resolution '{}'. Use format like '1920x1080', '1280x720'", internal);
+        }
+    }
+
     // Default: run the GUI application
-    run_app(cli.restore)
+    run_app(cli.restore, virtual_viewport)
 }
 
 /// Parse duration string like "5s", "500ms", "1m"
@@ -720,6 +837,7 @@ fn restore_state_to_app_state(state: RestoreState) -> AppState {
             } else {
                 AppState::ProjectChooser {
                     selected_index: state.selected,
+                    show_archived: false,
                 }
             }
         }
@@ -737,14 +855,25 @@ fn restore_state_to_app_state(state: RestoreState) -> AppState {
         }
         _ => AppState::ProjectChooser {
             selected_index: state.selected,
+            show_archived: false,
         },
     }
 }
 
-fn run_app(restore_path: Option<String>) -> Result<()> {
+fn run_app(restore_path: Option<String>, virtual_viewport: VirtualViewport) -> Result<()> {
     // Set default Wayland display for remote/headless scenarios (GPD Win 4 target)
     if env::var("WAYLAND_DISPLAY").is_err() && env::var("DISPLAY").is_err() {
         env::set_var("WAYLAND_DISPLAY", "wayland-0");
+    }
+
+    // Log virtual viewport settings if active
+    if virtual_viewport.is_active() {
+        if let Some(aspect) = virtual_viewport.target_aspect {
+            tracing::info!("Virtual aspect ratio: {:.3}", aspect);
+        }
+        if let Some((w, h)) = virtual_viewport.internal_resolution {
+            tracing::info!("Internal resolution: {}x{}", w, h);
+        }
     }
 
     // Initialize logging
@@ -802,7 +931,7 @@ fn run_app(restore_path: Option<String>) -> Result<()> {
 
     // Create and run application
     let app_proxy = proxy.clone();
-    let mut app = app::App::new(initial_state, projects_config, app_proxy);
+    let mut app = app::App::new(initial_state, projects_config, app_proxy, virtual_viewport);
 
     event_loop.run_app(&mut app)?;
 

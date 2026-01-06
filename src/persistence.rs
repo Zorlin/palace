@@ -524,6 +524,7 @@ mod tests {
     #[test]
     fn test_load_nonexistent_task() {
         let db = test_db();
+        init_test_db(&db);
         let result = db.load_task(999);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
@@ -532,6 +533,7 @@ mod tests {
     #[test]
     fn test_load_current_tasks_empty() {
         let db = test_db();
+        init_test_db(&db);
         let tasks = db.load_current_tasks("/test/project").unwrap();
         assert!(tasks.is_empty());
     }
@@ -639,6 +641,7 @@ mod tests {
     #[test]
     fn test_next_task_id_empty_db() {
         let db = test_db();
+        init_test_db(&db);
         let next_id = db.next_task_id().unwrap();
         assert_eq!(next_id, 1);
     }

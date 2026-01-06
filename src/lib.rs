@@ -8,7 +8,7 @@ pub mod persistence;
 
 // Re-export commonly used types from state
 pub use state::{
-    AppState, ExecuteOption, ExecutionStatus, MainMenuItem, PermissionChoice,
+    AppState, DisplayOption, ExecuteOption, ExecutionStatus, MainMenuItem, PermissionChoice,
     PermissionResponse, ProjectAction, SettingsItem, SuggestionCard, SurveyOption,
     SurveyResponse, TaskStatus, UiScaleOption,
 };

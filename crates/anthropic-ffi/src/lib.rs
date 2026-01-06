@@ -16,6 +16,7 @@ pub const EVENT_THINKING: c_int = 4;
 pub const EVENT_DONE: c_int = 5;
 pub const EVENT_ERROR: c_int = 6;
 pub const EVENT_TOOL_RESULT: c_int = 7;
+pub const EVENT_USAGE: c_int = 8;
 
 /// Callback type for streaming events
 /// event_type: one of EVENT_* constants
@@ -373,6 +374,8 @@ pub enum StreamEvent {
     Error(String),
     /// Tool result (truncated preview)
     ToolResult(String),
+    /// Usage update (JSON with input_tokens, output_tokens)
+    Usage { input_tokens: i64, output_tokens: i64 },
 }
 
 use std::cell::RefCell;
@@ -432,6 +435,22 @@ extern "C" fn stream_callback_handler(event_type: c_int, data: *const c_char) {
                         EVENT_DONE => StreamEvent::Done,
                         EVENT_ERROR => StreamEvent::Error(data_str),
                         EVENT_TOOL_RESULT => StreamEvent::ToolResult(data_str),
+                        EVENT_USAGE => {
+                            // Parse JSON: {"input_tokens": N, "output_tokens": M}
+                            #[derive(serde::Deserialize)]
+                            struct UsageData {
+                                input_tokens: i64,
+                                output_tokens: i64,
+                            }
+                            if let Ok(usage) = serde_json::from_str::<UsageData>(&data_str) {
+                                StreamEvent::Usage {
+                                    input_tokens: usage.input_tokens,
+                                    output_tokens: usage.output_tokens,
+                                }
+                            } else {
+                                return; // Failed to parse usage
+                            }
+                        }
                         _ => return, // Unknown event type
                     };
 

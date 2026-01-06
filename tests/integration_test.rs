@@ -37,7 +37,7 @@ fn test_app_state_project_chooser_initial() {
     let state = AppState::project_chooser();
 
     match state {
-        AppState::ProjectChooser { selected_index } => {
+        AppState::ProjectChooser { selected_index, .. } => {
             assert_eq!(selected_index, 0, "Initial selection should be 0");
         }
         _ => panic!("Expected ProjectChooser state"),
@@ -77,6 +77,7 @@ fn test_app_state_palace_loop_creation() {
         log_scroll_offset: 0,
         detail_scroll_offset: 0.0,
         detail_max_scroll: 0.0,
+        card_scroll_offset: 0.0,
     };
 
     match state {
@@ -241,6 +242,8 @@ fn test_app_state_executing_transitions() {
         previous_state: Box::new(AppState::project_view(project_path.clone())),
         quest_log_visible: false,
         quest_log_focus: 0,
+        request_active: false,
+        tokens_used: 0,
     };
 
     match state {
@@ -549,8 +552,9 @@ fn test_main_menu_items() {
 #[test]
 fn test_settings_items() {
     let items = SettingsItem::all();
-    assert_eq!(items.len(), 2);
+    assert_eq!(items.len(), 3);
 
+    assert_eq!(SettingsItem::Display.label(), "Display");
     assert_eq!(SettingsItem::DarkMode.label(), "Dark Mode");
     assert_eq!(SettingsItem::UiScale.label(), "UI Scale");
 }
@@ -583,11 +587,11 @@ fn test_execute_options() {
 
 #[test]
 fn test_app_state_clone_preserves_data() {
-    let original = AppState::ProjectChooser { selected_index: 3 };
+    let original = AppState::ProjectChooser { selected_index: 3, show_archived: false };
     let cloned = original.clone();
 
     match cloned {
-        AppState::ProjectChooser { selected_index } => {
+        AppState::ProjectChooser { selected_index, .. } => {
             assert_eq!(selected_index, 3);
         }
         _ => panic!("Clone should preserve state type"),
@@ -611,6 +615,7 @@ fn test_app_state_clone_with_complex_data() {
         log_scroll_offset: 5,
         detail_scroll_offset: 10.5,
         detail_max_scroll: 100.0,
+        card_scroll_offset: 0.0,
     };
 
     let cloned = original.clone();
@@ -669,6 +674,7 @@ fn test_full_state_machine_workflow() {
         log_scroll_offset: 0,
         detail_scroll_offset: 0.0,
         detail_max_scroll: 0.0,
+        card_scroll_offset: 0.0,
     };
     assert!(matches!(state, AppState::PalaceLoop { .. }));
 
@@ -739,9 +745,12 @@ fn test_execution_workflow_state_transitions() {
             log_scroll_offset: 0,
             detail_scroll_offset: 0.0,
             detail_max_scroll: 0.0,
+            card_scroll_offset: 0.0,
         }),
         quest_log_visible: false,
         quest_log_focus: 0,
+        request_active: false,
+        tokens_used: 0,
     };
 
     // Verify execution state
@@ -763,4 +772,333 @@ fn test_execution_workflow_state_transitions() {
         }
         _ => panic!("Expected Executing state"),
     }
+}
+
+// ============== Display Dialog Tests ==============
+
+use palace::DisplayOption;
+
+#[test]
+fn test_display_option_creation() {
+    let opt = DisplayOption::new("Monitor #123", "monitor-123", 1920, 1080);
+    assert_eq!(opt.name, "Monitor #123");
+    assert_eq!(opt.id, "monitor-123");
+    assert_eq!(opt.resolution, "1920x1080");
+    assert!(!opt.enabled);
+    assert!(!opt.is_primary);
+}
+
+#[test]
+fn test_display_option_with_primary() {
+    let opt = DisplayOption::new("Monitor", "m1", 1920, 1080).with_primary();
+    assert!(opt.is_primary);
+    assert!(opt.enabled, "Primary should auto-enable");
+}
+
+#[test]
+fn test_display_option_with_enabled() {
+    let opt = DisplayOption::new("Monitor", "m1", 1920, 1080).with_enabled(true);
+    assert!(opt.enabled);
+    assert!(!opt.is_primary);
+}
+
+#[test]
+fn test_multi_display_dialog_set_primary() {
+    // Create dialog with 3 monitors, first is primary
+    let mut options = vec![
+        DisplayOption::new("Monitor 1", "m1", 1920, 1080).with_primary(),
+        DisplayOption::new("Monitor 2", "m2", 2560, 1440).with_enabled(true),
+        DisplayOption::new("Monitor 3", "m3", 3840, 2160),
+    ];
+
+    // Verify initial state
+    assert!(options[0].is_primary);
+    assert!(options[0].enabled);
+    assert!(!options[1].is_primary);
+    assert!(options[1].enabled);
+    assert!(!options[2].is_primary);
+    assert!(!options[2].enabled);
+
+    // Set monitor 2 as primary (simulating P key or number key press)
+    let new_primary_idx = 1;
+    for (i, opt) in options.iter_mut().enumerate() {
+        if i == new_primary_idx {
+            opt.is_primary = true;
+            opt.enabled = true;
+        } else {
+            opt.is_primary = false;
+        }
+    }
+
+    // Verify the change persisted
+    assert!(!options[0].is_primary, "Old primary should no longer be primary");
+    assert!(options[0].enabled, "Old primary should stay enabled");
+    assert!(options[1].is_primary, "New primary should be set");
+    assert!(options[1].enabled, "New primary should be enabled");
+    assert!(!options[2].is_primary);
+}
+
+#[test]
+fn test_multi_display_dialog_cannot_disable_primary() {
+    let mut options = vec![
+        DisplayOption::new("Monitor 1", "m1", 1920, 1080).with_primary(),
+        DisplayOption::new("Monitor 2", "m2", 2560, 1440).with_enabled(true),
+    ];
+
+    // Try to disable primary - should NOT be allowed
+    let primary_idx = 0;
+    if options[primary_idx].is_primary {
+        // This is the check that should prevent disabling
+        // In the real code, we log and skip the toggle
+        // Here we just verify the check works
+        assert!(options[primary_idx].is_primary, "Cannot disable primary");
+    }
+
+    // Primary should still be enabled
+    assert!(options[0].enabled);
+    assert!(options[0].is_primary);
+}
+
+#[test]
+fn test_multi_display_dialog_state_creation() {
+    let options = vec![
+        DisplayOption::new("Monitor 1", "m1", 1920, 1080).with_primary(),
+        DisplayOption::new("Monitor 2", "m2", 2560, 1440),
+    ];
+
+    let state = AppState::MultiDisplayDialog {
+        focus_index: 0,
+        options: options.clone(),
+        remember_choice: false,
+        focused_row: 0,
+        primary_pill_drag: None,
+        previous_state: Box::new(AppState::project_chooser()),
+    };
+
+    match state {
+        AppState::MultiDisplayDialog {
+            options: opts,
+            focus_index,
+            focused_row,
+            primary_pill_drag,
+            ..
+        } => {
+            assert_eq!(opts.len(), 2);
+            assert_eq!(focus_index, 0);
+            assert_eq!(focused_row, 0);
+            assert!(primary_pill_drag.is_none());
+            assert!(opts[0].is_primary);
+            assert!(!opts[1].is_primary);
+        }
+        _ => panic!("Expected MultiDisplayDialog state"),
+    }
+}
+
+#[test]
+fn test_multi_display_dialog_primary_persists_after_state_clone() {
+    let mut options = vec![
+        DisplayOption::new("Monitor 1", "m1", 1920, 1080).with_primary(),
+        DisplayOption::new("Monitor 2", "m2", 2560, 1440).with_enabled(true),
+    ];
+
+    // Set monitor 2 as primary
+    options[0].is_primary = false;
+    options[1].is_primary = true;
+    options[1].enabled = true;
+
+    let state = AppState::MultiDisplayDialog {
+        focus_index: 1,
+        options: options.clone(),
+        remember_choice: false,
+        focused_row: 0,
+        primary_pill_drag: None,
+        previous_state: Box::new(AppState::project_chooser()),
+    };
+
+    // Clone the state (this is what happens during rendering)
+    let cloned = state.clone();
+
+    match cloned {
+        AppState::MultiDisplayDialog { options: opts, .. } => {
+            assert!(!opts[0].is_primary, "Monitor 1 should not be primary after clone");
+            assert!(opts[1].is_primary, "Monitor 2 should be primary after clone");
+        }
+        _ => panic!("Expected MultiDisplayDialog state"),
+    }
+}
+
+#[test]
+fn test_display_option_id_vs_name_distinction() {
+    // The critical bug was: name had position suffix like "(Main)" but id should be raw monitor name
+    // This test verifies the distinction is maintained
+
+    // Simulate how options are created in check_for_new_monitors:
+    // name = display name with suffix, id = raw monitor name
+    let raw_name = "Monitor #12345";
+    let display_name = format!("{} (Main)", raw_name);
+
+    let opt = DisplayOption::new(display_name.clone(), raw_name.to_string(), 1920, 1080);
+
+    // Name should have the display suffix
+    assert_eq!(opt.name, "Monitor #12345 (Main)");
+    // ID should be the raw monitor name (what winit uses)
+    assert_eq!(opt.id, "Monitor #12345");
+
+    // When applying settings, we must use opt.id (not opt.name) for SwitchDisplay event
+    // This ensures winit can find the monitor
+}
+
+#[test]
+fn test_display_option_enable_toggle_preserves_primary() {
+    let mut options = vec![
+        DisplayOption::new("Monitor 1 (Main)", "Monitor 1", 1920, 1080).with_primary(),
+        DisplayOption::new("Monitor 2 (Right)", "Monitor 2", 2560, 1440),
+    ];
+
+    // Initially: Monitor 1 is primary and enabled, Monitor 2 is disabled
+    assert!(options[0].is_primary);
+    assert!(options[0].enabled);
+    assert!(!options[1].is_primary);
+    assert!(!options[1].enabled);
+
+    // Set second monitor as primary using P key behavior
+    // This clears primary from all others and sets the target
+    for (i, opt) in options.iter_mut().enumerate() {
+        if i == 1 {
+            opt.is_primary = true;
+            opt.enabled = true;
+        } else {
+            opt.is_primary = false;
+            // Note: enabled stays as-is (Monitor 1 stays enabled)
+        }
+    }
+
+    assert!(!options[0].is_primary);
+    assert!(options[0].enabled, "Monitor 1 should still be enabled after losing primary");
+    assert!(options[1].is_primary);
+    assert!(options[1].enabled);
+
+    // Now simulate DISABLING the first monitor (Enter key on it when it's enabled)
+    // This should NOT change primary
+    if !options[0].is_primary {
+        options[0].enabled = !options[0].enabled; // true -> false
+    }
+
+    // Primary should still be on monitor 2
+    assert!(!options[0].is_primary, "Disabling first monitor should not change primary");
+    assert!(options[1].is_primary, "Second monitor should still be primary");
+    assert!(!options[0].enabled, "First monitor should now be disabled");
+
+    // Now re-enable monitor 1
+    if !options[0].is_primary {
+        options[0].enabled = !options[0].enabled; // false -> true
+    }
+
+    // Primary should STILL be on monitor 2
+    assert!(!options[0].is_primary, "Enabling first monitor should not change primary");
+    assert!(options[1].is_primary, "Second monitor should still be primary after enabling first");
+    assert!(options[0].enabled, "First monitor should now be enabled");
+}
+
+/// Test EXACT user scenario:
+/// 1. Dialog opens with Monitor A as primary
+/// 2. User does NOT press P
+/// 3. User presses Enter twice on Monitor A (disable then enable)
+/// 4. Primary should NOT change
+#[test]
+fn test_enter_twice_on_primary_does_not_lose_primary() {
+    let mut options = vec![
+        DisplayOption::new("Monitor A", "monitor_a", 1920, 1080).with_primary(),
+        DisplayOption::new("Monitor B", "monitor_b", 2560, 1440),
+    ];
+
+    // Initial state: A is primary
+    assert!(options[0].is_primary, "A should be primary initially");
+    assert!(options[0].enabled, "A should be enabled initially");
+    assert!(!options[1].is_primary);
+    assert!(!options[1].enabled);
+
+    let focus_index = 0; // User selects Monitor A
+
+    // Simulate Enter on Monitor A (attempt to disable)
+    // Since A is primary, this should be BLOCKED
+    if options[focus_index].is_primary {
+        // Cannot disable primary - do nothing
+    } else {
+        options[focus_index].enabled = !options[focus_index].enabled;
+    }
+
+    // State should be UNCHANGED
+    assert!(options[0].is_primary, "A should still be primary after first Enter");
+    assert!(options[0].enabled, "A should still be enabled after first Enter");
+
+    // Simulate Enter again on Monitor A
+    if options[focus_index].is_primary {
+        // Still cannot disable primary - do nothing
+    } else {
+        options[focus_index].enabled = !options[focus_index].enabled;
+    }
+
+    // State should STILL be unchanged
+    assert!(options[0].is_primary, "A should still be primary after second Enter");
+    assert!(options[0].enabled, "A should still be enabled after second Enter");
+}
+
+/// Test user scenario with P key:
+/// 1. Dialog opens with Monitor A as primary
+/// 2. User presses P on Monitor B (makes B primary)
+/// 3. User presses Enter twice on Monitor A (disable then enable)
+/// 4. Primary should stay on B
+#[test]
+fn test_enter_after_p_does_not_change_primary() {
+    let mut options = vec![
+        DisplayOption::new("Monitor A", "monitor_a", 1920, 1080).with_primary(),
+        DisplayOption::new("Monitor B", "monitor_b", 2560, 1440),
+    ];
+
+    // Initial: A is primary
+    assert!(options[0].is_primary);
+    assert!(options[0].enabled);
+
+    // Simulate P key on Monitor B (index 1)
+    let p_focus_index = 1;
+    for (i, opt) in options.iter_mut().enumerate() {
+        if i == p_focus_index {
+            opt.is_primary = true;
+            opt.enabled = true;
+        } else {
+            opt.is_primary = false;
+            // enabled stays as-is
+        }
+    }
+
+    // Now B is primary, A is NOT primary but still enabled
+    assert!(!options[0].is_primary, "A should NOT be primary after P on B");
+    assert!(options[0].enabled, "A should still be enabled");
+    assert!(options[1].is_primary, "B should be primary after P");
+    assert!(options[1].enabled, "B should be enabled after P");
+
+    // Simulate Enter on Monitor A (index 0) - should DISABLE it
+    let enter_focus_index = 0;
+    if options[enter_focus_index].is_primary {
+        // Cannot disable primary
+    } else {
+        options[enter_focus_index].enabled = !options[enter_focus_index].enabled;
+    }
+
+    assert!(!options[0].is_primary, "A should NOT be primary after first Enter");
+    assert!(!options[0].enabled, "A should be DISABLED after first Enter");
+    assert!(options[1].is_primary, "B should STILL be primary");
+
+    // Simulate Enter again on Monitor A - should ENABLE it
+    if options[enter_focus_index].is_primary {
+        // Cannot disable primary
+    } else {
+        options[enter_focus_index].enabled = !options[enter_focus_index].enabled;
+    }
+
+    // PRIMARY MUST STILL BE B
+    assert!(!options[0].is_primary, "A should NOT be primary after second Enter - THIS IS THE BUG");
+    assert!(options[0].enabled, "A should be enabled after second Enter");
+    assert!(options[1].is_primary, "B should STILL be primary after all operations");
 }

@@ -685,6 +685,9 @@ impl SuggestionEngine {
                     StreamEvent::ToolResult(result) => {
                         eprintln!("\x1b[32m  → {}\x1b[0m", result);
                     }
+                    StreamEvent::Usage { input_tokens, output_tokens } => {
+                        eprintln!("\x1b[90m[tokens: {} in, {} out]\x1b[0m", input_tokens, output_tokens);
+                    }
                 }
             },
         )?;
@@ -784,6 +787,9 @@ After exploring, output your suggestions in YAML format (no markdown fences)."#;
                     }
                     StreamEvent::Error(e) => {
                         eprintln!("\n\x1b[31mError: {}\x1b[0m", e);
+                    }
+                    StreamEvent::Usage { input_tokens, output_tokens } => {
+                        eprintln!("\x1b[90m[tokens: {} in, {} out]\x1b[0m", input_tokens, output_tokens);
                     }
                 }
             },

@@ -12,6 +12,7 @@ package main
 #define EVENT_DONE 5
 #define EVENT_ERROR 6
 #define EVENT_TOOL_RESULT 7
+#define EVENT_USAGE 8
 
 // Callback type for streaming events
 // event_type: one of EVENT_* constants
@@ -352,8 +353,12 @@ func anthropic_message_stream_with_tools(model *C.char, systemPrompt *C.char, us
 
 	stream := client.Messages.NewStreaming(context.Background(), params)
 
+	// Accumulate message to get usage at the end
+	message := anthropic.Message{}
+
 	for stream.Next() {
 		event := stream.Current()
+		message.Accumulate(event)
 
 		switch eventVariant := event.AsAny().(type) {
 		case anthropic.ContentBlockStartEvent:
@@ -413,6 +418,15 @@ func anthropic_message_stream_with_tools(model *C.char, systemPrompt *C.char, us
 		C.free(unsafe.Pointer(errStr))
 		return
 	}
+
+	// Emit usage information from the accumulated message
+	usageJSON, _ := json.Marshal(map[string]int64{
+		"input_tokens":  message.Usage.InputTokens,
+		"output_tokens": message.Usage.OutputTokens,
+	})
+	usageStr := C.CString(string(usageJSON))
+	C.invoke_callback(callback, C.EVENT_USAGE, usageStr)
+	C.free(unsafe.Pointer(usageStr))
 
 	// Signal completion
 	C.invoke_callback(callback, C.EVENT_DONE, nil)
@@ -543,6 +557,9 @@ func anthropic_agentic_loop(model *C.char, systemPrompt *C.char, userMessage *C.
 		anthropic.NewUserMessage(anthropic.NewTextBlock(userStr)),
 	}
 
+	// Track cumulative usage across turns
+	var totalInputTokens, totalOutputTokens int64
+
 	// Agentic loop - continue until no more tool calls
 	for {
 		params := anthropic.MessageNewParams{
@@ -560,6 +577,9 @@ func anthropic_agentic_loop(model *C.char, systemPrompt *C.char, userMessage *C.
 		// Stream this turn
 		stream := client.Messages.NewStreaming(context.Background(), params)
 
+		// Accumulate message to get usage for this turn
+		turnMessage := anthropic.Message{}
+
 		var toolCalls []struct {
 			ID    string
 			Name  string
@@ -571,6 +591,7 @@ func anthropic_agentic_loop(model *C.char, systemPrompt *C.char, userMessage *C.
 
 		for stream.Next() {
 			event := stream.Current()
+			turnMessage.Accumulate(event)
 
 			switch ev := event.AsAny().(type) {
 			case anthropic.ContentBlockStartEvent:
@@ -629,6 +650,19 @@ func anthropic_agentic_loop(model *C.char, systemPrompt *C.char, userMessage *C.
 			C.free(unsafe.Pointer(errStr))
 			return
 		}
+
+		// Accumulate usage from this turn
+		totalInputTokens += turnMessage.Usage.InputTokens
+		totalOutputTokens += turnMessage.Usage.OutputTokens
+
+		// Emit usage after each turn
+		usageJSON, _ := json.Marshal(map[string]int64{
+			"input_tokens":  totalInputTokens,
+			"output_tokens": totalOutputTokens,
+		})
+		usageStr := C.CString(string(usageJSON))
+		C.invoke_callback(callback, C.EVENT_USAGE, usageStr)
+		C.free(unsafe.Pointer(usageStr))
 
 		// If no tool calls, we're done
 		if len(toolCalls) == 0 {

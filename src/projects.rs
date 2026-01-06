@@ -12,6 +12,8 @@ pub struct Project {
     pub description: String,
     #[serde(default)]
     pub languages: Vec<String>,
+    #[serde(default)]
+    pub archived: bool,
     #[serde(skip)]
     pub status: ProjectStatus,
 }
@@ -76,6 +78,7 @@ impl ProjectsConfig {
             name,
             description: String::new(),
             languages,
+            archived: false,
             status: ProjectStatus::Unknown,
         });
         true
@@ -195,6 +198,7 @@ mod tests {
             name: "test_project".to_string(),
             description: "A test project".to_string(),
             languages: vec!["Rust".to_string()],
+            archived: false,
             status: ProjectStatus::Unknown,
         };
 

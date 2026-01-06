@@ -91,6 +91,9 @@ impl TaskExecutor {
     ) -> Result<()> {
         tracing::info!("execute_card: {} - {}", card.title, card.description);
 
+        // Signal that a request is starting
+        let _ = event_proxy.send_event(AppEvent::ExecutionRequestStart);
+
         let system = format!(
             r#"You are an AI assistant executing a specific task.
 
@@ -157,7 +160,7 @@ When done, the task is complete - no need to call a "done" tool."#,
         });
         let tool_ctx_clone = tool_ctx.clone();
 
-        self.client.agentic_loop(
+        let result = self.client.agentic_loop(
             &self.model,
             Some(&system),
             &prompt,
@@ -239,7 +242,14 @@ When done, the task is complete - no need to call a "done" tool."#,
                             ));
                         }
                     }
-                    _ => {}
+                    StreamEvent::Usage { input_tokens, output_tokens } => {
+                        // Send total tokens (input + output) to the UI
+                        let total = (input_tokens + output_tokens) as u64;
+                        let _ = proxy.send_event(AppEvent::ExecutionTokens(total));
+                    }
+                    StreamEvent::Error(e) => {
+                        let _ = proxy.send_event(AppEvent::ExecutionError(e));
+                    }
                 }
             },
             move |tool_name, tool_input| {
@@ -250,7 +260,13 @@ When done, the task is complete - no need to call a "done" tool."#,
                 tracing::debug!("Tool result: {}", truncated);
                 result
             },
-        )?;
+        );
+
+        // Signal that the request has completed (success or failure)
+        let _ = event_proxy.send_event(AppEvent::ExecutionRequestEnd);
+
+        // Propagate any error after sending the request end event
+        result?;
 
         tracing::info!("execute_card complete: {}", card.title);
         Ok(())
