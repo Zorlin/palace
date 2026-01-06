@@ -333,6 +333,9 @@ impl ApplicationHandler<AppEvent> for App {
                     // Check if we need to capture a screenshot
                     let screenshot_path = self.pending_screenshot.take();
 
+                    // Update snap animations (applies animated positions to panel_overrides)
+                    self.edit_mode.update_snap_animations();
+
                     // Merge panel_overrides (persisted) with reflow_previews (active drag)
                     // This ensures panels stay at their saved positions after resize completes
                     let mut panel_positions = self.edit_mode.panel_overrides.clone();
@@ -422,8 +425,8 @@ impl ApplicationHandler<AppEvent> for App {
             AppState::Executing { request_active: true, .. }
         );
 
-        // Edit mode has pulsing animations
-        let edit_mode_active = self.edit_mode.active;
+        // Edit mode has pulsing animations and snap animations
+        let edit_mode_active = self.edit_mode.active || self.edit_mode.has_active_animations();
 
         // Request redraw if needed
         if self.needs_redraw || self.pending_screenshot.is_some() || has_pending_captures || stick_active || animation_active || edit_mode_active {

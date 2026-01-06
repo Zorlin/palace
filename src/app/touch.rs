@@ -1018,6 +1018,15 @@ impl super::App {
 
     /// Handle touch/mouse release during edit mode (finish resize or drag)
     pub(crate) fn handle_edit_mode_release(&mut self, _x: f32, _y: f32) {
+        // Get screen size for grid calculations
+        let (screen_width, screen_height) = self.focused_window
+            .and_then(|id| self.windows.get(&id))
+            .map(|w| {
+                let size = w.window.inner_size();
+                (size.width as f32, size.height as f32)
+            })
+            .unwrap_or((1920.0, 1080.0));
+
         // Handle resize release
         if self.edit_mode.ui_resize.is_some() {
             // Check if reflow solution was valid (must check before taking ui_resize)
@@ -1026,26 +1035,51 @@ impl super::App {
                 .map(|s| s.valid)
                 .unwrap_or(true);
 
-            if reflow_valid {
-                // Apply resize to panel_overrides BEFORE taking ui_resize
-                // This persists the new position for the resized panel and any displaced panels
-                self.edit_mode.apply_resize_to_overrides();
-            }
-
             if let Some(resize) = self.edit_mode.ui_resize.take() {
                 let delta_x = resize.current_pos.0 - resize.start_pos.0;
                 let delta_y = resize.current_pos.1 - resize.start_pos.1;
 
                 if reflow_valid {
-                    tracing::info!(
-                        "Edit mode: Finished resize of '{}' - delta: ({:.0}, {:.0}), applied to overrides",
-                        resize.panel_id, delta_x, delta_y
+                    // Calculate current bounds (where panel is now)
+                    let current_bounds = self.edit_mode.apply_resize_delta_pub(
+                        resize.original_bounds,
+                        resize.handle,
+                        delta_x,
+                        delta_y,
                     );
 
-                    // Log override count
+                    // Calculate target grid position and snap to it
+                    let grid_pos = self.panel_layout.grid_position_from_pixels(
+                        current_bounds.0, current_bounds.1,
+                        current_bounds.2, current_bounds.3,
+                        screen_width, screen_height,
+                    );
+                    let snapped = self.panel_layout.bounds_for(&grid_pos, screen_width, screen_height);
+                    let target_bounds = (snapped.x, snapped.y, snapped.width, snapped.height);
+
+                    // Start snap animation
+                    self.edit_mode.start_snap_animation(resize.panel_id, current_bounds, target_bounds);
+
+                    // Also animate any displaced panels from reflow
+                    for (&panel_id, &target) in &self.edit_mode.reflow_previews.clone() {
+                        // Find current position for this panel
+                        if let Some(&current) = self.edit_mode.panel_overrides.get(panel_id) {
+                            self.edit_mode.start_snap_animation(panel_id, current, target);
+                        } else {
+                            // Panel hasn't been moved yet, find its original position
+                            for panel in &self.edit_mode.ui_panels {
+                                if panel.id == panel_id {
+                                    let current = (panel.bounds.x, panel.bounds.y, panel.bounds.width, panel.bounds.height);
+                                    self.edit_mode.start_snap_animation(panel_id, current, target);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
                     tracing::info!(
-                        "  Panel overrides now contains {} panels",
-                        self.edit_mode.panel_overrides.len()
+                        "Edit mode: Finished resize of '{}' - starting snap animation",
+                        resize.panel_id
                     );
                 } else {
                     tracing::warn!(
@@ -1054,7 +1088,7 @@ impl super::App {
                     );
                 }
 
-                // Clear reflow state (previews already applied to overrides)
+                // Clear reflow state
                 self.edit_mode.clear_reflow();
                 self.request_redraw();
             }
@@ -1069,24 +1103,45 @@ impl super::App {
                 .map(|s| s.valid)
                 .unwrap_or(true);
 
-            if reflow_valid {
-                // Apply drag to panel_overrides and any displaced panels
-                self.edit_mode.apply_drag_to_overrides();
-            }
-
             if let Some(drag) = self.edit_mode.ui_drag.take() {
                 let (new_x, new_y) = drag.current_pos;
                 let orig = drag.original_bounds;
 
                 if reflow_valid {
-                    tracing::info!(
-                        "Edit mode: Finished drag of '{}' - from ({:.0}, {:.0}) to ({:.0}, {:.0}), applied to overrides",
-                        drag.panel_id, orig.x, orig.y, new_x, new_y
+                    // Current bounds (where panel is now)
+                    let current_bounds = (new_x, new_y, orig.width, orig.height);
+
+                    // Calculate target grid position and snap to it
+                    let grid_pos = self.panel_layout.grid_position_from_pixels(
+                        new_x, new_y, orig.width, orig.height,
+                        screen_width, screen_height,
                     );
+                    let snapped = self.panel_layout.bounds_for(&grid_pos, screen_width, screen_height);
+                    let target_bounds = (snapped.x, snapped.y, snapped.width, snapped.height);
+
+                    // Start snap animation
+                    self.edit_mode.start_snap_animation(drag.panel_id, current_bounds, target_bounds);
+
+                    // Also animate any displaced panels from reflow
+                    for (&panel_id, &target) in &self.edit_mode.reflow_previews.clone() {
+                        // Find current position for this panel
+                        if let Some(&current) = self.edit_mode.panel_overrides.get(panel_id) {
+                            self.edit_mode.start_snap_animation(panel_id, current, target);
+                        } else {
+                            // Panel hasn't been moved yet, find its original position
+                            for panel in &self.edit_mode.ui_panels {
+                                if panel.id == panel_id {
+                                    let current = (panel.bounds.x, panel.bounds.y, panel.bounds.width, panel.bounds.height);
+                                    self.edit_mode.start_snap_animation(panel_id, current, target);
+                                    break;
+                                }
+                            }
+                        }
+                    }
 
                     tracing::info!(
-                        "  Panel overrides now contains {} panels",
-                        self.edit_mode.panel_overrides.len()
+                        "Edit mode: Finished drag of '{}' - starting snap animation",
+                        drag.panel_id
                     );
                 } else {
                     tracing::warn!(

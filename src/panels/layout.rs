@@ -92,7 +92,8 @@ pub struct PanelLayout {
 }
 
 /// Target cell size in pixels for fine-grained collision detection
-const TARGET_CELL_SIZE: f32 = 40.0;
+/// Smaller = smoother snap, larger = more pronounced grid feel
+const TARGET_CELL_SIZE: f32 = 20.0;
 
 impl Default for PanelLayout {
     fn default() -> Self {
@@ -322,12 +323,12 @@ impl PanelLayout {
         let cell_with_gap_w = cell_width + self.gap;
         let cell_with_gap_h = cell_height + self.gap;
 
-        // Convert position to grid coordinates
+        // Convert position to grid coordinates (round to nearest cell for smoother snap)
         let rel_x = (x - self.margin).max(0.0);
         let rel_y = (y - self.margin).max(0.0);
 
-        let start_col = (rel_x / cell_with_gap_w).floor() as u32;
-        let start_row = (rel_y / cell_with_gap_h).floor() as u32;
+        let start_col = (rel_x / cell_with_gap_w).round() as u32;
+        let start_row = (rel_y / cell_with_gap_h).round() as u32;
 
         // Calculate how many cells the width/height spans
         let grid_width = ((width + self.gap) / cell_with_gap_w).ceil().max(1.0) as u32;

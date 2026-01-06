@@ -11,9 +11,72 @@
 //! - Main Menu → "Edit Layout"
 //! - Long-press on empty area (500ms)
 
-use super::{GridCell, GridPosition, PanelId, PanelLayout, PushDirection, ReorderSolution};
+use super::{GridCell, GridPosition, PanelBounds, PanelId, PanelLayout, PushDirection, ReorderSolution};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+/// Duration of snap animation in milliseconds
+const SNAP_ANIMATION_DURATION_MS: u64 = 200;
+
+/// A snap animation for a panel moving to its target position
+#[derive(Debug, Clone)]
+pub struct SnapAnimation {
+    /// Panel being animated
+    pub panel_id: &'static str,
+    /// Starting bounds (where animation begins)
+    pub start_bounds: (f32, f32, f32, f32),
+    /// Target bounds (where animation ends)
+    pub target_bounds: (f32, f32, f32, f32),
+    /// When animation started
+    pub started: Instant,
+    /// Animation duration
+    pub duration: Duration,
+}
+
+impl SnapAnimation {
+    /// Create a new snap animation
+    pub fn new(
+        panel_id: &'static str,
+        start_bounds: (f32, f32, f32, f32),
+        target_bounds: (f32, f32, f32, f32),
+    ) -> Self {
+        Self {
+            panel_id,
+            start_bounds,
+            target_bounds,
+            started: Instant::now(),
+            duration: Duration::from_millis(SNAP_ANIMATION_DURATION_MS),
+        }
+    }
+
+    /// Get animation progress (0.0 to 1.0)
+    pub fn progress(&self) -> f32 {
+        let elapsed = self.started.elapsed().as_secs_f32();
+        let duration = self.duration.as_secs_f32();
+        (elapsed / duration).min(1.0)
+    }
+
+    /// Check if animation is complete
+    pub fn is_complete(&self) -> bool {
+        self.progress() >= 1.0
+    }
+
+    /// Get current interpolated bounds with ease-out easing
+    pub fn current_bounds(&self) -> (f32, f32, f32, f32) {
+        let t = self.progress();
+        // Ease-out cubic: 1 - (1 - t)^3
+        let eased = 1.0 - (1.0 - t).powi(3);
+
+        let lerp = |start: f32, end: f32| start + (end - start) * eased;
+
+        (
+            lerp(self.start_bounds.0, self.target_bounds.0),
+            lerp(self.start_bounds.1, self.target_bounds.1),
+            lerp(self.start_bounds.2, self.target_bounds.2),
+            lerp(self.start_bounds.3, self.target_bounds.3),
+        )
+    }
+}
 
 /// Threshold for long-press to enter edit mode
 pub const LONG_PRESS_THRESHOLD: Duration = Duration::from_millis(500);
@@ -146,6 +209,9 @@ pub struct EditModeState {
     /// Override positions for panels (persists during edit mode)
     /// When set, these positions are used instead of the computed defaults
     pub panel_overrides: HashMap<&'static str, (f32, f32, f32, f32)>,
+
+    /// Active snap animations (panels animating to their target positions)
+    pub snap_animations: Vec<SnapAnimation>,
 }
 
 /// State for panel drag operation
@@ -250,6 +316,7 @@ impl EditModeState {
             reflow_previews: HashMap::new(),
             reflow_solution: None,
             panel_overrides: HashMap::new(),
+            snap_animations: Vec::new(),
         }
     }
 
@@ -265,6 +332,7 @@ impl EditModeState {
         self.ghost_position = None;
         self.reflow_previews.clear();
         self.reflow_solution = None;
+        self.snap_animations.clear();
     }
 
     /// Exit edit mode
@@ -282,6 +350,7 @@ impl EditModeState {
         self.ui_panels.clear();
         self.reflow_previews.clear();
         self.reflow_solution = None;
+        self.snap_animations.clear();
         // Clear overrides when exiting - positions reset to defaults
         // TODO: In the future, persist to ReDB for layout persistence
         self.panel_overrides.clear();
@@ -690,6 +759,68 @@ impl EditModeState {
     pub fn clear_reflow(&mut self) {
         self.reflow_previews.clear();
         self.reflow_solution = None;
+    }
+
+    /// Start a snap animation for a panel
+    pub fn start_snap_animation(
+        &mut self,
+        panel_id: &'static str,
+        start_bounds: (f32, f32, f32, f32),
+        target_bounds: (f32, f32, f32, f32),
+    ) {
+        // Remove any existing animation for this panel
+        self.snap_animations.retain(|a| a.panel_id != panel_id);
+
+        // Only animate if there's a meaningful difference
+        let dx = (target_bounds.0 - start_bounds.0).abs();
+        let dy = (target_bounds.1 - start_bounds.1).abs();
+        let dw = (target_bounds.2 - start_bounds.2).abs();
+        let dh = (target_bounds.3 - start_bounds.3).abs();
+
+        if dx > 1.0 || dy > 1.0 || dw > 1.0 || dh > 1.0 {
+            self.snap_animations.push(SnapAnimation::new(panel_id, start_bounds, target_bounds));
+            tracing::debug!(
+                "Started snap animation for '{}': ({:.0},{:.0},{:.0},{:.0}) -> ({:.0},{:.0},{:.0},{:.0})",
+                panel_id,
+                start_bounds.0, start_bounds.1, start_bounds.2, start_bounds.3,
+                target_bounds.0, target_bounds.1, target_bounds.2, target_bounds.3,
+            );
+        }
+    }
+
+    /// Update all snap animations and apply their current positions
+    ///
+    /// Returns true if any animations are still running (needs more frames)
+    pub fn update_snap_animations(&mut self) -> bool {
+        // Update panel_overrides with current animation positions
+        for anim in &self.snap_animations {
+            let current = anim.current_bounds();
+            self.panel_overrides.insert(anim.panel_id, current);
+        }
+
+        // Remove completed animations and set final positions
+        let mut completed = Vec::new();
+        self.snap_animations.retain(|anim| {
+            if anim.is_complete() {
+                completed.push((anim.panel_id, anim.target_bounds));
+                false
+            } else {
+                true
+            }
+        });
+
+        // Set final positions for completed animations
+        for (panel_id, target) in completed {
+            self.panel_overrides.insert(panel_id, target);
+            tracing::debug!("Snap animation completed for '{}'", panel_id);
+        }
+
+        !self.snap_animations.is_empty()
+    }
+
+    /// Check if any snap animations are running
+    pub fn has_active_animations(&self) -> bool {
+        !self.snap_animations.is_empty()
     }
 
     /// Compute reflow during UI panel drag (ICS-style collision detection)
