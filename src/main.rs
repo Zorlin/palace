@@ -141,8 +141,13 @@ fn main() -> Result<()> {
         eprintln!("\n\x1b[2mPlease report this issue at: https://github.com/yourrepo/palace/issues\x1b[0m");
     }));
 
-    // Load .env file if present (silently)
-    let _ = dotenvy::dotenv();
+    // Load .env file from ~/.config/palace/.env if present (silently)
+    if let Some(config_dir) = dirs::config_dir() {
+        let env_path = config_dir.join("palace").join(".env");
+        if env_path.exists() {
+            let _ = dotenvy::from_path(&env_path);
+        }
+    }
 
     let cli = Cli::parse();
 
@@ -386,7 +391,7 @@ fn run_restart_command() -> Result<()> {
 /// Run the suggest command - analyze project and generate AI suggestions
 fn run_suggest_command(project: Option<String>, format: String, output: Option<String>, stream: bool) -> Result<()> {
     use crate::ai::{ProjectContext, SuggestionEngine};
-    use std::io::Write;
+    
 
     let project_path = project
         .map(std::path::PathBuf::from)
@@ -457,7 +462,7 @@ const DISPLAY_CONFIG_PATH: &str = "/home/wings/.config/palace/display.json";
 
 /// Run the display management command
 fn run_display_command(action: DisplayAction) -> Result<()> {
-    use std::process::Command;
+    
 
     // Try GNOME's Mutter DisplayConfig first (works on GNOME/Wayland)
     let displays = get_gnome_displays().or_else(|_| get_randr_displays())?;

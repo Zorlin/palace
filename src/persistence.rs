@@ -1,4 +1,5 @@
 //! Persistence layer using ReDB for tasks, permissions, and user preferences
+#![allow(dead_code)]
 
 use anyhow::{Context, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -92,7 +93,8 @@ impl Task {
 
 /// Palace database wrapper for ReDB
 pub struct PalaceDB {
-    db: Database,
+    /// The underlying ReDB instance (pub for testing)
+    pub db: Database,
 }
 
 impl PalaceDB {
@@ -112,12 +114,12 @@ impl PalaceDB {
         Ok(Self { db })
     }
 
-    /// Get the database file path
+    /// Get the database file path (~/.config/palace/palace.redb)
     fn db_path() -> Result<PathBuf> {
-        let data_dir = dirs::data_dir()
-            .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))
+        let config_dir = dirs::config_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
             .unwrap_or_else(|| PathBuf::from("."));
-        Ok(data_dir.join("palace").join("palace.redb"))
+        Ok(config_dir.join("palace").join("palace.redb"))
     }
 
     // ========== Task Operations ==========
@@ -233,8 +235,8 @@ impl PalaceDB {
 
     // ========== Permission Operations (per-project) ==========
 
-    /// Build permission key from project path and command prefix
-    fn permission_key(project_path: &str, prefix: &str) -> String {
+    /// Build permission key from project path and command prefix (pub for testing)
+    pub fn permission_key(project_path: &str, prefix: &str) -> String {
         format!("{}:{}", project_path, prefix)
     }
 
