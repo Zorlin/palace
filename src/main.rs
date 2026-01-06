@@ -141,9 +141,10 @@ fn main() -> Result<()> {
         eprintln!("\n\x1b[2mPlease report this issue at: https://github.com/yourrepo/palace/issues\x1b[0m");
     }));
 
-    // Load .env file from ~/.config/palace/.env if present (silently)
-    if let Some(config_dir) = dirs::config_dir() {
-        let env_path = config_dir.join("palace").join(".env");
+    // Load .env file from ~/.config/palace/.env if present
+    // Note: We use ~/.config/ explicitly (not dirs::config_dir()) for cross-platform consistency
+    if let Some(home) = dirs::home_dir() {
+        let env_path = home.join(".config").join("palace").join(".env");
         if env_path.exists() {
             let _ = dotenvy::from_path(&env_path);
         }
