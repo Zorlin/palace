@@ -2101,6 +2101,9 @@ impl Renderer {
             self.queue.submit(std::iter::once(encoder.finish()));
         }
 
+        // Trim unused glyphs from text atlas to prevent AtlasFull errors
+        self.text_atlas.trim();
+
         output.present();
 
         Ok(())
