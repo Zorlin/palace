@@ -824,6 +824,18 @@ impl TouchInput for super::App {
                     }
                 }
             }
+            AppState::ScenarioDiffViewer { .. } => {
+                // TODO: Touch support for diff viewer
+                // For now, basic back button area
+            }
+            AppState::ScenarioGenerator { .. } => {
+                // TODO: Touch support for generator
+                // For now, basic back button area
+            }
+            AppState::Recording { .. } => {
+                // Recording mode - pass through to inner state
+                // TODO: Handle recording indicator tap (stop recording)
+            }
         }
     }
 }
@@ -949,12 +961,22 @@ impl super::App {
             }
         }
 
-        // Tap outside all panels - deselect
-        if self.edit_mode.selected_panel.is_some() {
-            tracing::info!("Edit mode: Deselected panel (tap outside)");
-            self.edit_mode.selected_panel = None;
-            self.request_redraw();
+        // Tap outside all panels - open panel chooser or close it if already open
+        if self.edit_mode.panel_chooser_open {
+            // Clicking outside while chooser is open - close it
+            tracing::info!("Edit mode: Closed panel chooser (tap outside)");
+            self.edit_mode.panel_chooser_open = false;
+            self.edit_mode.spawn_target = None;
+            self.edit_mode.chooser_selection = 0;
+        } else {
+            // Open panel chooser at this location
+            tracing::info!("Edit mode: Opening panel chooser at ({:.0}, {:.0})", x, y);
+            self.edit_mode.panel_chooser_open = true;
+            self.edit_mode.spawn_target = Some((x, y));
+            self.edit_mode.chooser_selection = 0;
         }
+        self.edit_mode.selected_panel = None;
+        self.request_redraw();
     }
 
     /// Handle touch/mouse move during edit mode (for resize or drag)

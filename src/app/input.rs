@@ -25,12 +25,63 @@ impl KeyboardInput for super::App {
             return;
         }
 
-        // Escape exits edit mode if active
-        if key == KeyCode::Escape && self.edit_mode.active {
-            self.edit_mode.exit();
-            tracing::info!("Edit mode: OFF");
-            self.request_redraw();
-            return;
+        // Handle edit mode inputs
+        if self.edit_mode.active {
+            // If panel chooser is open, handle its inputs
+            if self.edit_mode.panel_chooser_open {
+                let panel_count = crate::panels::available_panel_types().len();
+                match key {
+                    KeyCode::Escape => {
+                        // Close chooser, stay in edit mode
+                        self.edit_mode.panel_chooser_open = false;
+                        self.edit_mode.spawn_target = None;
+                        self.edit_mode.chooser_selection = 0;
+                        self.request_redraw();
+                        return;
+                    }
+                    KeyCode::ArrowUp | KeyCode::KeyW => {
+                        if self.edit_mode.chooser_selection > 0 {
+                            self.edit_mode.chooser_selection -= 1;
+                        } else {
+                            self.edit_mode.chooser_selection = panel_count - 1;
+                        }
+                        self.request_redraw();
+                        return;
+                    }
+                    KeyCode::ArrowDown | KeyCode::KeyS => {
+                        if self.edit_mode.chooser_selection < panel_count - 1 {
+                            self.edit_mode.chooser_selection += 1;
+                        } else {
+                            self.edit_mode.chooser_selection = 0;
+                        }
+                        self.request_redraw();
+                        return;
+                    }
+                    KeyCode::Enter | KeyCode::Space => {
+                        // Select panel type and add it
+                        let panel_types = crate::panels::available_panel_types();
+                        if let Some(panel_type) = panel_types.get(self.edit_mode.chooser_selection) {
+                            tracing::info!("Panel chooser: selected '{}'", panel_type.name);
+                            // TODO: Actually spawn the panel at spawn_target location
+                            // For now, just close the dialog
+                        }
+                        self.edit_mode.panel_chooser_open = false;
+                        self.edit_mode.spawn_target = None;
+                        self.edit_mode.chooser_selection = 0;
+                        self.request_redraw();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Escape exits edit mode if active (and chooser not open)
+            if key == KeyCode::Escape {
+                self.edit_mode.exit();
+                tracing::info!("Edit mode: OFF");
+                self.request_redraw();
+                return;
+            }
         }
 
         // Calculate layout values first to avoid borrow issues
@@ -410,23 +461,29 @@ impl KeyboardInput for super::App {
                         }
                     }
                     KeyCode::Enter | KeyCode::Space => {
+                        let cmd_for_record = command.clone();
                         if let Some(tx) = self.permission_response_tx.take() {
                             let _ = tx.send(PermissionResponse::Approved);
                         }
                         self.state = *previous_state;
+                        self.record_permission_granted(&cmd_for_record);
                     }
                     KeyCode::KeyX => {
+                        let cmd_for_record = command.clone();
                         super::App::approve_command_prefix(&command_prefix);
                         if let Some(tx) = self.permission_response_tx.take() {
                             let _ = tx.send(PermissionResponse::ApprovedAlways(command_prefix));
                         }
                         self.state = *previous_state;
+                        self.record_permission_granted(&cmd_for_record);
                     }
                     KeyCode::Backspace | KeyCode::Escape => {
+                        let cmd_for_record = command.clone();
                         if let Some(tx) = self.permission_response_tx.take() {
                             let _ = tx.send(PermissionResponse::Denied);
                         }
                         self.state = *previous_state;
+                        self.record_permission_denied(&cmd_for_record);
                     }
                     KeyCode::KeyY => {
                         tracing::info!("Suggest else requested for: {}", command);
@@ -1397,6 +1454,177 @@ impl KeyboardInput for super::App {
                         self.state = *prev;
                     }
                     _ => {}
+                }
+            }
+            AppState::ScenarioDiffViewer {
+                viewer,
+                feedback_mode,
+                feedback_options,
+                selected_feedback,
+                custom_feedback,
+                custom_cursor,
+                input_path,
+                output_path,
+            } => {
+                if *feedback_mode {
+                    if custom_feedback.is_some() {
+                        // Custom feedback text input mode
+                        match key {
+                            KeyCode::Enter => {
+                                // Submit custom feedback
+                                if let Some(feedback) = custom_feedback.take() {
+                                    if !feedback.is_empty() {
+                                        // Transition to refining (placeholder - actual LLM call in later phase)
+                                        tracing::info!("Custom feedback submitted: {}", feedback);
+                                    }
+                                    *feedback_mode = false;
+                                }
+                            }
+                            KeyCode::Escape => {
+                                // Cancel custom feedback
+                                *custom_feedback = None;
+                            }
+                            KeyCode::Backspace => {
+                                if let Some(ref mut text) = custom_feedback {
+                                    if *custom_cursor > 0 {
+                                        text.remove(*custom_cursor - 1);
+                                        *custom_cursor -= 1;
+                                    }
+                                }
+                            }
+                            KeyCode::ArrowLeft => {
+                                if *custom_cursor > 0 {
+                                    *custom_cursor -= 1;
+                                }
+                            }
+                            KeyCode::ArrowRight => {
+                                if let Some(ref text) = custom_feedback {
+                                    if *custom_cursor < text.len() {
+                                        *custom_cursor += 1;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        // Feedback options selection mode
+                        match key {
+                            KeyCode::ArrowUp | KeyCode::KeyW => {
+                                if *selected_feedback > 0 {
+                                    *selected_feedback -= 1;
+                                }
+                            }
+                            KeyCode::ArrowDown | KeyCode::KeyS => {
+                                if *selected_feedback < feedback_options.len().saturating_sub(1) {
+                                    *selected_feedback += 1;
+                                }
+                            }
+                            KeyCode::Enter | KeyCode::Space => {
+                                // Select feedback option
+                                if let Some(option) = feedback_options.get(*selected_feedback) {
+                                    if option.label == "Custom feedback..." {
+                                        *custom_feedback = Some(String::new());
+                                        *custom_cursor = 0;
+                                    } else {
+                                        // Submit feedback (placeholder - actual LLM call in later phase)
+                                        tracing::info!("Feedback selected: {}", option.label);
+                                        *feedback_mode = false;
+                                    }
+                                }
+                            }
+                            KeyCode::Escape | KeyCode::Backspace => {
+                                // Cancel feedback mode
+                                *feedback_mode = false;
+                            }
+                            _ => {}
+                        }
+                    }
+                } else {
+                    // Normal diff viewer navigation
+                    match key {
+                        KeyCode::ArrowUp | KeyCode::KeyW => {
+                            viewer.navigate_chunk(-1);
+                        }
+                        KeyCode::ArrowDown | KeyCode::KeyS => {
+                            viewer.navigate_chunk(1);
+                        }
+                        KeyCode::KeyN => {
+                            viewer.navigate_next_change();
+                        }
+                        KeyCode::KeyP => {
+                            viewer.navigate_prev_change();
+                        }
+                        KeyCode::Enter | KeyCode::Space => {
+                            viewer.toggle_collapse();
+                        }
+                        KeyCode::KeyC => {
+                            viewer.collapse_all_context();
+                        }
+                        KeyCode::KeyE => {
+                            viewer.expand_all();
+                        }
+                        KeyCode::KeyF => {
+                            // Enter feedback mode
+                            *feedback_mode = true;
+                            *selected_feedback = 0;
+                        }
+                        KeyCode::KeyA => {
+                            // Accept correction (placeholder - write file in later phase)
+                            tracing::info!("Correction accepted");
+                            self.state = AppState::project_chooser();
+                        }
+                        KeyCode::Escape | KeyCode::Backspace => {
+                            self.state = AppState::project_chooser();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            AppState::ScenarioGenerator { generator, .. } => {
+                use crate::scenario::GeneratorAction;
+                // Generator navigation (placeholder - full implementation in later phase)
+                match key {
+                    KeyCode::ArrowUp | KeyCode::KeyW => {
+                        generator.navigate(-1);
+                    }
+                    KeyCode::ArrowDown | KeyCode::KeyS => {
+                        generator.navigate(1);
+                    }
+                    KeyCode::Enter | KeyCode::Space => {
+                        generator.select();
+                    }
+                    KeyCode::Escape | KeyCode::Backspace => {
+                        if let Some(GeneratorAction::Cancel) = generator.back() {
+                            self.state = AppState::project_chooser();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            AppState::Recording { inner_state, recorder, paused, .. } => {
+                // Recording mode - pass through to inner state
+                // TODO: Handle recording-specific keys (pause, stop, screenshot)
+                match key {
+                    KeyCode::F9 => {
+                        // Toggle pause
+                        *paused = !*paused;
+                    }
+                    KeyCode::F10 => {
+                        // Stop recording and save
+                        let output_path = recorder.get_output_path();
+                        if let Err(e) = recorder.save(&output_path) {
+                            tracing::error!("Failed to save recording: {}", e);
+                        } else {
+                            tracing::info!("Recording saved to: {}", output_path.display());
+                        }
+                        // Exit recording mode
+                        self.state = *inner_state.clone();
+                    }
+                    _ => {
+                        // Pass through to inner state handling
+                        // Note: This is simplified - full implementation would
+                        // temporarily swap states and call handle_input recursively
+                    }
                 }
             }
         }

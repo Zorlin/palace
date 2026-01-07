@@ -209,6 +209,19 @@ impl DebugCommands for super::App {
                 // New monitor dialog is transient - return to project chooser on restart
                 serde_json::json!({"view": "chooser", "selected": 0})
             }
+            AppState::ScenarioDiffViewer { .. } => {
+                // Diff viewer is transient - return to project chooser on restart
+                serde_json::json!({"view": "chooser", "selected": 0})
+            }
+            AppState::ScenarioGenerator { .. } => {
+                // Generator is transient - return to project chooser on restart
+                serde_json::json!({"view": "chooser", "selected": 0})
+            }
+            AppState::Recording { inner_state, .. } => {
+                // Recording wraps another state - serialize the inner state
+                // For simplicity, just return chooser on restart
+                serde_json::json!({"view": "chooser", "selected": 0})
+            }
         }
         .to_string()
     }

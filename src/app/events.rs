@@ -228,6 +228,31 @@ impl ApplicationHandler<AppEvent> for App {
                             }
                         }
                     }
+                    // Handle text input for diff viewer custom feedback
+                    if let AppState::ScenarioDiffViewer { feedback_mode: true, custom_feedback: Some(ref mut feedback_text), custom_cursor, .. } = &mut self.state {
+                        if let Some(ref txt) = text {
+                            if !txt.is_empty() && !txt.chars().next().map(|c| c.is_control()).unwrap_or(true) {
+                                feedback_text.insert_str(*custom_cursor, txt.as_str());
+                                *custom_cursor += txt.len();
+                                self.request_redraw();
+                                return;
+                            }
+                        }
+                    }
+                    // Handle text input for generator description input
+                    if let AppState::ScenarioGenerator { generator, .. } = &mut self.state {
+                        use crate::scenario::GeneratorState;
+                        if let GeneratorState::DescriptionInput { text: input_text, cursor, .. } = generator.current_state_mut() {
+                            if let Some(ref txt) = text {
+                                if !txt.is_empty() && !txt.chars().next().map(|c| c.is_control()).unwrap_or(true) {
+                                    input_text.insert_str(*cursor, txt.as_str());
+                                    *cursor += txt.len();
+                                    self.request_redraw();
+                                    return;
+                                }
+                            }
+                        }
+                    }
                     self.handle_input(key);
                     self.request_redraw();
                 }
@@ -370,6 +395,13 @@ impl ApplicationHandler<AppEvent> for App {
                         panel_positions.insert(drag.panel_id, (new_x, new_y, orig.width, orig.height));
                     }
 
+                    // Build panel chooser state if open
+                    let panel_chooser = if self.edit_mode.panel_chooser_open {
+                        self.edit_mode.spawn_target.map(|pos| (pos, self.edit_mode.chooser_selection))
+                    } else {
+                        None
+                    };
+
                     match palace_window.renderer.render_with_screenshot(
                         &self.state,
                         &self.projects,
@@ -379,6 +411,7 @@ impl ApplicationHandler<AppEvent> for App {
                         self.edit_mode.selected_panel,
                         resize_preview,
                         &panel_positions,
+                        panel_chooser,
                     ) {
                         Ok(_) => {}
                         Err(wgpu::SurfaceError::Lost) => {
@@ -428,8 +461,14 @@ impl ApplicationHandler<AppEvent> for App {
         // Edit mode has pulsing animations and snap animations
         let edit_mode_active = self.edit_mode.active || self.edit_mode.has_active_animations();
 
+        // Recording indicator has pulsing animation (only when not paused)
+        let recording_active = matches!(
+            &self.state,
+            AppState::Recording { paused: false, .. }
+        );
+
         // Request redraw if needed
-        if self.needs_redraw || self.pending_screenshot.is_some() || has_pending_captures || stick_active || animation_active || edit_mode_active {
+        if self.needs_redraw || self.pending_screenshot.is_some() || has_pending_captures || stick_active || animation_active || edit_mode_active || recording_active {
             for palace_window in self.windows.values() {
                 palace_window.window.request_redraw();
             }
@@ -536,10 +575,28 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             AppEvent::SuggestionsDone => {
+                // Get card count for recording before mutating state
+                let card_count = match &self.state {
+                    AppState::PalaceLoop { cards, .. } => cards.len(),
+                    AppState::Recording { inner_state, .. } => {
+                        if let AppState::PalaceLoop { cards, .. } = inner_state.as_ref() {
+                            cards.len()
+                        } else {
+                            0
+                        }
+                    }
+                    _ => 0,
+                };
+
                 if let AppState::PalaceLoop { generating, current_tool, .. } = &mut self.state {
                     *generating = false;
                     *current_tool = None;
                     self.request_redraw();
+                }
+
+                // Record cards received if in recording mode
+                if card_count > 0 {
+                    self.record_cards_received(card_count);
                 }
             }
             AppEvent::AiError(error) => {
@@ -604,6 +661,8 @@ impl ApplicationHandler<AppEvent> for App {
                     tool_log.insert(0, "✅ All tasks completed".to_string());
                     self.request_redraw();
                 }
+                // Record completion if in recording mode
+                self.record_execution_completed(true);
             }
             AppEvent::ExecutionError(error) => {
                 if let AppState::Executing { status, task_statuses, tool_log, .. } = &mut self.state {
@@ -617,6 +676,8 @@ impl ApplicationHandler<AppEvent> for App {
                     tool_log.insert(0, format!("❌ Failed: {}", error));
                     self.request_redraw();
                 }
+                // Record failure if in recording mode
+                self.record_execution_completed(false);
             }
             AppEvent::ExecutionTokens(tokens) => {
                 if let AppState::Executing { tokens_used, .. } = &mut self.state {

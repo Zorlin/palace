@@ -1,0 +1,98 @@
+# Asteroids Implementation Scenario
+#
+# This scenario demonstrates the full power of Palace automation:
+# - Plain English scripting for the deterministic parts
+# - AI supervisor for decisions that require judgment
+# - Automatic permission/survey handling
+#
+# Run with: palace scenario scenarios/asteroids.yml
+
+scenario:
+  name: "Implement Classic Asteroids"
+  description: |
+    Create a complete Asteroids clone in Rust using WGPU.
+    This is a demonstration scenario showing how Palace can
+    automate complex development workflows.
+  version: "1.0"
+  author: "Palace Team"
+  tags:
+    - game
+    - rust
+    - wgpu
+    - demo
+
+# High-level goals guide AI decisions when script doesn't cover something
+goals:
+  - "Working Asteroids game in Rust with WGPU rendering"
+  - "Player ship with thrust, rotation, and momentum"
+  - "Asteroids that spawn and split when destroyed"
+  - "Bullets that destroy asteroids"
+  - "Score tracking and lives system"
+
+# Explicit steps for fast, deterministic execution
+steps:
+  - open project ~/projects/asteroids-demo
+  - click "Suggest Tasks"
+  - wait for cards
+  - log "Cards received, selecting all for implementation"
+  - select all cards
+  - execute
+  - wait for completion
+  - screenshot "implementation-complete.png"
+  - log "Implementation complete!"
+
+# Constraints the AI must respect
+constraints:
+  - "Use only Rust with WGPU - no game engines"
+  - "Single binary output"
+  - "Must compile with stable Rust"
+  - "No external assets required"
+
+# Automatic permission handling
+permissions:
+  allow:
+    - read
+    - write
+    - create
+    - cargo
+    - git
+  deny:
+    - network
+    - rm_rf
+    - bash  # Only allow safe commands
+  ask_unknown: true
+  max_auto_approvals: 50
+
+# Use best judgment for surveys
+surveys: ubj
+
+# Project configuration
+project:
+  path: ~/projects/asteroids-demo
+  init_if_missing: true
+  template: rust-wgpu  # Optional template to init from
+
+# What to capture during execution
+capture:
+  screenshots: true
+  fixtures: true
+  animated_svg: true
+  output_dir: ./captures/asteroids
+  screenshot_on:
+    - cards_ready
+    - before_execution
+    - after_execution
+    - on_error
+
+# Success criteria
+okrs:
+  - objective: "Game is playable"
+    key_results:
+      - description: "Binary compiles successfully"
+      - description: "Game window opens"
+      - description: "Ship responds to controls"
+
+# Hard requirements (fail if not met)
+requirements:
+  - "Code compiles without errors"
+  - "No unsafe code without justification"

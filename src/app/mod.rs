@@ -574,4 +574,55 @@ impl App {
         let list = approved.lock().unwrap();
         list.iter().any(|a| cmd.starts_with(a))
     }
+
+    // --- Recording hooks ---
+
+    /// Record cards received if in recording mode
+    pub(crate) fn record_cards_received(&mut self, count: usize) {
+        if let AppState::Recording { recorder, paused: false, .. } = &mut self.state {
+            recorder.record_cards_received(count, None);
+        }
+    }
+
+    /// Record cards selected if in recording mode
+    pub(crate) fn record_cards_selected(&mut self, indices: Vec<usize>) {
+        if let AppState::Recording { recorder, paused: false, .. } = &mut self.state {
+            recorder.record_cards_selected(indices);
+        }
+    }
+
+    /// Record execution started if in recording mode
+    pub(crate) fn record_execution_started(&mut self) {
+        if let AppState::Recording { recorder, paused: false, .. } = &mut self.state {
+            recorder.record_execution_started();
+        }
+    }
+
+    /// Record execution completed if in recording mode
+    pub(crate) fn record_execution_completed(&mut self, success: bool) {
+        if let AppState::Recording { recorder, paused: false, .. } = &mut self.state {
+            recorder.record_execution_completed(success);
+        }
+    }
+
+    /// Record permission granted if in recording mode
+    pub(crate) fn record_permission_granted(&mut self, command: &str) {
+        if let AppState::Recording { recorder, paused: false, .. } = &mut self.state {
+            recorder.record_permission_granted(command.to_string());
+        }
+    }
+
+    /// Record permission denied if in recording mode
+    pub(crate) fn record_permission_denied(&mut self, command: &str) {
+        if let AppState::Recording { recorder, paused: false, .. } = &mut self.state {
+            recorder.record_permission_denied(command.to_string());
+        }
+    }
+
+    /// Record survey answered if in recording mode
+    pub(crate) fn record_survey_answered(&mut self, question: &str, selection: usize, options: &[String]) {
+        if let AppState::Recording { recorder, paused: false, .. } = &mut self.state {
+            recorder.record_survey_answered(question.to_string(), selection, options.to_vec());
+        }
+    }
 }

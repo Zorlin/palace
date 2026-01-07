@@ -1302,7 +1302,7 @@ impl Renderer {
         projects: &ProjectsConfig,
     ) -> Result<(), wgpu::SurfaceError> {
         let empty_reflow = std::collections::HashMap::new();
-        self.render_with_screenshot(state, projects, None, &mut crate::debug::ScreenshotCapture::new(), false, None, None, &empty_reflow)
+        self.render_with_screenshot(state, projects, None, &mut crate::debug::ScreenshotCapture::new(), false, None, None, &empty_reflow, None)
     }
 
     pub fn render_with_screenshot(
@@ -1315,6 +1315,7 @@ impl Renderer {
         selected_panel: Option<&str>,
         resize_preview: Option<(&str, f32, f32)>, // (panel_id, delta_x, delta_y)
         reflow_positions: &std::collections::HashMap<&'static str, (f32, f32, f32, f32)>, // Panels displaced by reflow
+        panel_chooser: Option<((f32, f32), usize)>, // (spawn_target, selection) if chooser is open
     ) -> Result<(), wgpu::SurfaceError> {
         // Clear edit mode cards from previous frame
         self.edit_mode_cards.clear();
@@ -1489,6 +1490,22 @@ impl Renderer {
                 self.build_suggestion_cards(all_cards, *quest_log_focus, None, Some((&exec_ids, task_statuses)), 0.0, false)
             }
             AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } | AppState::PermissionModal { .. } | AppState::ExecuteModal { .. } | AppState::AddCardMenu { .. } | AppState::CustomTaskInput { .. } | AppState::Survey { .. } | AppState::Executing { .. } | AppState::MultiDisplayDialog { .. } | AppState::ProjectContextMenu { .. } | AppState::LanguageSelector { .. } | AppState::NewMonitorDialog { .. } => Vec::new(),
+            AppState::ScenarioDiffViewer { viewer, feedback_mode, feedback_options, selected_feedback, custom_feedback, custom_cursor, .. } => {
+                self.build_diff_viewer_cards(viewer, *feedback_mode, feedback_options, *selected_feedback, custom_feedback.as_deref(), *custom_cursor)
+            }
+            AppState::ScenarioGenerator { generator, .. } => {
+                self.build_generator_cards(generator)
+            }
+            AppState::Recording { inner_state, .. } => {
+                // Delegate to inner state for card rendering
+                match inner_state.as_ref() {
+                    AppState::PalaceLoop { cards, focused_index, hovered_index, card_scroll_offset, generating, .. } => {
+                        let show_add_card = !cards.is_empty() || !generating;
+                        self.build_suggestion_cards(cards, *focused_index, *hovered_index, None, *card_scroll_offset, show_add_card)
+                    }
+                    _ => Vec::new(),
+                }
+            }
         };
 
         // When modal is open, render base scene then overlay + modal
@@ -1543,13 +1560,18 @@ impl Renderer {
                         self.queue_executing_text(tool_log, thought_log, *log_scroll_offset, status, *executor, *tokens_used, *request_active);
                     }
                 }
-                AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } | AppState::PermissionModal { .. } | AppState::ExecuteModal { .. } | AppState::AddCardMenu { .. } | AppState::CustomTaskInput { .. } | AppState::Survey { .. } | AppState::MultiDisplayDialog { .. } | AppState::ProjectContextMenu { .. } | AppState::LanguageSelector { .. } | AppState::NewMonitorDialog { .. } => {}
+                AppState::MainMenu { .. } | AppState::SettingsMenu { .. } | AppState::UiScaleMenu { .. } | AppState::PermissionModal { .. } | AppState::ExecuteModal { .. } | AppState::AddCardMenu { .. } | AppState::CustomTaskInput { .. } | AppState::Survey { .. } | AppState::MultiDisplayDialog { .. } | AppState::ProjectContextMenu { .. } | AppState::LanguageSelector { .. } | AppState::NewMonitorDialog { .. } | AppState::ScenarioDiffViewer { .. } | AppState::ScenarioGenerator { .. } | AppState::Recording { .. } => {}
             }
 
             // Edit mode indicator (overlay)
             if edit_mode_active {
                 let panels = self.compute_ui_panels(base_state);
                 self.queue_edit_mode_indicator(&panels, selected_panel, resize_preview, reflow_positions);
+
+                // Panel chooser dialog (if open)
+                if let Some((spawn_pos, selection)) = panel_chooser {
+                    self.queue_panel_chooser(spawn_pos, selection);
+                }
             }
 
             // Prepare base text for Pass 1
@@ -1819,12 +1841,44 @@ impl Renderer {
                 AppState::ProjectContextMenu { .. } => {}
                 AppState::LanguageSelector { .. } => {}
                 AppState::NewMonitorDialog { .. } => {}
+                AppState::ScenarioDiffViewer { viewer, feedback_mode, feedback_options, selected_feedback, custom_feedback, custom_cursor, .. } => {
+                    self.queue_diff_viewer_text(viewer, *feedback_mode, feedback_options, *selected_feedback, custom_feedback.as_deref(), *custom_cursor);
+                }
+                AppState::ScenarioGenerator { generator, .. } => {
+                    self.queue_generator_text(generator);
+                }
+                AppState::Recording { inner_state, recorder, paused, .. } => {
+                    // Queue inner state's text
+                    match inner_state.as_ref() {
+                        AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, hovered_index, detail_scroll_offset, card_scroll_offset, generating, .. } => {
+                            let show_add_card = !cards.is_empty() || !generating;
+                            self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *hovered_index, *detail_scroll_offset, None, *card_scroll_offset, show_add_card);
+                        }
+                        AppState::ProjectChooser { selected_index, .. } => {
+                            self.queue_project_chooser_text(projects, *selected_index);
+                        }
+                        _ => {}
+                    }
+                    // Queue recording indicator overlay
+                    self.queue_recording_indicator_text(recorder.elapsed(), *paused);
+                }
             }
 
             // Edit mode indicator (overlay)
             if edit_mode_active {
                 let panels = self.compute_ui_panels(base_state);
                 self.queue_edit_mode_indicator(&panels, selected_panel, resize_preview, reflow_positions);
+
+                // Panel chooser dialog (if open)
+                if let Some((spawn_pos, selection)) = panel_chooser {
+                    self.queue_panel_chooser(spawn_pos, selection);
+                }
+            }
+
+            // Recording indicator cards (overlay)
+            let mut recording_cards = Vec::new();
+            if let AppState::Recording { paused, .. } = base_state {
+                recording_cards = self.build_recording_indicator_cards(*paused);
             }
 
             // Prepare text
@@ -1857,9 +1911,10 @@ impl Renderer {
                     multiview_mask: None,
                 });
 
-                // Combine base cards and edit mode cards into one draw call
+                // Combine base cards, edit mode cards, and recording indicator into one draw call
                 let mut all_cards = base_cards.clone();
                 all_cards.extend(self.edit_mode_cards.iter().cloned());
+                all_cards.extend(recording_cards.iter().cloned());
                 self.card_renderer
                     .draw(&mut render_pass, &self.queue, &all_cards);
 
@@ -1960,12 +2015,44 @@ impl Renderer {
                 AppState::ProjectContextMenu { .. } => {}
                 AppState::LanguageSelector { .. } => {}
                 AppState::NewMonitorDialog { .. } => {}
+                AppState::ScenarioDiffViewer { viewer, feedback_mode, feedback_options, selected_feedback, custom_feedback, custom_cursor, .. } => {
+                    self.queue_diff_viewer_text(viewer, *feedback_mode, feedback_options, *selected_feedback, custom_feedback.as_deref(), *custom_cursor);
+                }
+                AppState::ScenarioGenerator { generator, .. } => {
+                    self.queue_generator_text(generator);
+                }
+                AppState::Recording { inner_state, recorder, paused, .. } => {
+                    // Queue inner state's text
+                    match inner_state.as_ref() {
+                        AppState::PalaceLoop { cards, current_tool, tool_log, thought_log, log_scroll_offset, focused_index, hovered_index, detail_scroll_offset, card_scroll_offset, generating, .. } => {
+                            let show_add_card = !cards.is_empty() || !generating;
+                            self.queue_palace_loop_text(cards, current_tool.as_deref(), tool_log, thought_log, *log_scroll_offset, *focused_index, *hovered_index, *detail_scroll_offset, None, *card_scroll_offset, show_add_card);
+                        }
+                        AppState::ProjectChooser { selected_index, .. } => {
+                            self.queue_project_chooser_text(projects, *selected_index);
+                        }
+                        _ => {}
+                    }
+                    // Queue recording indicator overlay
+                    self.queue_recording_indicator_text(recorder.elapsed(), *paused);
+                }
             }
 
             // Edit mode indicator (overlay)
             if edit_mode_active {
                 let panels = self.compute_ui_panels(base_state);
                 self.queue_edit_mode_indicator(&panels, selected_panel, resize_preview, reflow_positions);
+
+                // Panel chooser dialog (if open)
+                if let Some((spawn_pos, selection)) = panel_chooser {
+                    self.queue_panel_chooser(spawn_pos, selection);
+                }
+            }
+
+            // Recording indicator cards (overlay)
+            let mut recording_cards = Vec::new();
+            if let AppState::Recording { paused, .. } = base_state {
+                recording_cards = self.build_recording_indicator_cards(*paused);
             }
 
             // Prepare text
@@ -1995,10 +2082,10 @@ impl Renderer {
                     multiview_mask: None,
                 });
 
-                // Combine base cards and edit mode cards into one draw call
-                // (Drawing twice overwrites the instance buffer - race condition)
+                // Combine base cards, edit mode cards, and recording indicator into one draw call
                 let mut all_cards = base_cards;
                 all_cards.extend(self.edit_mode_cards.iter().cloned());
+                all_cards.extend(recording_cards.iter().cloned());
                 self.card_renderer
                     .draw(&mut render_pass, &self.queue, &all_cards);
 
@@ -4316,6 +4403,884 @@ impl Renderer {
         }
     }
 
+    // --- Scenario Generator Rendering ---
+
+    /// Build cards for the scenario generator wizard
+    pub fn build_generator_cards(&self, generator: &crate::scenario::ScenarioGenerator) -> Vec<CardInstance> {
+        use crate::scenario::{GeneratorState, StartOption};
+
+        let (content_w, content_h) = self.content_size();
+        let (offset_x, offset_y) = self.content_offset();
+
+        let mut cards = Vec::new();
+        let padding = self.ui_scale.px(24.0);
+        let card_height = self.ui_scale.px(60.0);
+        let card_gap = self.ui_scale.px(12.0);
+        let card_width = content_w.min(self.ui_scale.px(400.0)) - padding * 2.0;
+        let start_x = offset_x + (content_w - card_width) / 2.0;
+        let start_y = offset_y + self.ui_scale.px(150.0);
+
+        match generator.current_state() {
+            GeneratorState::Start { selected } => {
+                for (i, opt) in StartOption::all().iter().enumerate() {
+                    let is_selected = i == *selected;
+                    let y = start_y + i as f32 * (card_height + card_gap);
+
+                    let bg_color = if is_selected {
+                        [0.15, 0.2, 0.3, 1.0]
+                    } else {
+                        [0.1, 0.1, 0.15, 0.8]
+                    };
+
+                    let card = CardInstance::new(start_x, y, card_width, card_height, bg_color)
+                        .with_corner_radius(self.ui_scale.px(12.0))
+                        .with_border_width(if is_selected { self.ui_scale.px(2.0) } else { 0.0 })
+                        .with_border_color([0.4, 0.6, 1.0, 0.8]);
+
+                    cards.push(if is_selected { card.selected() } else { card });
+                }
+            }
+            GeneratorState::DescriptionInput { .. } | GeneratorState::Feedback { .. } => {
+                // Text input card
+                let input_height = self.ui_scale.px(120.0);
+                cards.push(
+                    CardInstance::new(start_x, start_y, card_width, input_height, [0.08, 0.08, 0.12, 1.0])
+                        .with_corner_radius(self.ui_scale.px(8.0))
+                        .with_border_width(self.ui_scale.px(2.0))
+                        .with_border_color([0.4, 0.5, 0.7, 0.6])
+                );
+            }
+            GeneratorState::Survey { current_question, selected_option, selected_options, .. } => {
+                for (i, _opt) in current_question.options.iter().enumerate() {
+                    let is_selected = i == *selected_option;
+                    let is_checked = selected_options.contains(&i);
+                    let y = start_y + i as f32 * (card_height + card_gap);
+
+                    let bg_color = if is_selected {
+                        [0.15, 0.2, 0.3, 1.0]
+                    } else if is_checked {
+                        [0.1, 0.15, 0.2, 1.0]
+                    } else {
+                        [0.1, 0.1, 0.15, 0.8]
+                    };
+
+                    let card = CardInstance::new(start_x, y, card_width, card_height, bg_color)
+                        .with_corner_radius(self.ui_scale.px(12.0))
+                        .with_border_width(if is_selected || is_checked { self.ui_scale.px(2.0) } else { 0.0 })
+                        .with_border_color(if is_checked { [0.3, 0.7, 0.3, 0.8] } else { [0.4, 0.6, 1.0, 0.8] });
+
+                    cards.push(if is_selected { card.selected() } else { card });
+                }
+            }
+            GeneratorState::Preview { .. } => {
+                // Preview card (full width)
+                let preview_height = content_h - self.ui_scale.px(200.0);
+                cards.push(
+                    CardInstance::new(start_x, start_y, card_width, preview_height, [0.06, 0.06, 0.1, 1.0])
+                        .with_corner_radius(self.ui_scale.px(8.0))
+                        .with_border_width(self.ui_scale.px(1.0))
+                        .with_border_color([0.3, 0.3, 0.4, 0.5])
+                );
+            }
+            GeneratorState::Enriching { .. } | GeneratorState::Generating { .. } => {
+                // Loading spinner area
+                cards.push(
+                    CardInstance::new(start_x + card_width / 3.0, start_y, card_width / 3.0, self.ui_scale.px(80.0), [0.1, 0.1, 0.15, 0.6])
+                        .with_corner_radius(self.ui_scale.px(12.0))
+                );
+            }
+            _ => {}
+        }
+
+        cards
+    }
+
+    /// Queue text for the scenario generator wizard
+    pub fn queue_generator_text(&mut self, generator: &crate::scenario::ScenarioGenerator) {
+        use crate::scenario::{GeneratorState, StartOption};
+
+        let (content_w, content_h) = self.content_size();
+        let (offset_x, offset_y) = self.content_offset();
+
+        let padding = self.ui_scale.px(24.0);
+        let card_height = self.ui_scale.px(60.0);
+        let card_gap = self.ui_scale.px(12.0);
+        let card_width = content_w.min(self.ui_scale.px(400.0)) - padding * 2.0;
+        let start_x = offset_x + (content_w - card_width) / 2.0;
+        let start_y = offset_y + self.ui_scale.px(150.0);
+
+        let title_scale = self.ui_scale.px(32.0);
+        let label_scale = self.ui_scale.px(18.0);
+        let desc_scale = self.ui_scale.px(14.0);
+        let text_color = self.text_color();
+        let dim_color = self.text_color_dim();
+
+        // Title
+        self.text_queue.push(
+            "SCENARIO GENERATOR",
+            offset_x + (content_w - self.ui_scale.px(280.0)) / 2.0,
+            offset_y + self.ui_scale.px(60.0),
+            title_scale,
+            [0.7, 0.5, 1.0, 1.0],
+        );
+
+        match generator.current_state() {
+            GeneratorState::Start { selected } => {
+                // Subtitle
+                self.text_queue.push(
+                    "How would you like to create a scenario?",
+                    start_x,
+                    offset_y + self.ui_scale.px(110.0),
+                    desc_scale,
+                    dim_color,
+                );
+
+                // Options
+                for (i, opt) in StartOption::all().iter().enumerate() {
+                    let is_selected = i == *selected;
+                    let y = start_y + i as f32 * (card_height + card_gap);
+
+                    self.text_queue.push(
+                        opt.label(),
+                        start_x + self.ui_scale.px(16.0),
+                        y + self.ui_scale.px(12.0),
+                        label_scale,
+                        if is_selected { text_color } else { dim_color },
+                    );
+                    self.text_queue.push(
+                        opt.description(),
+                        start_x + self.ui_scale.px(16.0),
+                        y + self.ui_scale.px(34.0),
+                        desc_scale,
+                        [0.5, 0.5, 0.6, 0.8],
+                    );
+                }
+            }
+            GeneratorState::DescriptionInput { text, cursor } => {
+                // Instructions
+                self.text_queue.push(
+                    "Describe what you want to build:",
+                    start_x,
+                    offset_y + self.ui_scale.px(110.0),
+                    desc_scale,
+                    dim_color,
+                );
+
+                // Input text with cursor
+                let display_text = if text.is_empty() {
+                    "Type your description here..."
+                } else {
+                    text.as_str()
+                };
+                let input_color = if text.is_empty() { [0.4, 0.4, 0.5, 0.6] } else { text_color };
+                self.text_queue.push_bounded(
+                    display_text,
+                    start_x + self.ui_scale.px(12.0),
+                    start_y + self.ui_scale.px(12.0),
+                    label_scale,
+                    input_color,
+                    card_width - self.ui_scale.px(24.0),
+                    self.ui_scale.px(96.0),
+                );
+
+                // Hint
+                self.text_queue.push(
+                    "Press Enter to submit, Esc to go back",
+                    start_x,
+                    start_y + self.ui_scale.px(140.0),
+                    desc_scale,
+                    [0.5, 0.5, 0.6, 0.6],
+                );
+            }
+            GeneratorState::Enriching { original } => {
+                self.text_queue.push(
+                    "Expanding your description...",
+                    start_x,
+                    start_y,
+                    label_scale,
+                    [0.6, 0.8, 1.0, 1.0],
+                );
+                self.text_queue.push_bounded(
+                    original,
+                    start_x,
+                    start_y + self.ui_scale.px(40.0),
+                    desc_scale,
+                    dim_color,
+                    card_width,
+                    self.ui_scale.px(100.0),
+                );
+            }
+            GeneratorState::Survey { current_question, selected_option, selected_options, .. } => {
+                // Question
+                self.text_queue.push_bounded(
+                    &current_question.question,
+                    start_x,
+                    offset_y + self.ui_scale.px(100.0),
+                    label_scale,
+                    text_color,
+                    card_width,
+                    self.ui_scale.px(50.0),
+                );
+
+                // Context (if any)
+                if let Some(context) = &current_question.context {
+                    self.text_queue.push_bounded(
+                        context,
+                        start_x,
+                        offset_y + self.ui_scale.px(130.0),
+                        desc_scale,
+                        [0.5, 0.6, 0.7, 0.8],
+                        card_width,
+                        self.ui_scale.px(40.0),
+                    );
+                }
+
+                // Options
+                for (i, opt) in current_question.options.iter().enumerate() {
+                    let is_selected = i == *selected_option;
+                    let is_checked = selected_options.contains(&i);
+                    let y = start_y + i as f32 * (card_height + card_gap);
+
+                    // Checkbox indicator for multi-select
+                    let prefix = if current_question.multi_select {
+                        if is_checked { "☑ " } else { "☐ " }
+                    } else {
+                        ""
+                    };
+
+                    self.text_queue.push(
+                        &format!("{}{}", prefix, opt.label),
+                        start_x + self.ui_scale.px(16.0),
+                        y + self.ui_scale.px(12.0),
+                        label_scale,
+                        if is_selected || is_checked { text_color } else { dim_color },
+                    );
+
+                    if let Some(desc) = &opt.description {
+                        self.text_queue.push(
+                            desc,
+                            start_x + self.ui_scale.px(16.0),
+                            y + self.ui_scale.px(34.0),
+                            desc_scale,
+                            [0.5, 0.5, 0.6, 0.8],
+                        );
+                    }
+                }
+            }
+            GeneratorState::Generating { .. } => {
+                self.text_queue.push(
+                    "Generating scenario...",
+                    start_x + self.ui_scale.px(50.0),
+                    start_y + self.ui_scale.px(30.0),
+                    label_scale,
+                    [0.6, 0.8, 1.0, 1.0],
+                );
+            }
+            GeneratorState::Preview { scenario, scroll_offset } => {
+                // Preview title
+                self.text_queue.push(
+                    "Generated Scenario Preview",
+                    start_x,
+                    offset_y + self.ui_scale.px(110.0),
+                    desc_scale,
+                    dim_color,
+                );
+
+                // YAML preview (simple version)
+                let yaml = format!(
+                    "scenario:\n  name: \"{}\"\n\ngoals:\n{}\n\nproject:\n  path: {}",
+                    scenario.scenario.name,
+                    scenario.goals.iter()
+                        .map(|g| format!("  - \"{}\"", g))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    scenario.project.path,
+                );
+
+                self.text_queue.push_bounded(
+                    &yaml,
+                    start_x + self.ui_scale.px(12.0),
+                    start_y + self.ui_scale.px(12.0) - scroll_offset,
+                    desc_scale,
+                    text_color,
+                    card_width - self.ui_scale.px(24.0),
+                    content_h - self.ui_scale.px(250.0),
+                );
+
+                // Actions hint
+                self.text_queue.push(
+                    "[A] Accept  [B] Feedback  [Esc] Cancel",
+                    start_x,
+                    offset_y + content_h - self.ui_scale.px(50.0),
+                    desc_scale,
+                    [0.5, 0.5, 0.6, 0.7],
+                );
+            }
+            GeneratorState::Feedback { feedback_text, .. } => {
+                self.text_queue.push(
+                    "What would you like to change?",
+                    start_x,
+                    offset_y + self.ui_scale.px(110.0),
+                    desc_scale,
+                    dim_color,
+                );
+
+                let display_text = if feedback_text.is_empty() {
+                    "Enter your feedback..."
+                } else {
+                    feedback_text.as_str()
+                };
+                let input_color = if feedback_text.is_empty() { [0.4, 0.4, 0.5, 0.6] } else { text_color };
+                self.text_queue.push_bounded(
+                    display_text,
+                    start_x + self.ui_scale.px(12.0),
+                    start_y + self.ui_scale.px(12.0),
+                    label_scale,
+                    input_color,
+                    card_width - self.ui_scale.px(24.0),
+                    self.ui_scale.px(96.0),
+                );
+            }
+            GeneratorState::ForkPicker { files, selected } => {
+                self.text_queue.push(
+                    "Select scenario to fork:",
+                    start_x,
+                    offset_y + self.ui_scale.px(110.0),
+                    desc_scale,
+                    dim_color,
+                );
+
+                if files.is_empty() {
+                    self.text_queue.push(
+                        "No scenario files found",
+                        start_x,
+                        start_y,
+                        label_scale,
+                        [0.6, 0.4, 0.4, 0.8],
+                    );
+                } else {
+                    for (i, path) in files.iter().enumerate() {
+                        let is_selected = i == *selected;
+                        let y = start_y + i as f32 * (card_height + card_gap);
+                        let name = path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown");
+
+                        self.text_queue.push(
+                            name,
+                            start_x + self.ui_scale.px(16.0),
+                            y + self.ui_scale.px(20.0),
+                            label_scale,
+                            if is_selected { text_color } else { dim_color },
+                        );
+                    }
+                }
+            }
+            GeneratorState::Done { output_path } => {
+                self.text_queue.push(
+                    "✓ Scenario saved!",
+                    start_x + self.ui_scale.px(50.0),
+                    start_y,
+                    label_scale,
+                    [0.3, 0.8, 0.3, 1.0],
+                );
+                self.text_queue.push(
+                    &*output_path.to_string_lossy(),
+                    start_x,
+                    start_y + self.ui_scale.px(40.0),
+                    desc_scale,
+                    dim_color,
+                );
+            }
+        }
+    }
+
+    // --- Scenario Diff Viewer Rendering ---
+
+    /// Build cards for the diff viewer (side-by-side diff with synchronized scrolling)
+    pub fn build_diff_viewer_cards(
+        &self,
+        viewer: &crate::scenario::DiffViewer,
+        feedback_mode: bool,
+        feedback_options: &[crate::scenario::FeedbackOption],
+        selected_feedback: usize,
+        custom_feedback: Option<&str>,
+        _custom_cursor: usize,
+    ) -> Vec<CardInstance> {
+        use crate::scenario::DiffKind;
+
+        let (content_w, content_h) = self.content_size();
+        let (offset_x, offset_y) = self.content_offset();
+
+        let mut cards = Vec::new();
+
+        let padding = self.ui_scale.px(16.0);
+        let header_height = self.ui_scale.px(60.0);
+        let col_width = (content_w - padding * 3.0) / 2.0;
+        let line_height = viewer.line_height;
+
+        // Left column background (original)
+        cards.push(
+            CardInstance::new(offset_x + padding, offset_y + header_height, col_width, content_h - header_height - self.ui_scale.px(50.0), [0.06, 0.06, 0.08, 1.0])
+                .with_corner_radius(self.ui_scale.px(8.0))
+        );
+
+        // Right column background (corrected)
+        cards.push(
+            CardInstance::new(offset_x + padding * 2.0 + col_width, offset_y + header_height, col_width, content_h - header_height - self.ui_scale.px(50.0), [0.06, 0.06, 0.08, 1.0])
+                .with_corner_radius(self.ui_scale.px(8.0))
+        );
+
+        // Render diff chunks
+        let start_y = offset_y + header_height + padding;
+        let visible_height = content_h - header_height - self.ui_scale.px(100.0);
+
+        for (i, chunk) in viewer.chunks.iter().enumerate() {
+            let chunk_y = viewer.chunk_y(i) - viewer.scroll_offset;
+
+            // Skip if off-screen
+            if chunk_y + chunk.height_lines() as f32 * line_height < 0.0
+                || chunk_y > visible_height
+            {
+                continue;
+            }
+
+            let actual_y = start_y + chunk_y;
+            let chunk_height = if viewer.collapsed.contains(&i) {
+                viewer.collapsed_height()
+            } else {
+                chunk.height_lines() as f32 * line_height
+            };
+
+            // Skip if completely off-screen
+            if actual_y > offset_y + content_h || actual_y + chunk_height < offset_y + header_height {
+                continue;
+            }
+
+            let is_focused = i == viewer.cursor_chunk;
+
+            // Background color based on diff kind
+            let bg_color = match chunk.kind {
+                DiffKind::Context => [0.0, 0.0, 0.0, 0.0],
+                DiffKind::Added => [0.1, 0.3, 0.1, 0.4],
+                DiffKind::Removed => [0.3, 0.1, 0.1, 0.4],
+                DiffKind::Modified => [0.3, 0.3, 0.1, 0.4],
+            };
+
+            // Collapsed marker bar
+            if viewer.collapsed.contains(&i) {
+                let marker_color = chunk.kind.marker_color();
+                // Left marker
+                cards.push(
+                    CardInstance::new(offset_x + padding, actual_y, col_width, viewer.collapsed_height(), marker_color)
+                        .with_corner_radius(2.0)
+                );
+                // Right marker
+                cards.push(
+                    CardInstance::new(offset_x + padding * 2.0 + col_width, actual_y, col_width, viewer.collapsed_height(), marker_color)
+                        .with_corner_radius(2.0)
+                );
+            } else {
+                // Left side (original)
+                if chunk.has_original() && bg_color[3] > 0.0 {
+                    cards.push(
+                        CardInstance::new(offset_x + padding, actual_y, col_width, chunk_height, bg_color)
+                            .with_corner_radius(4.0)
+                    );
+                }
+
+                // Right side (corrected)
+                if chunk.has_corrected() && bg_color[3] > 0.0 {
+                    cards.push(
+                        CardInstance::new(offset_x + padding * 2.0 + col_width, actual_y, col_width, chunk_height, bg_color)
+                            .with_corner_radius(4.0)
+                    );
+                }
+
+                // Marker bar for added (right only has content)
+                if chunk.kind == DiffKind::Added {
+                    cards.push(
+                        CardInstance::new(offset_x + padding + col_width / 2.0 - self.ui_scale.px(20.0), actual_y + chunk_height / 2.0 - 2.0, self.ui_scale.px(40.0), 4.0, [0.3, 0.15, 0.15, 0.8])
+                            .with_corner_radius(2.0)
+                    );
+                }
+
+                // Marker bar for removed (left only has content)
+                if chunk.kind == DiffKind::Removed {
+                    cards.push(
+                        CardInstance::new(offset_x + padding * 2.0 + col_width + col_width / 2.0 - self.ui_scale.px(20.0), actual_y + chunk_height / 2.0 - 2.0, self.ui_scale.px(40.0), 4.0, [0.15, 0.3, 0.15, 0.8])
+                            .with_corner_radius(2.0)
+                    );
+                }
+            }
+
+            // Focus indicator
+            if is_focused {
+                cards.push(
+                    CardInstance::new(offset_x + padding - 4.0, actual_y - 2.0, col_width * 2.0 + padding + 8.0, chunk_height + 4.0, [0.3, 0.5, 0.9, 0.0])
+                        .with_corner_radius(self.ui_scale.px(6.0))
+                        .with_border_width(self.ui_scale.px(2.0))
+                        .with_border_color([0.4, 0.6, 1.0, 0.8])
+                        .selected()
+                );
+            }
+        }
+
+        // Feedback modal overlay
+        if feedback_mode {
+            // Dim background
+            cards.push(
+                CardInstance::new(offset_x, offset_y, content_w, content_h, [0.0, 0.0, 0.0, 0.6])
+            );
+
+            // Modal card
+            let modal_width = content_w.min(self.ui_scale.px(500.0));
+            let option_height = self.ui_scale.px(50.0);
+            let option_gap = self.ui_scale.px(8.0);
+            let modal_padding = self.ui_scale.px(24.0);
+            let header_h = self.ui_scale.px(80.0);
+
+            // Calculate modal height based on content
+            let options_height = if custom_feedback.is_some() {
+                self.ui_scale.px(120.0) // Custom input area
+            } else {
+                feedback_options.len() as f32 * (option_height + option_gap) - option_gap
+            };
+            let modal_height = header_h + options_height + modal_padding * 2.0;
+            let modal_x = offset_x + (content_w - modal_width) / 2.0;
+            let modal_y = offset_y + (content_h - modal_height) / 2.0;
+
+            // Modal background
+            cards.push(
+                CardInstance::new(modal_x, modal_y, modal_width, modal_height, [0.1, 0.1, 0.15, 0.98])
+                    .with_corner_radius(self.ui_scale.px(16.0))
+                    .with_border_width(self.ui_scale.px(2.0))
+                    .with_border_color([0.4, 0.5, 0.7, 0.6])
+            );
+
+            if custom_feedback.is_some() {
+                // Custom feedback text input area
+                cards.push(
+                    CardInstance::new(
+                        modal_x + modal_padding,
+                        modal_y + header_h,
+                        modal_width - modal_padding * 2.0,
+                        self.ui_scale.px(100.0),
+                        [0.08, 0.08, 0.12, 1.0],
+                    )
+                    .with_corner_radius(self.ui_scale.px(8.0))
+                    .with_border_width(self.ui_scale.px(2.0))
+                    .with_border_color([0.3, 0.5, 0.8, 0.8])
+                );
+            } else {
+                // Feedback option cards
+                let options_start_y = modal_y + header_h;
+                for (i, _option) in feedback_options.iter().enumerate() {
+                    let is_selected = i == selected_feedback;
+                    let opt_y = options_start_y + i as f32 * (option_height + option_gap);
+
+                    let bg_color = if is_selected {
+                        [0.15, 0.2, 0.3, 1.0]
+                    } else {
+                        [0.08, 0.08, 0.12, 0.8]
+                    };
+
+                    let mut card = CardInstance::new(
+                        modal_x + modal_padding,
+                        opt_y,
+                        modal_width - modal_padding * 2.0,
+                        option_height,
+                        bg_color,
+                    )
+                    .with_corner_radius(self.ui_scale.px(8.0));
+
+                    if is_selected {
+                        card = card
+                            .with_border_width(self.ui_scale.px(2.0))
+                            .with_border_color([0.4, 0.6, 1.0, 0.8])
+                            .selected();
+                    }
+
+                    cards.push(card);
+                }
+            }
+        }
+
+        cards
+    }
+
+    /// Queue text for the diff viewer
+    pub fn queue_diff_viewer_text(
+        &mut self,
+        viewer: &crate::scenario::DiffViewer,
+        feedback_mode: bool,
+        feedback_options: &[crate::scenario::FeedbackOption],
+        selected_feedback: usize,
+        custom_feedback: Option<&str>,
+        custom_cursor: usize,
+    ) {
+        use crate::scenario::DiffKind;
+
+        let (content_w, content_h) = self.content_size();
+        let (offset_x, offset_y) = self.content_offset();
+
+        let padding = self.ui_scale.px(16.0);
+        let header_height = self.ui_scale.px(60.0);
+        let col_width = (content_w - padding * 3.0) / 2.0;
+        let title_scale = self.ui_scale.px(24.0);
+        let code_scale = self.ui_scale.px(13.0);
+        let desc_scale = self.ui_scale.px(12.0);
+        let text_color = self.text_color();
+        let dim_color = self.text_color_dim();
+        let line_height = viewer.line_height;
+
+        // Title
+        self.text_queue.push(
+            "SCENARIO CORRECTOR",
+            offset_x + (content_w - self.ui_scale.px(240.0)) / 2.0,
+            offset_y + self.ui_scale.px(16.0),
+            title_scale,
+            [0.8, 0.5, 0.5, 1.0],
+        );
+
+        // Column headers
+        self.text_queue.push("ORIGINAL", offset_x + padding + self.ui_scale.px(8.0), offset_y + self.ui_scale.px(44.0), desc_scale, [0.6, 0.4, 0.4, 1.0]);
+        self.text_queue.push("CORRECTED", offset_x + padding * 2.0 + col_width + self.ui_scale.px(8.0), offset_y + self.ui_scale.px(44.0), desc_scale, [0.4, 0.6, 0.4, 1.0]);
+
+        // Change counter
+        let change_info = if let Some(idx) = viewer.current_change_index() {
+            format!("Change {} of {}", idx, viewer.change_count())
+        } else {
+            format!("{} changes", viewer.change_count())
+        };
+        self.text_queue.push(&change_info, offset_x + content_w - self.ui_scale.px(120.0), offset_y + self.ui_scale.px(20.0), desc_scale, dim_color);
+
+        // Iteration badge
+        self.text_queue.push(&format!("Iteration {}", viewer.iteration), offset_x + content_w - self.ui_scale.px(120.0), offset_y + self.ui_scale.px(36.0), desc_scale, [0.5, 0.5, 0.7, 0.8]);
+
+        // Render chunk text
+        let start_y = offset_y + header_height + padding;
+        let visible_height = content_h - header_height - self.ui_scale.px(100.0);
+
+        for (i, chunk) in viewer.chunks.iter().enumerate() {
+            let chunk_y = viewer.chunk_y(i) - viewer.scroll_offset;
+
+            // Skip if off-screen
+            if chunk_y + chunk.height_lines() as f32 * line_height < 0.0
+                || chunk_y > visible_height
+            {
+                continue;
+            }
+
+            let actual_y = start_y + chunk_y;
+
+            // Skip collapsed chunks (just show marker)
+            if viewer.collapsed.contains(&i) {
+                let kind_label = match chunk.kind {
+                    DiffKind::Context => "context",
+                    DiffKind::Added => "added",
+                    DiffKind::Removed => "removed",
+                    DiffKind::Modified => "modified",
+                };
+                let lines_info = format!("{} ({} lines)", kind_label, chunk.height_lines());
+                self.text_queue.push(&lines_info, offset_x + content_w / 2.0 - self.ui_scale.px(40.0), actual_y, desc_scale, [0.5, 0.5, 0.5, 0.7]);
+                continue;
+            }
+
+            // Original lines (left column)
+            for (j, line) in chunk.original_lines.iter().enumerate() {
+                let line_y = actual_y + j as f32 * line_height;
+                if line_y > offset_y + content_h - self.ui_scale.px(50.0) {
+                    break;
+                }
+                self.text_queue.push_bounded(
+                    line,
+                    offset_x + padding + self.ui_scale.px(4.0),
+                    line_y,
+                    code_scale,
+                    text_color,
+                    col_width - self.ui_scale.px(8.0),
+                    line_height,
+                );
+            }
+
+            // Corrected lines (right column)
+            for (j, line) in chunk.corrected_lines.iter().enumerate() {
+                let line_y = actual_y + j as f32 * line_height;
+                if line_y > offset_y + content_h - self.ui_scale.px(50.0) {
+                    break;
+                }
+                self.text_queue.push_bounded(
+                    line,
+                    offset_x + padding * 2.0 + col_width + self.ui_scale.px(4.0),
+                    line_y,
+                    code_scale,
+                    text_color,
+                    col_width - self.ui_scale.px(8.0),
+                    line_height,
+                );
+            }
+
+            // Explanation tooltip for focused chunk
+            if i == viewer.cursor_chunk {
+                if let Some(explanation) = &chunk.explanation {
+                    let tooltip_y = offset_y + content_h - self.ui_scale.px(80.0);
+                    self.text_queue.push_bounded(
+                        explanation,
+                        offset_x + padding,
+                        tooltip_y,
+                        desc_scale,
+                        [0.7, 0.7, 0.8, 0.9],
+                        content_w - padding * 2.0,
+                        self.ui_scale.px(40.0),
+                    );
+                }
+            }
+        }
+
+        // Overall explanation
+        if !viewer.explanation.is_empty() && !feedback_mode {
+            self.text_queue.push_bounded(
+                &viewer.explanation,
+                offset_x + padding,
+                offset_y + content_h - self.ui_scale.px(45.0),
+                desc_scale,
+                [0.6, 0.6, 0.7, 0.8],
+                content_w - padding * 2.0 - self.ui_scale.px(200.0),
+                self.ui_scale.px(20.0),
+            );
+        }
+
+        // Controls hint (changes based on mode)
+        if !feedback_mode {
+            let controls = "[↑↓] Navigate  [N/P] Next/Prev Change  [Enter] Collapse  [A] Accept  [F] Feedback";
+            self.text_queue.push(controls, offset_x + content_w - self.ui_scale.px(450.0), offset_y + content_h - self.ui_scale.px(25.0), desc_scale, [0.4, 0.4, 0.5, 0.7]);
+        }
+
+        // Feedback modal text
+        if feedback_mode {
+            let modal_width = content_w.min(self.ui_scale.px(500.0));
+            let option_height = self.ui_scale.px(50.0);
+            let option_gap = self.ui_scale.px(8.0);
+            let modal_padding = self.ui_scale.px(24.0);
+            let header_h = self.ui_scale.px(80.0);
+
+            let options_height = if custom_feedback.is_some() {
+                self.ui_scale.px(120.0)
+            } else {
+                feedback_options.len() as f32 * (option_height + option_gap) - option_gap
+            };
+            let modal_height = header_h + options_height + modal_padding * 2.0;
+            let modal_x = offset_x + (content_w - modal_width) / 2.0;
+            let modal_y = offset_y + (content_h - modal_height) / 2.0;
+
+            let label_scale = self.ui_scale.px(16.0);
+
+            // Modal title
+            self.text_queue.push(
+                "PROVIDE FEEDBACK",
+                modal_x + modal_padding,
+                modal_y + self.ui_scale.px(20.0),
+                title_scale,
+                [0.8, 0.6, 0.5, 1.0],
+            );
+
+            // Chunk info
+            if let Some(chunk) = viewer.chunks.get(viewer.cursor_chunk) {
+                let chunk_info = format!("Chunk {} of {}: {:?}", viewer.cursor_chunk + 1, viewer.chunks.len(), chunk.kind);
+                self.text_queue.push(
+                    &chunk_info,
+                    modal_x + modal_padding,
+                    modal_y + self.ui_scale.px(50.0),
+                    desc_scale,
+                    dim_color,
+                );
+            }
+
+            if let Some(custom_text) = custom_feedback {
+                // Custom feedback input mode
+                self.text_queue.push(
+                    "Enter your feedback:",
+                    modal_x + modal_padding,
+                    modal_y + header_h - self.ui_scale.px(20.0),
+                    desc_scale,
+                    dim_color,
+                );
+
+                // Show the custom text with cursor
+                let display_text = if custom_text.is_empty() {
+                    "Type your feedback here..."
+                } else {
+                    custom_text
+                };
+                let text_color = if custom_text.is_empty() {
+                    [0.4, 0.4, 0.5, 0.5]
+                } else {
+                    text_color
+                };
+                self.text_queue.push_bounded(
+                    display_text,
+                    modal_x + modal_padding + self.ui_scale.px(8.0),
+                    modal_y + header_h + self.ui_scale.px(8.0),
+                    code_scale,
+                    text_color,
+                    modal_width - modal_padding * 2.0 - self.ui_scale.px(16.0),
+                    self.ui_scale.px(80.0),
+                );
+
+                // Cursor indicator (simple block)
+                if !custom_text.is_empty() && custom_cursor <= custom_text.len() {
+                    // Approximate cursor position
+                    let char_width = self.ui_scale.px(8.0);
+                    let cursor_x = modal_x + modal_padding + self.ui_scale.px(8.0) + custom_cursor as f32 * char_width;
+                    self.text_queue.push("│", cursor_x, modal_y + header_h + self.ui_scale.px(8.0), code_scale, [0.4, 0.6, 1.0, 1.0]);
+                }
+
+                // Controls
+                self.text_queue.push(
+                    "[Enter] Submit  [Esc] Cancel",
+                    modal_x + modal_padding,
+                    modal_y + modal_height - self.ui_scale.px(30.0),
+                    desc_scale,
+                    [0.4, 0.4, 0.5, 0.7],
+                );
+            } else {
+                // Feedback options mode
+                self.text_queue.push(
+                    "What's wrong with this correction?",
+                    modal_x + modal_padding,
+                    modal_y + header_h - self.ui_scale.px(20.0),
+                    desc_scale,
+                    dim_color,
+                );
+
+                let options_start_y = modal_y + header_h;
+                for (i, option) in feedback_options.iter().enumerate() {
+                    let is_selected = i == selected_feedback;
+                    let opt_y = options_start_y + i as f32 * (option_height + option_gap);
+
+                    let color = if is_selected { text_color } else { dim_color };
+                    self.text_queue.push(
+                        &option.label,
+                        modal_x + modal_padding + self.ui_scale.px(16.0),
+                        opt_y + self.ui_scale.px(16.0),
+                        label_scale,
+                        color,
+                    );
+                }
+
+                // Controls
+                self.text_queue.push(
+                    "[↑↓] Navigate  [A/Enter] Select  [B/Esc] Cancel",
+                    modal_x + modal_padding,
+                    modal_y + modal_height - self.ui_scale.px(30.0),
+                    desc_scale,
+                    [0.4, 0.4, 0.5, 0.7],
+                );
+            }
+        }
+    }
+
     fn queue_project_view_text(
         &mut self,
         project_path: &std::path::Path,
@@ -5253,6 +6218,20 @@ impl Renderer {
                 (XboxButton::A, "Select"),
                 (XboxButton::B, "Cancel"),
             ],
+            AppState::ScenarioDiffViewer { .. } => vec![
+                (XboxButton::LeftStick, "Navigate"),
+                (XboxButton::A, "Collapse"),
+                (XboxButton::B, "Back"),
+                (XboxButton::X, "Accept"),
+            ],
+            AppState::ScenarioGenerator { .. } => vec![
+                (XboxButton::LeftStick, "Navigate"),
+                (XboxButton::A, "Select"),
+                (XboxButton::B, "Back"),
+            ],
+            AppState::Recording { .. } => vec![
+                (XboxButton::Start, "Stop Recording"),
+            ],
         }
     }
 
@@ -5429,6 +6408,21 @@ impl Renderer {
                 ("←→", "Navigate"),
                 ("Enter", "Select"),
                 ("Esc", "Cancel"),
+            ],
+            AppState::ScenarioDiffViewer { .. } => vec![
+                ("WASD", "Navigate"),
+                ("N/P", "Next/Prev Change"),
+                ("Enter", "Collapse"),
+                ("Esc", "Back"),
+            ],
+            AppState::ScenarioGenerator { .. } => vec![
+                ("↑↓", "Navigate"),
+                ("Enter", "Select"),
+                ("Esc", "Back"),
+            ],
+            AppState::Recording { .. } => vec![
+                ("F9", "Pause"),
+                ("F10", "Stop"),
             ],
         }
     }
@@ -5695,6 +6689,474 @@ impl Renderer {
             self.ui_scale.px(14.0),
             [0.5, 0.7, 1.0, 0.9],
         );
+    }
+
+    /// Build recording indicator cards (red dot in top-right)
+    pub fn build_recording_indicator_cards(&self, paused: bool) -> Vec<CardInstance> {
+        let (content_w, _content_h) = self.content_size();
+        let (offset_x, offset_y) = self.content_offset();
+
+        let mut cards = Vec::new();
+
+        // Red dot position (top-right)
+        let dot_size = self.ui_scale.px(12.0);
+        let margin = self.ui_scale.px(16.0);
+        let dot_x = offset_x + content_w - margin - dot_size - self.ui_scale.px(50.0);
+        let dot_y = offset_y + margin;
+
+        // Red recording dot (pulsing when active, solid when paused)
+        let alpha = if paused {
+            0.5
+        } else {
+            let anim_time = self.animation_time();
+            0.7 + 0.3 * (anim_time * 3.0 * std::f32::consts::PI).sin()
+        };
+
+        let dot_color = if paused {
+            [0.7, 0.3, 0.1, alpha] // Orange when paused
+        } else {
+            [0.9, 0.1, 0.1, alpha] // Red when recording
+        };
+
+        cards.push(
+            CardInstance::new(dot_x, dot_y, dot_size, dot_size, dot_color)
+                .with_corner_radius(dot_size / 2.0) // Circle
+                .with_border_width(0.0)
+        );
+
+        cards
+    }
+
+    /// Queue recording indicator text (REC + elapsed time)
+    pub fn queue_recording_indicator_text(&mut self, elapsed: std::time::Duration, paused: bool) {
+        let (content_w, content_h) = self.content_size();
+        let (offset_x, offset_y) = self.content_offset();
+
+        let margin = self.ui_scale.px(16.0);
+        let dot_size = self.ui_scale.px(12.0);
+
+        // "REC" text next to dot
+        let rec_x = offset_x + content_w - margin - self.ui_scale.px(40.0);
+        let rec_y = offset_y + margin;
+        let rec_text = if paused { "PAUSED" } else { "REC" };
+        let rec_color = if paused {
+            [0.8, 0.6, 0.2, 1.0] // Orange
+        } else {
+            [0.9, 0.3, 0.3, 1.0] // Red
+        };
+
+        self.text_queue.push(
+            rec_text,
+            rec_x,
+            rec_y,
+            self.ui_scale.px(14.0),
+            rec_color,
+        );
+
+        // Elapsed time in status bar (bottom-left)
+        let minutes = elapsed.as_secs() / 60;
+        let seconds = elapsed.as_secs() % 60;
+        let time_text = format!("Recording {:02}:{:02}", minutes, seconds);
+
+        self.text_queue.push(
+            &time_text,
+            offset_x + margin,
+            offset_y + content_h - self.ui_scale.px(30.0),
+            self.ui_scale.px(14.0),
+            [0.7, 0.7, 0.7, 0.9],
+        );
+
+        // Recording controls hint
+        let hint_text = "F9: Pause | F10: Stop & Save";
+        self.text_queue.push(
+            hint_text,
+            offset_x + margin + self.ui_scale.px(140.0),
+            offset_y + content_h - self.ui_scale.px(30.0),
+            self.ui_scale.px(12.0),
+            [0.5, 0.5, 0.5, 0.7],
+        );
+    }
+
+    /// Render panel chooser dialog with ICS-style widget previews
+    ///
+    /// Shows actual mini-rendered previews of each panel type using fixture data,
+    /// following the Android ICS widget picker pattern.
+    fn queue_panel_chooser(&mut self, spawn_pos: (f32, f32), selection: usize) {
+        use crate::fixtures::{get_panel_fixture, PanelFixture};
+        use crate::panels::available_panel_types;
+
+        let (spawn_x, spawn_y) = spawn_pos;
+        let panel_types = available_panel_types();
+
+        // Grid layout: 2 columns of preview cards
+        let columns = 2;
+        let preview_width = self.ui_scale.px(200.0);
+        let preview_height = self.ui_scale.px(150.0);
+        let gap = self.ui_scale.px(12.0);
+        let padding = self.ui_scale.px(16.0);
+        let title_height = self.ui_scale.px(40.0);
+        let label_height = self.ui_scale.px(24.0);
+
+        let rows = (panel_types.len() + columns - 1) / columns;
+        let dialog_width = columns as f32 * preview_width + (columns - 1) as f32 * gap + padding * 2.0;
+        let dialog_height = title_height + rows as f32 * (preview_height + label_height + gap) + padding;
+
+        // Position dialog near spawn point, but keep on screen
+        let (content_w, content_h) = self.content_size();
+        let (offset_x, offset_y) = self.content_offset();
+
+        let mut dialog_x = spawn_x - dialog_width / 2.0;
+        let mut dialog_y = spawn_y - dialog_height / 2.0;
+
+        // Clamp to screen bounds
+        dialog_x = dialog_x.max(offset_x + padding).min(offset_x + content_w - dialog_width - padding);
+        dialog_y = dialog_y.max(offset_y + padding).min(offset_y + content_h - dialog_height - padding);
+
+        // Background card (darker, semi-transparent)
+        let bg_color = [0.08, 0.08, 0.12, 0.98];
+        let bg_card = CardInstance::new(dialog_x, dialog_y, dialog_width, dialog_height, bg_color)
+            .with_corner_radius(self.ui_scale.px(20.0))
+            .with_border_width(self.ui_scale.px(2.0))
+            .with_border_color([0.3, 0.4, 0.6, 0.8]);
+        self.edit_mode_cards.push(bg_card);
+
+        // Title
+        self.text_queue.push(
+            "Add Panel",
+            dialog_x + padding,
+            dialog_y + padding,
+            self.ui_scale.px(20.0),
+            [0.9, 0.9, 1.0, 1.0],
+        );
+
+        // Render each panel type as a preview card
+        let previews_start_y = dialog_y + title_height;
+
+        for (i, panel_type) in panel_types.iter().enumerate() {
+            let col = i % columns;
+            let row = i / columns;
+
+            let preview_x = dialog_x + padding + col as f32 * (preview_width + gap);
+            let preview_y = previews_start_y + row as f32 * (preview_height + label_height + gap);
+            let is_selected = i == selection;
+
+            // Selection highlight (glow effect)
+            if is_selected {
+                let glow = CardInstance::new(
+                    preview_x - self.ui_scale.px(4.0),
+                    preview_y - self.ui_scale.px(4.0),
+                    preview_width + self.ui_scale.px(8.0),
+                    preview_height + label_height + self.ui_scale.px(8.0),
+                    [0.3, 0.5, 0.9, 0.4],
+                )
+                .with_corner_radius(self.ui_scale.px(14.0));
+                self.edit_mode_cards.push(glow);
+            }
+
+            // Preview card background
+            let preview_bg_color = if is_selected {
+                [0.15, 0.18, 0.25, 1.0]
+            } else {
+                [0.12, 0.12, 0.16, 1.0]
+            };
+            let preview_card = CardInstance::new(preview_x, preview_y, preview_width, preview_height, preview_bg_color)
+                .with_corner_radius(self.ui_scale.px(10.0))
+                .with_border_width(self.ui_scale.px(1.0))
+                .with_border_color(if is_selected {
+                    [0.5, 0.6, 0.9, 0.8]
+                } else {
+                    [0.25, 0.25, 0.3, 0.6]
+                });
+            self.edit_mode_cards.push(preview_card);
+
+            // Render mini preview content based on panel type
+            self.queue_panel_preview(
+                panel_type.id,
+                preview_x,
+                preview_y,
+                preview_width,
+                preview_height,
+            );
+
+            // Panel name label below preview
+            let label_y = preview_y + preview_height + self.ui_scale.px(6.0);
+            let name_color = if is_selected {
+                [1.0, 1.0, 1.0, 1.0]
+            } else {
+                [0.7, 0.7, 0.8, 1.0]
+            };
+            self.text_queue.push(
+                panel_type.name,
+                preview_x + preview_width / 2.0 - self.ui_scale.px(40.0), // Roughly centered
+                label_y,
+                self.ui_scale.px(13.0),
+                name_color,
+            );
+        }
+
+        // Hint text at bottom
+        self.text_queue.push(
+            "↑↓ Navigate  Enter Select  Esc Cancel",
+            dialog_x + padding,
+            dialog_y + dialog_height - self.ui_scale.px(20.0),
+            self.ui_scale.px(10.0),
+            [0.4, 0.4, 0.5, 0.8],
+        );
+    }
+
+    /// Render a mini preview of a panel type using fixture data
+    fn queue_panel_preview(
+        &mut self,
+        panel_type: &str,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) {
+        use crate::fixtures::{get_panel_fixture, PanelFixture};
+
+        let padding = self.ui_scale.px(6.0);
+        let inner_x = x + padding;
+        let inner_y = y + padding;
+        let inner_w = width - padding * 2.0;
+        let inner_h = height - padding * 2.0;
+
+        match get_panel_fixture(panel_type) {
+            Some(PanelFixture::QuestLog(cards)) => {
+                self.queue_quest_log_preview(inner_x, inner_y, inner_w, inner_h, &cards);
+            }
+            Some(PanelFixture::Execution { tool_log, thought_log }) => {
+                self.queue_execution_preview(inner_x, inner_y, inner_w, inner_h, &tool_log, &thought_log);
+            }
+            Some(PanelFixture::Analysis(log)) => {
+                self.queue_analysis_preview(inner_x, inner_y, inner_w, inner_h, &log);
+            }
+            Some(PanelFixture::ProjectChooser(projects)) => {
+                self.queue_project_chooser_preview(inner_x, inner_y, inner_w, inner_h, &projects);
+            }
+            None => {
+                // Fallback: just show panel type name
+                self.text_queue.push(
+                    panel_type,
+                    inner_x + inner_w / 2.0 - self.ui_scale.px(30.0),
+                    inner_y + inner_h / 2.0,
+                    self.ui_scale.px(12.0),
+                    [0.5, 0.5, 0.6, 0.8],
+                );
+            }
+        }
+    }
+
+    /// Mini preview of quest log panel (card grid)
+    fn queue_quest_log_preview(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        cards: &[crate::state::SuggestionCard],
+    ) {
+        let mini_card_w = self.ui_scale.px(50.0);
+        let mini_card_h = self.ui_scale.px(35.0);
+        let gap = self.ui_scale.px(4.0);
+        let cols = ((width + gap) / (mini_card_w + gap)).floor() as usize;
+
+        for (i, card) in cards.iter().take(6).enumerate() {
+            let col = i % cols;
+            let row = i / cols;
+
+            let card_x = x + col as f32 * (mini_card_w + gap);
+            let card_y = y + row as f32 * (mini_card_h + gap);
+
+            if card_y + mini_card_h > y + height {
+                break; // Don't overflow
+            }
+
+            // Card color based on category
+            let card_color = match card.category.as_str() {
+                "setup" => [0.2, 0.35, 0.5, 0.9],
+                "gameplay" => [0.25, 0.4, 0.3, 0.9],
+                "ui" => [0.4, 0.3, 0.45, 0.9],
+                "polish" => [0.45, 0.35, 0.25, 0.9],
+                _ => [0.25, 0.25, 0.3, 0.9],
+            };
+
+            let mini_card = CardInstance::new(card_x, card_y, mini_card_w, mini_card_h, card_color)
+                .with_corner_radius(self.ui_scale.px(4.0));
+            self.edit_mode_cards.push(mini_card);
+
+            // Selection indicator (checkmark area)
+            if card.selected {
+                let check_size = self.ui_scale.px(8.0);
+                let check = CardInstance::new(
+                    card_x + mini_card_w - check_size - self.ui_scale.px(2.0),
+                    card_y + self.ui_scale.px(2.0),
+                    check_size,
+                    check_size,
+                    [0.3, 0.8, 0.4, 0.9],
+                )
+                .with_corner_radius(self.ui_scale.px(2.0));
+                self.edit_mode_cards.push(check);
+            }
+
+            // Tiny title text (truncated)
+            let title: String = card.title.chars().take(8).collect();
+            self.text_queue.push(
+                Box::leak(title.into_boxed_str()),
+                card_x + self.ui_scale.px(3.0),
+                card_y + self.ui_scale.px(4.0),
+                self.ui_scale.px(7.0),
+                [0.9, 0.9, 0.95, 0.9],
+            );
+        }
+    }
+
+    /// Mini preview of execution panel (two columns: tools | thoughts)
+    fn queue_execution_preview(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        tool_log: &[String],
+        thought_log: &[String],
+    ) {
+        let col_width = width / 2.0 - self.ui_scale.px(2.0);
+        let line_height = self.ui_scale.px(10.0);
+
+        // Left column header
+        self.text_queue.push(
+            "Tools",
+            x + self.ui_scale.px(2.0),
+            y,
+            self.ui_scale.px(8.0),
+            [0.6, 0.7, 0.9, 0.9],
+        );
+
+        // Right column header
+        self.text_queue.push(
+            "Thoughts",
+            x + col_width + self.ui_scale.px(4.0),
+            y,
+            self.ui_scale.px(8.0),
+            [0.9, 0.7, 0.6, 0.9],
+        );
+
+        // Tool log entries (left column)
+        let entries_y = y + self.ui_scale.px(12.0);
+        for (i, entry) in tool_log.iter().take(8).enumerate() {
+            let entry_y = entries_y + i as f32 * line_height;
+            if entry_y + line_height > y + height {
+                break;
+            }
+            // Extract just the icon and action (skip timestamp for mini view)
+            let display: String = entry.chars().skip(11).take(12).collect();
+            self.text_queue.push(
+                Box::leak(display.into_boxed_str()),
+                x + self.ui_scale.px(2.0),
+                entry_y,
+                self.ui_scale.px(6.0),
+                [0.7, 0.75, 0.85, 0.8],
+            );
+        }
+
+        // Thought log entries (right column)
+        for (i, entry) in thought_log.iter().take(8).enumerate() {
+            let entry_y = entries_y + i as f32 * line_height;
+            if entry_y + line_height > y + height {
+                break;
+            }
+            let display: String = entry.chars().take(14).collect();
+            self.text_queue.push(
+                Box::leak(display.into_boxed_str()),
+                x + col_width + self.ui_scale.px(4.0),
+                entry_y,
+                self.ui_scale.px(6.0),
+                [0.85, 0.75, 0.7, 0.8],
+            );
+        }
+    }
+
+    /// Mini preview of analysis panel (log list)
+    fn queue_analysis_preview(
+        &mut self,
+        x: f32,
+        y: f32,
+        _width: f32,
+        height: f32,
+        log: &[String],
+    ) {
+        let line_height = self.ui_scale.px(12.0);
+
+        for (i, entry) in log.iter().take(8).enumerate() {
+            let entry_y = y + i as f32 * line_height;
+            if entry_y + line_height > y + height {
+                break;
+            }
+            let display: String = entry.chars().take(20).collect();
+            self.text_queue.push(
+                Box::leak(display.into_boxed_str()),
+                x + self.ui_scale.px(2.0),
+                entry_y,
+                self.ui_scale.px(7.0),
+                [0.7, 0.8, 0.7, 0.9],
+            );
+        }
+    }
+
+    /// Mini preview of project chooser (project grid)
+    fn queue_project_chooser_preview(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        projects: &[crate::fixtures::FixtureProject],
+    ) {
+        let card_w = self.ui_scale.px(45.0);
+        let card_h = self.ui_scale.px(30.0);
+        let gap = self.ui_scale.px(4.0);
+        let cols = ((width + gap) / (card_w + gap)).floor() as usize;
+
+        for (i, project) in projects.iter().take(4).enumerate() {
+            let col = i % cols;
+            let row = i / cols;
+
+            let card_x = x + col as f32 * (card_w + gap);
+            let card_y = y + row as f32 * (card_h + gap);
+
+            if card_y + card_h > y + height {
+                break;
+            }
+
+            // Project card
+            let card_color = [0.2, 0.22, 0.28, 0.9];
+            let card = CardInstance::new(card_x, card_y, card_w, card_h, card_color)
+                .with_corner_radius(self.ui_scale.px(4.0));
+            self.edit_mode_cards.push(card);
+
+            // Project name (truncated)
+            let name: String = project.name.chars().take(6).collect();
+            self.text_queue.push(
+                Box::leak(name.into_boxed_str()),
+                card_x + self.ui_scale.px(3.0),
+                card_y + self.ui_scale.px(4.0),
+                self.ui_scale.px(7.0),
+                [0.9, 0.9, 0.95, 0.9],
+            );
+
+            // Language indicator
+            if let Some(lang) = project.languages.first() {
+                let lang_short: String = lang.chars().take(4).collect();
+                self.text_queue.push(
+                    Box::leak(lang_short.into_boxed_str()),
+                    card_x + self.ui_scale.px(3.0),
+                    card_y + self.ui_scale.px(16.0),
+                    self.ui_scale.px(6.0),
+                    [0.5, 0.6, 0.7, 0.8],
+                );
+            }
+        }
     }
 
     /// Poll pending screenshot captures (call each frame)

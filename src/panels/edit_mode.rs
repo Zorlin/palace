@@ -181,8 +181,8 @@ pub struct EditModeState {
     /// Panel chooser dialog open
     pub panel_chooser_open: bool,
 
-    /// Target cell for new panel (where user tapped)
-    pub spawn_target: Option<GridCell>,
+    /// Target position for new panel (pixel coordinates where user tapped)
+    pub spawn_target: Option<(f32, f32)>,
 
     /// Selected panel in chooser
     pub chooser_selection: usize,
@@ -212,6 +212,12 @@ pub struct EditModeState {
 
     /// Active snap animations (panels animating to their target positions)
     pub snap_animations: Vec<SnapAnimation>,
+
+    /// Active panels in the workspace (panel type IDs)
+    /// When set, these panels are rendered instead of the defaults
+    /// Format: Vec of (panel_id, is_user_added) tuples
+    /// - is_user_added: true if panel was added by user via chooser
+    pub active_panels: Vec<(&'static str, bool)>,
 }
 
 /// State for panel drag operation
@@ -317,6 +323,7 @@ impl EditModeState {
             reflow_solution: None,
             panel_overrides: HashMap::new(),
             snap_animations: Vec::new(),
+            active_panels: Vec::new(),
         }
     }
 
@@ -351,9 +358,8 @@ impl EditModeState {
         self.reflow_previews.clear();
         self.reflow_solution = None;
         self.snap_animations.clear();
-        // Clear overrides when exiting - positions reset to defaults
-        // TODO: In the future, persist to ReDB for layout persistence
-        self.panel_overrides.clear();
+        // Keep panel_overrides - layout persists after exiting edit mode
+        // Phase 4 will add ReDB persistence for cross-session survival
     }
 
     /// Toggle edit mode
@@ -555,10 +561,10 @@ impl EditModeState {
         self.ghost_position = None;
     }
 
-    /// Open panel chooser at a specific cell
-    pub fn open_panel_chooser(&mut self, target: GridCell) {
+    /// Open panel chooser at a specific pixel location
+    pub fn open_panel_chooser(&mut self, x: f32, y: f32) {
         self.panel_chooser_open = true;
-        self.spawn_target = Some(target);
+        self.spawn_target = Some((x, y));
         self.chooser_selection = 0;
     }
 
@@ -1022,6 +1028,89 @@ impl EditModeState {
             }
         }
     }
+
+    /// Initialize active panels with defaults for the current state
+    ///
+    /// Call this when entering a state that has panels (e.g., PalaceLoop)
+    pub fn init_default_panels(&mut self, default_panels: &[&'static str]) {
+        if self.active_panels.is_empty() {
+            self.active_panels = default_panels.iter().map(|&id| (id, false)).collect();
+        }
+    }
+
+    /// Check if a panel type is currently active
+    pub fn has_panel(&self, panel_id: &str) -> bool {
+        self.active_panels.iter().any(|(id, _)| *id == panel_id)
+    }
+
+    /// Add a new panel to the workspace at the given pixel position
+    ///
+    /// Returns the panel ID if successful, None if panel type already exists
+    pub fn spawn_panel(
+        &mut self,
+        panel_id: &'static str,
+        x: f32,
+        y: f32,
+        screen_width: f32,
+        screen_height: f32,
+    ) -> Option<&'static str> {
+        // Don't allow duplicate panels (for now)
+        if self.has_panel(panel_id) {
+            tracing::warn!("Panel '{}' already exists in workspace", panel_id);
+            return None;
+        }
+
+        // Verify panel type exists
+        let _panel_info = available_panel_types()
+            .into_iter()
+            .find(|p| p.id == panel_id)?;
+
+        // Calculate default size (roughly 1/4 of screen)
+        let default_width = (screen_width / 3.0).max(200.0);
+        let default_height = (screen_height / 3.0).max(150.0);
+
+        // Center the panel on the spawn point
+        let panel_x = (x - default_width / 2.0).max(0.0).min(screen_width - default_width);
+        let panel_y = (y - default_height / 2.0).max(0.0).min(screen_height - default_height);
+
+        // Add to active panels
+        self.active_panels.push((panel_id, true));
+
+        // Set initial position in overrides
+        self.panel_overrides.insert(panel_id, (panel_x, panel_y, default_width, default_height));
+
+        tracing::info!(
+            "Spawned panel '{}' at ({:.0}, {:.0}) size ({:.0}x{:.0})",
+            panel_id, panel_x, panel_y, default_width, default_height
+        );
+
+        Some(panel_id)
+    }
+
+    /// Remove a user-added panel from the workspace
+    ///
+    /// Only removes panels that were added by the user (is_user_added = true)
+    pub fn remove_panel(&mut self, panel_id: &str) -> bool {
+        if let Some(pos) = self.active_panels.iter().position(|(id, user_added)| *id == panel_id && *user_added) {
+            self.active_panels.remove(pos);
+            self.panel_overrides.remove(panel_id);
+            tracing::info!("Removed panel '{}'", panel_id);
+            true
+        } else {
+            tracing::warn!("Cannot remove panel '{}' (not user-added or doesn't exist)", panel_id);
+            false
+        }
+    }
+
+    /// Get all active panel IDs
+    pub fn get_active_panel_ids(&self) -> Vec<&'static str> {
+        self.active_panels.iter().map(|(id, _)| *id).collect()
+    }
+
+    /// Check if there are any user-added panels
+    pub fn has_user_panels(&self) -> bool {
+        self.active_panels.iter().any(|(_, user_added)| *user_added)
+    }
 }
 
 /// Available panel types for the chooser
@@ -1135,9 +1224,9 @@ mod tests {
         let mut state = EditModeState::new();
         state.enter();
 
-        state.open_panel_chooser(GridCell::new(2, 3));
+        state.open_panel_chooser(200.0, 300.0);
         assert!(state.panel_chooser_open);
-        assert_eq!(state.spawn_target, Some(GridCell::new(2, 3)));
+        assert_eq!(state.spawn_target, Some((200.0, 300.0)));
         assert_eq!(state.chooser_selection, 0);
 
         // Test selection navigation
@@ -1169,7 +1258,7 @@ mod tests {
         state.cancel_drag();
         assert!(!state.is_busy());
 
-        state.open_panel_chooser(GridCell::new(0, 0));
+        state.open_panel_chooser(0.0, 0.0);
         assert!(state.is_busy());
     }
 

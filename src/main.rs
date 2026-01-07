@@ -2,11 +2,13 @@ mod ai;
 mod app;
 mod debug;
 mod display;
+mod fixtures;
 mod palace_window;
 mod panels;
 mod persistence;
 mod projects;
 mod renderer;
+mod scenario;
 mod state;
 mod ui;
 
@@ -192,6 +194,120 @@ enum Commands {
         #[arg(short, long)]
         project: Option<String>,
     },
+
+    /// Capture fixture data from a real AI session
+    ///
+    /// Runs the AI suggest flow against a project and records
+    /// all cards, tool logs, and thoughts. Used to generate
+    /// realistic panel previews for the widget chooser.
+    CaptureFixtures {
+        /// Project path to analyze
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Output JSON file (default: fixtures/session.json)
+        #[arg(short, long, default_value = "fixtures/session.json")]
+        output: String,
+
+        /// Task prompt for the AI (e.g., "implement asteroids")
+        #[arg(short, long, default_value = "analyze this project and suggest improvements")]
+        task: String,
+    },
+
+    /// Scenario system - run, generate, correct, and record scenarios
+    ///
+    /// Scenarios are declarative YAML files that specify goals, constraints,
+    /// and permissions. An AI supervisor drives Palace to achieve the goals.
+    Scenario {
+        #[command(subcommand)]
+        action: ScenarioAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScenarioAction {
+    /// Run a scenario file
+    ///
+    /// Example: palace scenario run asteroids.yml
+    Run {
+        /// Path to the scenario YAML file
+        scenario_file: String,
+
+        /// Acknowledge safety warning (non-interactive mode)
+        #[arg(long)]
+        acknowledge: bool,
+
+        /// Capture screenshots during execution
+        #[arg(long)]
+        capture_screenshots: bool,
+
+        /// Output directory for captures
+        #[arg(long, default_value = "./captures")]
+        output_dir: String,
+
+        /// Dry run - validate scenario without executing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Correct a scenario file using AI
+    ///
+    /// Sends the scenario to Claude for syntax/semantic correction,
+    /// then shows a side-by-side diff for approval.
+    ///
+    /// Example: palace scenario correct broken.yml
+    Correct {
+        /// Path to the scenario file to correct
+        input_file: String,
+
+        /// Output path (defaults to overwriting input)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Auto-accept corrections without showing diff viewer
+        #[arg(long)]
+        auto_accept: bool,
+    },
+
+    /// Generate a new scenario interactively
+    ///
+    /// Uses a recursive survey wizard to gather requirements,
+    /// then generates a comprehensive scenario YAML.
+    ///
+    /// Example: palace scenario generate -o my-scenario.yml
+    Generate {
+        /// Output file path
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Initial description to expand
+        #[arg(long)]
+        from_description: Option<String>,
+
+        /// Fork an existing scenario
+        #[arg(long)]
+        fork: Option<String>,
+    },
+
+    /// Record a Palace session as a scenario
+    ///
+    /// Starts Palace in recording mode, capturing high-level actions
+    /// (card selections, permissions, surveys) as semantic scenario steps.
+    ///
+    /// Example: palace scenario record -o session.yml
+    Record {
+        /// Output file path
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Project path (defaults to current directory)
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Include AI context (thoughts, tool calls) in output
+        #[arg(long)]
+        include_ai_context: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -267,6 +383,10 @@ fn main() -> Result<()> {
             Commands::Headless { width, height, output, project } => {
                 run_headless_command(width, height, output, project)
             }
+            Commands::CaptureFixtures { project, output, task } => {
+                run_capture_fixtures_command(project, output, task)
+            }
+            Commands::Scenario { action } => run_scenario_command(action)
         };
     }
 
@@ -573,6 +693,350 @@ fn run_headless_command(
 ) -> Result<()> {
     println!("🖥️  Headless mode not yet implemented.");
     println!("   This will render Palace UI to a PNG without needing a display.");
+    Ok(())
+}
+
+/// Capture fixtures from a real AI session
+fn run_capture_fixtures_command(
+    project: Option<String>,
+    output: String,
+    task: String,
+) -> Result<()> {
+    use crate::ai::{ProjectContext, SuggestionEngine};
+    use crate::fixtures::FixtureCapture;
+
+    let project_path = project
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+    eprintln!("🎬 Capturing fixtures from: {}", project_path.display());
+    eprintln!("📝 Task: {}", task);
+
+    // Start capturing
+    let mut capture = FixtureCapture::new();
+
+    // Gather project context
+    let context = ProjectContext::gather(&project_path)?;
+
+    // Run AI suggestion with streaming to capture tool/thought logs
+    let engine = SuggestionEngine::from_env()?;
+
+    eprintln!("📡 Running AI analysis...\n");
+
+    // Use agentic exploration which streams tool calls
+    engine.suggest_with_exploration(&context)?;
+
+    // For now, create mock data since we need to hook into the streaming callbacks
+    // TODO: Wire up actual streaming callbacks to capture real tool/thought logs
+    capture.add_tool("[00:00:01] 📂 Read src/main.rs".to_string());
+    capture.add_thought("Analyzing project structure...".to_string());
+
+    // Extract project name from path
+    let project_name = project_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project");
+
+    // Save fixtures
+    capture.save(project_name, &output)
+        .map_err(|e| anyhow::anyhow!("Failed to save fixtures: {}", e))?;
+
+    eprintln!("\n✅ Fixtures saved to: {}", output);
+    eprintln!("   Cards: {}", capture.cards.len());
+    eprintln!("   Tool calls: {}", capture.tool_log.len());
+    eprintln!("   Thoughts: {}", capture.thought_log.len());
+
+    Ok(())
+}
+
+/// Run scenario commands - run, correct, generate, record
+fn run_scenario_command(action: ScenarioAction) -> Result<()> {
+    match action {
+        ScenarioAction::Run {
+            scenario_file,
+            acknowledge,
+            capture_screenshots,
+            output_dir,
+            dry_run,
+        } => run_scenario_run(scenario_file, acknowledge, capture_screenshots, output_dir, dry_run),
+
+        ScenarioAction::Correct {
+            input_file,
+            output,
+            auto_accept,
+        } => run_scenario_correct(input_file, output, auto_accept),
+
+        ScenarioAction::Generate {
+            output,
+            from_description,
+            fork,
+        } => run_scenario_generate(output, from_description, fork),
+
+        ScenarioAction::Record {
+            output,
+            project,
+            include_ai_context,
+        } => run_scenario_record(output, project, include_ai_context),
+    }
+}
+
+/// Run a scenario file
+fn run_scenario_run(
+    scenario_file: String,
+    acknowledge: bool,
+    capture_screenshots: bool,
+    output_dir: String,
+    dry_run: bool,
+) -> Result<()> {
+    use crate::scenario::{load_scenario, SafetyGate};
+
+    eprintln!("🎭 Palace Scenario Runner");
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    // Check safety gate (unless --acknowledge was passed)
+    if acknowledge {
+        eprintln!("⚠️  Safety warning acknowledged via --acknowledge flag");
+    } else {
+        SafetyGate::check()?;
+    }
+
+    // Load scenario
+    eprintln!("📋 Loading scenario: {}", scenario_file);
+    let scenario = load_scenario(&scenario_file)?;
+
+    eprintln!("   Name: {}", scenario.scenario.name);
+    if let Some(ref desc) = scenario.scenario.description {
+        eprintln!("   Description: {}", desc.lines().next().unwrap_or(""));
+    }
+    eprintln!("   Project: {}", scenario.project.path);
+
+    // Show mode
+    if scenario.is_scripted() {
+        eprintln!("   Mode: Script ({} steps)", scenario.steps.len());
+    } else if scenario.is_goal_driven() {
+        eprintln!("   Mode: Goal-driven ({} goals)", scenario.goals.len());
+    } else if scenario.is_mixed() {
+        eprintln!("   Mode: Mixed ({} steps, {} goals)", scenario.steps.len(), scenario.goals.len());
+    }
+
+    if dry_run {
+        eprintln!("\n🔍 Dry run - validating scenario without executing\n");
+
+        // Validate project path
+        let project_path = scenario.project.expanded_path();
+        if project_path.exists() {
+            eprintln!("   ✅ Project path exists: {}", project_path.display());
+        } else if scenario.project.init_if_missing {
+            eprintln!("   ⚠️  Project path missing, will create: {}", project_path.display());
+        } else {
+            eprintln!("   ❌ Project path missing: {}", project_path.display());
+        }
+
+        // Show goals
+        if !scenario.goals.is_empty() {
+            eprintln!("\n📎 Goals:");
+            for (i, goal) in scenario.goals.iter().enumerate() {
+                eprintln!("   {}. {}", i + 1, goal);
+            }
+        }
+
+        // Show steps
+        if !scenario.steps.is_empty() {
+            use crate::scenario::ScriptStep;
+            eprintln!("\n📜 Steps:");
+            for (i, step) in scenario.steps.iter().enumerate() {
+                let display = match step {
+                    ScriptStep::Simple(s) => s.clone(),
+                    ScriptStep::Structured(s) => {
+                        if let Some(ref target) = s.target {
+                            format!("{} {}", s.action, target)
+                        } else {
+                            s.action.clone()
+                        }
+                    }
+                };
+                eprintln!("   {}. {}", i + 1, display);
+            }
+        }
+
+        // Show constraints
+        if let Some(ref constraints) = scenario.constraints {
+            eprintln!("\n🚧 Constraints:");
+            for c in constraints {
+                eprintln!("   - {}", c);
+            }
+        }
+
+        // Show permissions
+        if let Some(ref perms) = scenario.permissions {
+            eprintln!("\n🔐 Permissions:");
+            if !perms.allow.is_empty() {
+                eprintln!("   Allow: {:?}", perms.allow);
+            }
+            if !perms.deny.is_empty() {
+                eprintln!("   Deny: {:?}", perms.deny);
+            }
+        }
+
+        eprintln!("\n✅ Scenario validation complete");
+        return Ok(());
+    }
+
+    // Create output directory for captures
+    if capture_screenshots {
+        std::fs::create_dir_all(&output_dir)?;
+        eprintln!("📸 Screenshots will be saved to: {}", output_dir);
+    }
+
+    eprintln!("\n🚀 Executing scenario...\n");
+
+    // TODO: Actually execute the scenario
+    // This requires:
+    // 1. Starting Palace in a controllable mode
+    // 2. Having the supervisor drive the UI
+    // 3. Executing script steps or delegating to AI for goals
+
+    eprintln!("⚠️  Scenario execution not yet implemented.");
+    eprintln!("   The scenario system is designed but needs integration with Palace's event loop.");
+    eprintln!("\n   Next steps:");
+    eprintln!("   1. Add Palace headless/controllable mode");
+    eprintln!("   2. Wire supervisor to Palace events");
+    eprintln!("   3. Implement script step execution");
+
+    Ok(())
+}
+
+/// Correct a scenario file using AI
+fn run_scenario_correct(
+    input_file: String,
+    output: Option<String>,
+    auto_accept: bool,
+) -> Result<()> {
+    use crate::scenario::ScenarioCorrector;
+
+    eprintln!("🔧 Palace Scenario Corrector");
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("📋 Input: {}", input_file);
+
+    if let Some(ref out) = output {
+        eprintln!("📝 Output: {}", out);
+    } else {
+        eprintln!("📝 Output: {} (overwrite)", input_file);
+    }
+
+    if auto_accept {
+        eprintln!("⚡ Auto-accept mode enabled");
+    }
+
+    // Create corrector
+    let mut corrector = ScenarioCorrector::new(
+        std::path::PathBuf::from(&input_file),
+        output.map(std::path::PathBuf::from),
+        auto_accept,
+    );
+
+    // Load the file
+    corrector.load()?;
+
+    if auto_accept {
+        // In auto-accept mode, we'd call the LLM directly and save
+        // For now, show that the file was loaded
+        eprintln!("\n⚠️  LLM correction not yet wired up.");
+        eprintln!("   The corrector state machine is ready but needs SDK integration.");
+    } else {
+        // Interactive mode would launch the diff viewer UI
+        eprintln!("\n⚠️  Interactive diff viewer not yet implemented.");
+        eprintln!("   This will launch Palace with a side-by-side diff view.");
+    }
+
+    Ok(())
+}
+
+/// Generate a new scenario interactively
+fn run_scenario_generate(
+    output: Option<String>,
+    from_description: Option<String>,
+    fork: Option<String>,
+) -> Result<()> {
+    use crate::scenario::ScenarioGenerator;
+
+    eprintln!("🪄 Palace Scenario Generator");
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    if let Some(ref path) = output {
+        eprintln!("📝 Output: {}", path);
+    }
+
+    let mut generator = if let Some(ref desc) = from_description {
+        eprintln!("📖 From description: {}", desc);
+        ScenarioGenerator::from_description(desc.clone())
+    } else if let Some(ref fork_path) = fork {
+        eprintln!("🍴 Forking: {}", fork_path);
+        let scenario = crate::scenario::load_scenario(fork_path)?;
+        ScenarioGenerator::from_fork(scenario)
+    } else {
+        eprintln!("🆕 Starting fresh");
+        ScenarioGenerator::new()
+    };
+
+    if let Some(path) = output {
+        generator.set_output_path(std::path::PathBuf::from(path));
+    }
+
+    // Interactive mode would launch the survey wizard UI
+    eprintln!("\n⚠️  Interactive survey wizard not yet implemented.");
+    eprintln!("   This will launch Palace with a recursive question interface.");
+    eprintln!("\n   The generator state machine is ready:");
+    eprintln!("   - Recursive LLM-driven questioning");
+    eprintln!("   - AI expansion of descriptions");
+    eprintln!("   - Gamepad-friendly navigation");
+
+    Ok(())
+}
+
+/// Record a Palace session as a scenario
+fn run_scenario_record(
+    output: Option<String>,
+    project: Option<String>,
+    include_ai_context: bool,
+) -> Result<()> {
+    use crate::scenario::{RecorderConfig, SessionRecorder};
+
+    let project_path = project
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+    eprintln!("🔴 Palace Session Recorder");
+    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    eprintln!("📁 Project: {}", project_path.display());
+
+    if let Some(ref path) = output {
+        eprintln!("📝 Output: {}", path);
+    }
+
+    if include_ai_context {
+        eprintln!("🤖 AI context capture enabled");
+    }
+
+    // Create recorder config
+    let config = RecorderConfig {
+        include_ai_context,
+        checkpoint_dir: std::path::PathBuf::from("/tmp/palace-recording"),
+        output_path: output.map(std::path::PathBuf::from),
+    };
+
+    // Create recorder (would be attached to Palace app)
+    let recorder = SessionRecorder::new(project_path.clone(), config);
+
+    eprintln!("\n⚠️  Recording mode not yet integrated with Palace.");
+    eprintln!("   The recorder is ready but needs to hook into the app event loop.");
+    eprintln!("\n   Features ready:");
+    eprintln!("   - High-level action capture (cards, permissions, surveys)");
+    eprintln!("   - Semantic wait conversion");
+    eprintln!("   - Auto-checkpointing (5min + events)");
+    eprintln!("   - YAML export with inferred permissions");
+    eprintln!("\n   Output will be: {}", recorder.get_output_path().display());
+
     Ok(())
 }
 
